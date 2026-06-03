@@ -5,6 +5,7 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+.omx/
 .omc/
 artifacts/claude/*.json
 artifacts/claude/*.txt
