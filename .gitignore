@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.DS_Store
+.omc/
+artifacts/claude/*.json
+artifacts/claude/*.txt
+artifacts/claude/*.md
