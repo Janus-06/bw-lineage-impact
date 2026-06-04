@@ -72,6 +72,29 @@ def test_llm_enabled_rejects_public_runtime_endpoint(monkeypatch: pytest.MonkeyP
         LlmConfig(enabled=True).resolve_runtime()
 
 
+def test_llm_enabled_rejects_link_local_metadata_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BWLI_LLM_BASE_URL", "http://169.254.169.254/v1")
+    monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
+    monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
+
+    with pytest.raises(ConfigError):
+        LlmConfig(enabled=True).resolve_runtime()
+
+
+def test_llm_enabled_rejects_private_non_loopback_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    for base_url in [
+        "http://10.0.0.1/v1",
+        "http://172.16.0.1/v1",
+        "http://192.168.1.50/v1",
+    ]:
+        monkeypatch.setenv("BWLI_LLM_BASE_URL", base_url)
+        monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
+        monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
+
+        with pytest.raises(ConfigError):
+            LlmConfig(enabled=True).resolve_runtime()
+
+
 def test_app_config_rejects_plaintext_secret_fields(tmp_path) -> None:
     config_path = tmp_path / "bwli-config.json"
     config_path.write_text(

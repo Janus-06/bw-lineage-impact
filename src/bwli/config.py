@@ -114,18 +114,18 @@ def _validate_local_llm_base_url(base_url: str) -> None:
         raise ConfigError("LLM base URL must be an http(s) OpenAI-compatible endpoint")
 
     host = parsed.hostname.lower()
-    if host in {"localhost", "host.docker.internal"} or host.endswith(".local"):
+    if host in {"localhost", "host.docker.internal"}:
         return
 
     try:
         address = ip_address(host)
     except ValueError as exc:
-        raise ConfigError("LLM base URL must point to a local or private endpoint") from exc
+        raise ConfigError("LLM base URL must point to a loopback/local host endpoint") from exc
 
-    if address.is_loopback or address.is_private or address.is_link_local:
+    if address.is_loopback:
         return
 
-    raise ConfigError("LLM base URL must point to a local or private endpoint")
+    raise ConfigError("LLM base URL must point to a loopback/local host endpoint")
 
 
 def redact_config_for_log(value: Any) -> str:
