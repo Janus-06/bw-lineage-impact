@@ -1,0 +1,17 @@
+{
+  "changes": [
+    {
+      "id": "chg-field-remove",
+      "object_id": "SRC",
+      "object_type": "ADSO",
+      "change_type": "field_removed",
+      "field": "AMOUNT"
+    },
+    {
+      "id": "chg-routine",
+      "object_id": "TR",
+      "object_type": "TRFN",
+      "change_type": "routine_changed"
+    }
+  ]
+}
