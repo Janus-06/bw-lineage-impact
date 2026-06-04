@@ -3,14 +3,18 @@ import {
   clearRuntimeConfig,
   getHealth,
   getRuntimeConfig,
+  postJson,
   postRendered,
   putRuntimeConfig,
   type HealthResponse,
+  type LiveCollectResponse,
+  type LiveSmokeResponse,
   type OutputFormat,
   type RuntimeConfigResponse,
 } from './api';
 
-type Tool = 'settings' | 'lineage' | 'impact' | 'sql-view' | 'field-lineage';
+type Tool = 'settings' | 'live' | 'lineage' | 'impact' | 'sql-view' | 'field-lineage';
+type LiveMode = 'smoke' | 'collect';
 
 interface FormState {
   graphPath: string;
@@ -23,6 +27,11 @@ interface FormState {
   sourceObject: string;
   targetObject: string;
   format: OutputFormat;
+  liveMode: LiveMode;
+  liveSearchTerm: string;
+  liveObjectName: string;
+  liveOutDir: string;
+  liveConfirm: boolean;
 }
 
 interface SettingsState {
@@ -49,6 +58,11 @@ const defaultState: FormState = {
   sourceObject: 'SRC',
   targetObject: 'TGT',
   format: 'md',
+  liveMode: 'smoke',
+  liveSearchTerm: 'Z*',
+  liveObjectName: '',
+  liveOutDir: '.tmp/live-snapshot',
+  liveConfirm: false,
 };
 
 const defaultSettings: SettingsState = {
@@ -66,6 +80,7 @@ const defaultSettings: SettingsState = {
 
 const toolLabels: Record<Tool, string> = {
   settings: 'Runtime Settings',
+  live: 'Live BW Smoke',
   lineage: 'Lineage',
   impact: 'Change Impact',
   'sql-view': 'Native SQL View',
@@ -118,11 +133,46 @@ export default function App() {
       await saveSettings();
       return;
     }
+    if (tool === 'live') {
+      await runLiveAction();
+      return;
+    }
     setBusy(true);
     setError('');
     try {
       const rendered = await postRendered(endpoint, buildRequest(tool, form));
       setResult(rendered.content);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runLiveAction() {
+    setBusy(true);
+    setError('');
+    try {
+      if (form.liveMode === 'smoke') {
+        const payload = await postJson<LiveSmokeResponse>('/api/live/smoke', {
+          confirm_read_only: form.liveConfirm,
+          search_term: form.liveSearchTerm,
+          object_name: form.liveObjectName || undefined,
+          xref_direction: 'downstream',
+        });
+        setResult(JSON.stringify(payload, null, 2));
+      } else {
+        const payload = await postJson<LiveCollectResponse>('/api/collect/live', {
+          confirm_read_only: form.liveConfirm,
+          out_dir: form.liveOutDir,
+          search_terms: form.liveSearchTerm ? [form.liveSearchTerm] : [],
+          object_names: form.liveObjectName ? [form.liveObjectName] : [],
+          include_dataflow: true,
+          include_xref: true,
+          xref_direction: 'downstream',
+        });
+        setResult(JSON.stringify(payload, null, 2));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -232,9 +282,9 @@ export default function App() {
         <section className="panel formPanel">
           <div className="panelHeader">
             <h2>{toolLabels[tool]}</h2>
-            {tool === 'settings' ? (
-              <span>process-memory only</span>
-            ) : (
+            {tool === 'settings' ? <span>process-memory only</span> : null}
+            {tool === 'live' ? <span>explicit read-only confirmation required</span> : null}
+            {tool !== 'settings' && tool !== 'live' ? (
               <select
                 value={form.format}
                 onChange={(event) => update('format', event.target.value as OutputFormat)}
@@ -243,7 +293,7 @@ export default function App() {
                 <option value="json">JSON</option>
                 {tool === 'lineage' ? <option value="mermaid">Mermaid</option> : null}
               </select>
-            )}
+            ) : null}
           </div>
 
           {tool === 'settings' ? (
@@ -256,6 +306,8 @@ export default function App() {
               updateSettings={updateSettings}
             />
           ) : null}
+
+          {tool === 'live' ? <LivePanel form={form} update={update} /> : null}
 
           {tool === 'lineage' || tool === 'impact' ? (
             <Field label="Graph JSON path" value={form.graphPath} onChange={(v) => update('graphPath', v)} />
@@ -283,7 +335,7 @@ export default function App() {
 
           {tool !== 'settings' ? (
             <button className="run" disabled={busy} onClick={() => void runAnalysis()} type="button">
-              {busy ? '실행 중…' : 'Run local analysis'}
+              {busy ? '실행 중…' : tool === 'live' ? 'Run confirmed live read-only action' : 'Run local analysis'}
             </button>
           ) : null}
           {error ? <p className="error">{error}</p> : null}
@@ -381,6 +433,40 @@ function SettingsPanel({
   );
 }
 
+function LivePanel({
+  form,
+  update,
+}: {
+  form: FormState;
+  update: <K extends keyof FormState>(key: K, value: FormState[K]) => void;
+}) {
+  return (
+    <div className="settingsStack">
+      <p className="notice">
+        실제 SAP BW metadata GET 호출을 수행합니다. Runtime Settings에 read-only 계정을 저장한 뒤,
+        아래 확인 체크박스를 켠 경우에만 실행됩니다.
+      </p>
+      <label className="field">
+        <span>Live action</span>
+        <select value={form.liveMode} onChange={(event) => update('liveMode', event.target.value as LiveMode)}>
+          <option value="smoke">Smoke only</option>
+          <option value="collect">Collect snapshot</option>
+        </select>
+      </label>
+      <Field label="Search term" value={form.liveSearchTerm} onChange={(v) => update('liveSearchTerm', v)} />
+      <Field label="Object name (optional)" value={form.liveObjectName} onChange={(v) => update('liveObjectName', v)} />
+      {form.liveMode === 'collect' ? (
+        <Field label="Output directory" value={form.liveOutDir} onChange={(v) => update('liveOutDir', v)} />
+      ) : null}
+      <Checkbox
+        checked={form.liveConfirm}
+        label="I confirm this is a read-only live BW metadata call"
+        onChange={(value) => update('liveConfirm', value)}
+      />
+    </div>
+  );
+}
+
 function Field({
   label,
   value,
@@ -417,7 +503,7 @@ function Checkbox({
   );
 }
 
-function buildRequest(tool: Exclude<Tool, 'settings'>, form: FormState): unknown {
+function buildRequest(tool: Exclude<Tool, 'settings' | 'live'>, form: FormState): unknown {
   if (tool === 'lineage') {
     return {
       graph_path: form.graphPath,

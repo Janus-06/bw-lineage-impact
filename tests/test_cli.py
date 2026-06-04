@@ -18,3 +18,13 @@ def test_stub_commands_are_safe_and_offline(capsys) -> None:
         combined = f"{captured.out}\n{captured.err}".lower()
         assert "no bw calls" in combined or "offline" in combined or "stub" in combined
         assert "sap" not in combined
+
+
+def test_collect_live_requires_explicit_gate(capsys, monkeypatch) -> None:
+    monkeypatch.delenv("BWLI_LIVE", raising=False)
+
+    assert app(["collect", "--live", "--search-term", "Z"]) == 2
+
+    captured = capsys.readouterr()
+    assert "gated" in captured.err
+    assert "no BW calls" in captured.err

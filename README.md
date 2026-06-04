@@ -90,3 +90,27 @@ BWLI_LIVE=1 BW_URL=<...> BW_USER=<...> BW_PASSWORD=<...> BW_CLIENT=<...> uv run 
 ```
 
 The current live path is intentionally a safe placeholder for M1.
+
+### Live read-only smoke and snapshot collection
+
+The web UI includes a **Live BW Smoke** tab. It uses the BW runtime settings stored in the
+local backend process memory and requires an explicit read-only confirmation checkbox before
+making SAP BW metadata calls. API responses include operation summaries and local manifest
+metadata only; BW passwords and LLM API keys are never returned.
+
+CLI live collection remains gated by `BWLI_LIVE=1` and runtime environment variables:
+
+```bash
+BWLI_LIVE=1 \
+BW_URL=<user-supplied> \
+BW_USER=<user-supplied> \
+BW_PASSWORD=<user-supplied> \
+BW_CLIENT=<user-supplied> \
+BW_LANGUAGE=EN \
+BW_VERIFY_SSL=true \
+uv run bwli collect --live --search-term Z* --object ZCUBE --out .tmp/live-snapshot
+```
+
+This command performs read-only `bw_search`, `bw_get_dataflow`, and `bw_xref` metadata calls
+and writes a local snapshot manifest under the chosen output directory. Do not commit `.tmp/`
+or any live snapshot/report that may contain internal BW object metadata.

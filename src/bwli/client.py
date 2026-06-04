@@ -28,6 +28,7 @@ class BwClient:
         language: str = "EN",
         transport: httpx.BaseTransport | None = None,
         timeout: float = 30.0,
+        verify: bool = True,
     ) -> None:
         self._sap_client = sap_client
         self._language = language
@@ -37,6 +38,8 @@ class BwClient:
             transport=transport,
             timeout=timeout,
             headers={"Accept": "application/json, application/xml, text/xml, */*"},
+            verify=verify,
+            trust_env=False,
         )
 
     def fetch_search(self, search_term: str, *, object_type: str | None = None) -> Any:

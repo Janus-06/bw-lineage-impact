@@ -2,12 +2,44 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
 
 from bwli.server import create_app
 
 FIXTURES = Path("tests/fixtures")
+
+
+class FakeLiveBwClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.closed = False
+
+    def fetch_search(self, search_term: str, *, object_type: str | None = None) -> dict[str, Any]:
+        self.calls.append(("search", search_term, object_type))
+        return {"objects": [{"name": "ZCUBE"}, {"name": "ZQUERY"}]}
+
+    def fetch_dataflow(self, object_name: str) -> dict[str, Any]:
+        self.calls.append(("dataflow", object_name))
+        return {"nodes": [{"id": object_name}], "edges": []}
+
+    def fetch_xref(self, object_name: str, *, direction: str = "downstream") -> dict[str, Any]:
+        self.calls.append(("xref", object_name, direction))
+        return {"references": [{"from": object_name, "to": "ZQUERY"}]}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FailingDataflowBwClient(FakeLiveBwClient):
+    def __init__(self, leaked_value: str) -> None:
+        super().__init__()
+        self._leaked_value = leaked_value
+
+    def fetch_dataflow(self, object_name: str) -> dict[str, Any]:
+        self.calls.append(("dataflow", object_name))
+        raise RuntimeError(f"authorization token={self._leaked_value} failed")
 
 
 def test_health_reports_local_read_only_server() -> None:
@@ -361,3 +393,158 @@ def test_runtime_config_can_be_cleared() -> None:
     payload = response.json()
     assert payload["bw"]["configured"] is False
     assert payload["llm"]["configured"] is False
+
+
+def _put_runtime_bw_config(client: TestClient, *, password: str = "[REDACTED]") -> None:
+    response = client.put(
+        "/api/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": password,
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_live_smoke_rejects_missing_runtime_config() -> None:
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: fake))
+
+    response = client.post("/api/live/smoke", json={"confirm_read_only": True, "search_term": "Z"})
+
+    assert response.status_code == 400
+    assert "BW runtime config" in response.text
+    assert fake.calls == []
+
+
+def test_live_smoke_requires_explicit_read_only_confirmation() -> None:
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: fake))
+    _put_runtime_bw_config(client)
+
+    response = client.post("/api/live/smoke", json={"search_term": "Z", "object_name": "ZCUBE"})
+
+    assert response.status_code == 400
+    assert "confirm_read_only" in response.text
+    assert fake.calls == []
+
+
+def test_live_smoke_uses_runtime_config_and_returns_safe_operation_summaries() -> None:
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: fake))
+    _put_runtime_bw_config(client)
+
+    response = client.post(
+        "/api/live/smoke",
+        json={
+            "confirm_read_only": True,
+            "search_term": "Z",
+            "object_name": "ZCUBE",
+            "xref_direction": "upstream",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "fixture-user" not in response.text
+    payload = response.json()
+    assert payload["mode"] == "live-read-only"
+    assert payload["read_only"] is True
+    assert payload["status"] == "ok"
+    assert [operation["name"] for operation in payload["operations"]] == [
+        "bw_search",
+        "bw_get_dataflow",
+        "bw_xref",
+    ]
+    assert payload["operations"][0]["item_count"] == 2
+    assert fake.calls == [
+        ("search", "Z", None),
+        ("dataflow", "ZCUBE"),
+        ("xref", "ZCUBE", "upstream"),
+    ]
+    assert fake.closed is True
+
+
+def test_live_smoke_redacts_runtime_secret_from_partial_error() -> None:
+    leaked_value = "redaction-target-value"
+    fake = FailingDataflowBwClient(leaked_value)
+    client = TestClient(create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: fake))
+    _put_runtime_bw_config(client, password=leaked_value)
+
+    response = client.post(
+        "/api/live/smoke",
+        json={
+            "confirm_read_only": True,
+            "search_term": "Z",
+            "object_name": "ZCUBE",
+        },
+    )
+
+    assert response.status_code == 200
+    assert leaked_value not in response.text
+    payload = response.json()
+    assert payload["status"] == "partial"
+    dataflow_error = payload["operations"][1]["error"]
+    assert dataflow_error == "authorization token=[REDACTED] failed"
+    assert fake.closed is True
+
+
+def test_live_collect_writes_local_snapshot_manifest_without_secrets(tmp_path) -> None:
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=tmp_path, bw_client_factory=lambda _state: fake))
+    _put_runtime_bw_config(client)
+
+    response = client.post(
+        "/api/collect/live",
+        json={
+            "confirm_read_only": True,
+            "out_dir": "snapshots/live",
+            "search_terms": ["Z"],
+            "object_names": ["ZCUBE"],
+            "include_dataflow": True,
+            "include_xref": True,
+            "xref_direction": "downstream",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "fixture-user" not in response.text
+    payload = response.json()
+    assert payload["mode"] == "live-read-only"
+    assert payload["read_only"] is True
+    assert payload["manifest"]["mode"] == "live-read-only"
+    assert len(payload["manifest"]["payloads"]) == 3
+    manifest_path = tmp_path / "snapshots/live/manifest.json"
+    assert manifest_path.exists()
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    assert "fixture-user" not in manifest_text
+    assert "bw://bw_search" in manifest_text
+    assert fake.calls == [
+        ("search", "Z", None),
+        ("dataflow", "ZCUBE"),
+        ("xref", "ZCUBE", "downstream"),
+    ]
+
+
+def test_live_collect_rejects_output_path_escape(tmp_path) -> None:
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=tmp_path, bw_client_factory=lambda _state: fake))
+    _put_runtime_bw_config(client)
+
+    response = client.post(
+        "/api/collect/live",
+        json={
+            "confirm_read_only": True,
+            "out_dir": "../outside",
+            "search_terms": ["Z"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "outside project root" in response.text
+    assert fake.calls == []
