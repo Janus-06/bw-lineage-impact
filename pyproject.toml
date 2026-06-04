@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bw-lineage-impact"
+version = "0.1.0"
+description = "Local-first read-only SAP BW lineage and change-impact analyzer."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "BW Lineage Impact Contributors" }]
+dependencies = [
+  "httpx>=0.27,<1",
+  "pydantic>=2.7,<3",
+]
+
+[project.scripts]
+bwli = "bwli.cli:app"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.10,<2",
+  "pytest>=8.2,<9",
+  "ruff>=0.5,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bwli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["bwli"]
+warn_unused_configs = true

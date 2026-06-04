@@ -10,3 +10,12 @@ coverage/
 artifacts/claude/*.json
 artifacts/claude/*.txt
 artifacts/claude/*.md
+.venv/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+.tmp/
+snapshot/

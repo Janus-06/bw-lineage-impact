@@ -1,0 +1,10 @@
+{
+  "kind": "bwsearch",
+  "objects": [
+    {
+      "technicalName": "ZADSO_SAMPLE",
+      "objectType": "ADSO",
+      "description": "Anonymized offline fixture"
+    }
+  ]
+}
