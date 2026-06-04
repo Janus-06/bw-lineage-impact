@@ -56,11 +56,10 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
         seen_paths.append(request.url.path)
         return httpx.Response(200, json={"ok": True})
 
-    credential_value = "fakepass"
     client = BwClient(
         base_url="https://bw.example.invalid",
         username="fixture-user",
-        password=credential_value,
+        password="[REDACTED]",
         sap_client="100",
         language="EN",
         transport=httpx.MockTransport(handler),
