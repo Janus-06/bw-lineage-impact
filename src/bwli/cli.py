@@ -5,9 +5,18 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from bwli import __version__
 from bwli.graph import Direction
+from bwli.impact import (
+    ImpactOutputFormat,
+    diff_graphs,
+    load_changes,
+    render_impact_report,
+    render_snapshot_diff,
+    run_impact_analysis,
+)
 from bwli.lineage import load_graph, render_lineage
 from bwli.snapshot import write_fixture_snapshot
 
@@ -50,8 +59,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     lineage.add_argument("--out", type=Path, help="Optional output path.")
 
-    for name in ("impact", "diff", "report"):
-        subparsers.add_parser(name, help=f"{name} command placeholder for later milestones.")
+    impact = subparsers.add_parser("impact", help="Analyze local graph impact from a change file.")
+    impact.add_argument("--graph", type=Path, help="Graph JSON file to read.")
+    impact.add_argument("--changes", type=Path, help="Manual change JSON file to read.")
+    impact.add_argument("--max-depth", type=int, default=3, help="Downstream traversal depth cap.")
+    impact.add_argument(
+        "--format",
+        choices=["json", "md"],
+        default="json",
+        help="Output format.",
+    )
+    impact.add_argument("--out", type=Path, help="Optional output path.")
+
+    diff = subparsers.add_parser("diff", help="Diff two local graph snapshots.")
+    diff.add_argument("--before", type=Path, help="Before graph JSON file.")
+    diff.add_argument("--after", type=Path, help="After graph JSON file.")
+    diff.add_argument("--out", type=Path, help="Optional output path.")
+
+    subparsers.add_parser("report", help="report command placeholder for later milestones.")
 
     return parser
 
@@ -72,7 +97,11 @@ def app(argv: Sequence[str] | None = None) -> int:
         return _collect(args)
     if command == "lineage":
         return _lineage(args)
-    if command in {"impact", "diff", "report"}:
+    if command == "impact":
+        return _impact(args)
+    if command == "diff":
+        return _diff(args)
+    if command == "report":
         print(f"{command} {SAFE_STUB_MESSAGE}")
         return 0
 
@@ -104,6 +133,44 @@ def _lineage(args: argparse.Namespace) -> int:
     graph = load_graph(args.graph)
     result = graph.traverse(args.object, direction=args.direction, max_depth=args.max_depth)
     rendered = render_lineage(result, output_format=args.format)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(rendered, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(rendered, end="")
+    return 0
+
+
+def _impact(args: argparse.Namespace) -> int:
+    if args.graph is None or args.changes is None:
+        if args.graph is not None or args.changes is not None:
+            print("impact requires both --graph and --changes", file=sys.stderr)
+            return 2
+        print(f"impact {SAFE_STUB_MESSAGE}")
+        return 0
+    graph = load_graph(args.graph)
+    changes = load_changes(args.changes)
+    report = run_impact_analysis(graph, changes, max_depth=args.max_depth)
+    rendered = render_impact_report(report, output_format=cast(ImpactOutputFormat, args.format))
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(rendered, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(rendered, end="")
+    return 0
+
+
+def _diff(args: argparse.Namespace) -> int:
+    if args.before is None or args.after is None:
+        if args.before is not None or args.after is not None:
+            print("diff requires both --before and --after", file=sys.stderr)
+            return 2
+        print(f"diff {SAFE_STUB_MESSAGE}")
+        return 0
+    diff = diff_graphs(load_graph(args.before), load_graph(args.after))
+    rendered = render_snapshot_diff(diff)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(rendered, encoding="utf-8")

@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "nodes": [
+    {"id": "SRC", "name": "Source ADSO", "type": "ADSO"},
+    {"id": "TR", "name": "Sales Transformation", "type": "TRFN"},
+    {"id": "TGT", "name": "Target ADSO", "type": "ADSO"}
+  ],
+  "edges": [
+    {"id": "e1", "source": "SRC", "target": "TR", "type": "feeds", "confidence": "direct"},
+    {"id": "e2", "source": "TR", "target": "TGT", "type": "loads", "confidence": "direct"}
+  ]
+}
