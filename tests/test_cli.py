@@ -12,7 +12,7 @@ def test_version_cli(capsys) -> None:
 
 
 def test_stub_commands_are_safe_and_offline(capsys) -> None:
-    for command in ["collect", "lineage", "impact", "diff", "report"]:
+    for command in ["collect", "impact", "diff", "report"]:
         assert app([command]) == 0
         captured = capsys.readouterr()
         combined = f"{captured.out}\n{captured.err}".lower()

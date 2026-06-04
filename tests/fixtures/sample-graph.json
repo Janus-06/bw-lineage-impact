@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "nodes": [
+    {"id": "SRC", "name": "Source ADSO", "type": "ADSO"},
+    {"id": "TR", "name": "Sales Transformation", "type": "TRFN"},
+    {"id": "TGT", "name": "Target ADSO", "type": "ADSO"},
+    {"id": "QRY", "name": "Sales Query", "type": "QUERY"},
+    {"id": "LOOP", "name": "Cycle Guard", "type": "TEST"}
+  ],
+  "edges": [
+    {"id": "e1", "source": "SRC", "target": "TR", "type": "feeds", "confidence": "direct"},
+    {"id": "e2", "source": "TR", "target": "TGT", "type": "loads", "confidence": "direct"},
+    {"id": "e3", "source": "TGT", "target": "QRY", "type": "consumed_by", "confidence": "direct"},
+    {"id": "e4", "source": "QRY", "target": "LOOP", "type": "test_cycle", "confidence": "unknown"},
+    {"id": "e5", "source": "LOOP", "target": "TGT", "type": "test_cycle", "confidence": "unknown"}
+  ]
+}
