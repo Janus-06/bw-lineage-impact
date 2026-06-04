@@ -117,6 +117,27 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("report", help="report command placeholder for later milestones.")
 
+    serve = subparsers.add_parser("serve", help="Run the local backend API and built frontend.")
+    serve.add_argument("--host", default="127.0.0.1", help="Bind host; keep loopback by default.")
+    serve.add_argument("--port", type=int, default=8787, help="Bind port.")
+    serve.add_argument(
+        "--project-root",
+        type=Path,
+        default=Path.cwd(),
+        help="Project root used to resolve local graph/report files.",
+    )
+    serve.add_argument(
+        "--static-dir",
+        type=Path,
+        default=Path("web/dist"),
+        help="Built frontend directory to serve when present.",
+    )
+    serve.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable uvicorn reload for development.",
+    )
+
     return parser
 
 
@@ -147,6 +168,8 @@ def app(argv: Sequence[str] | None = None) -> int:
     if command == "report":
         print(f"{command} {SAFE_STUB_MESSAGE}")
         return 0
+    if command == "serve":
+        return _serve(args)
 
     print(f"unknown command: {command}", file=sys.stderr)
     return 2
@@ -220,6 +243,21 @@ def _sql_view(args: argparse.Namespace) -> int:
     result = parse_native_sql_view(load_text(args.sql_file), view_id=args.id)
     rendered = render_sql_view_evidence(result, output_format=cast(SqlOutputFormat, args.format))
     return _write_or_print(rendered, args.out)
+
+
+def _serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    os.environ["BWLI_PROJECT_ROOT"] = str(args.project_root.resolve())
+    os.environ["BWLI_STATIC_DIR"] = str(args.static_dir)
+    uvicorn.run(
+        "bwli.server:create_default_app",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
+    return 0
 
 
 def _write_or_print(rendered: str, out: Path | None) -> int:

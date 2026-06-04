@@ -36,6 +36,51 @@ uv run bwli collect --fixture tests/fixtures/sample-search.json --out .tmp/snaps
 uv run pytest -q
 uv run ruff check .
 uv run mypy src
+npm --prefix web install
+npm --prefix web run build
+```
+
+## Local backend + frontend
+
+Run both local servers for development:
+
+```bash
+./scripts/dev-local.sh
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5173
+```
+
+This starts:
+
+- Backend API: `http://127.0.0.1:8787`
+- Frontend dev server: `http://127.0.0.1:5173`
+
+The frontend talks to the local backend through Vite's `/api` proxy. If you use the `Runtime Settings` tab, BW credentials temporarily pass through browser memory and are sent only to the local backend.
+
+Use the `Runtime Settings` tab to enter BW and optional local LLM runtime values from the web UI. The backend keeps these values in process memory only:
+
+- Not written to `.env`, config files, snapshots, reports, or Git.
+- Secret values are not returned by API responses; the UI only receives `[REDACTED]` status.
+- Values are cleared when the backend process stops or when you click `Clear`.
+
+Current live-BW readiness note: the project has a GET-only `BwClient` and endpoint builders for `bw_search`, `bw_get_dataflow`, and `bw_xref`, but the `collect --live` path is still intentionally gated/placeholder. Use the web settings now to prepare runtime config safely; actual SAP BW live collection still needs the collector wiring and sandbox smoke test before it should be considered production-ready.
+
+You can also build the frontend and serve it from the Python backend only:
+
+```bash
+npm --prefix web install
+npm --prefix web run build
+uv run bwli serve --host 127.0.0.1 --port 8787
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8787
 ```
 
 Live BW collection is gated and should only be run with a read-only account after explicit setup:

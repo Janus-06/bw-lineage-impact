@@ -108,6 +108,10 @@ def _resolve_env_ref(ref: str) -> str:
     return value
 
 
+def validate_local_llm_base_url(base_url: str) -> None:
+    _validate_local_llm_base_url(base_url)
+
+
 def _validate_local_llm_base_url(base_url: str) -> None:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
