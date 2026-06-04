@@ -85,6 +85,40 @@ def test_sql_view_endpoint_uses_local_sql_file_only() -> None:
     assert "no SQL rewrite or DB change is applied" in payload["content"]
 
 
+def test_sql_view_endpoint_rejects_absolute_path_outside_project_root(tmp_path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside.sql"
+    outside.write_text("SELECT * FROM sensitive_table", encoding="utf-8")
+    client = TestClient(create_app(project_root=root))
+
+    response = client.post(
+        "/api/sql-view",
+        json={"view_id": "ZSQL_VIEW", "sql_file": str(outside), "format": "json"},
+    )
+
+    assert response.status_code == 400
+    assert "project root" in response.text
+    assert "sensitive_table" not in response.text
+
+
+def test_sql_view_endpoint_rejects_parent_directory_traversal(tmp_path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside.sql"
+    outside.write_text("SELECT * FROM escaped_table", encoding="utf-8")
+    client = TestClient(create_app(project_root=root))
+
+    response = client.post(
+        "/api/sql-view",
+        json={"view_id": "ZSQL_VIEW", "sql_file": "../outside.sql", "format": "json"},
+    )
+
+    assert response.status_code == 400
+    assert "project root" in response.text
+    assert "escaped_table" not in response.text
+
+
 def test_field_lineage_endpoint_renders_from_local_xml() -> None:
     client = TestClient(create_app(project_root=Path.cwd()))
 

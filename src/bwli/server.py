@@ -441,8 +441,13 @@ def _redact_validation_errors(exc: RequestValidationError) -> list[dict[str, obj
 
 def _resolve_local_path(root: Path, user_path: str) -> Path:
     path = Path(user_path)
-    resolved = path if path.is_absolute() else root / path
+    root_resolved = root.resolve()
+    resolved = path if path.is_absolute() else root_resolved / path
     resolved = resolved.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"local path must stay under project root: {user_path}") from exc
     if not resolved.exists():
         raise FileNotFoundError(f"local file not found: {user_path}")
     if not resolved.is_file():
