@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
-import { getHealth, postRendered, type HealthResponse, type OutputFormat } from './api';
+import {
+  clearRuntimeConfig,
+  getHealth,
+  getRuntimeConfig,
+  postRendered,
+  putRuntimeConfig,
+  type HealthResponse,
+  type OutputFormat,
+  type RuntimeConfigResponse,
+} from './api';
 
-type Tool = 'lineage' | 'impact' | 'sql-view' | 'field-lineage';
+type Tool = 'settings' | 'lineage' | 'impact' | 'sql-view' | 'field-lineage';
 
 interface FormState {
   graphPath: string;
@@ -14,6 +23,19 @@ interface FormState {
   sourceObject: string;
   targetObject: string;
   format: OutputFormat;
+}
+
+interface SettingsState {
+  bwUrl: string;
+  bwUser: string;
+  bwPassword: string;
+  bwClient: string;
+  bwLanguage: string;
+  bwVerifySsl: boolean;
+  llmEnabled: boolean;
+  llmBaseUrl: string;
+  llmModel: string;
+  llmApiKey: string;
 }
 
 const defaultState: FormState = {
@@ -29,7 +51,21 @@ const defaultState: FormState = {
   format: 'md',
 };
 
+const defaultSettings: SettingsState = {
+  bwUrl: '',
+  bwUser: '',
+  bwPassword: '',
+  bwClient: '100',
+  bwLanguage: 'EN',
+  bwVerifySsl: true,
+  llmEnabled: false,
+  llmBaseUrl: 'http://127.0.0.1:11434/v1',
+  llmModel: '',
+  llmApiKey: '',
+};
+
 const toolLabels: Record<Tool, string> = {
+  settings: 'Runtime Settings',
   lineage: 'Lineage',
   impact: 'Change Impact',
   'sql-view': 'Native SQL View',
@@ -37,22 +73,51 @@ const toolLabels: Record<Tool, string> = {
 };
 
 export default function App() {
-  const [tool, setTool] = useState<Tool>('lineage');
+  const [tool, setTool] = useState<Tool>('settings');
   const [form, setForm] = useState<FormState>(defaultState);
+  const [settings, setSettings] = useState<SettingsState>(defaultSettings);
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfigResponse | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [result, setResult] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    getHealth()
-      .then(setHealth)
-      .catch((err: unknown) => setError(`Backend 연결 실패: ${String(err)}`));
+    void refreshStatus();
   }, []);
 
   const endpoint = useMemo(() => `/api/${tool}`, [tool]);
 
+  async function refreshStatus() {
+    try {
+      const [healthResponse, configResponse] = await Promise.all([getHealth(), getRuntimeConfig()]);
+      setHealth(healthResponse);
+      setRuntimeConfig(configResponse);
+      hydrateSettingsFromRedactedConfig(configResponse);
+    } catch (err: unknown) {
+      setError(`Backend 연결 실패: ${String(err)}`);
+    }
+  }
+
+  function hydrateSettingsFromRedactedConfig(config: RuntimeConfigResponse) {
+    setSettings((current) => ({
+      ...current,
+      bwUrl: config.bw.url ?? current.bwUrl,
+      bwUser: config.bw.user ?? current.bwUser,
+      bwClient: config.bw.client ?? current.bwClient,
+      bwLanguage: config.bw.language ?? current.bwLanguage,
+      bwVerifySsl: config.bw.verify_ssl,
+      llmEnabled: config.llm.enabled,
+      llmBaseUrl: config.llm.base_url ?? current.llmBaseUrl,
+      llmModel: config.llm.model ?? current.llmModel,
+    }));
+  }
+
   async function runAnalysis() {
+    if (tool === 'settings') {
+      await saveSettings();
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -65,9 +130,66 @@ export default function App() {
     }
   }
 
+  async function saveSettings() {
+    setBusy(true);
+    setError('');
+    try {
+      const body = {
+        bw: settings.bwUrl
+          ? {
+              url: settings.bwUrl,
+              user: settings.bwUser,
+              password: settings.bwPassword,
+              client: settings.bwClient,
+              language: settings.bwLanguage,
+              verify_ssl: settings.bwVerifySsl,
+            }
+          : undefined,
+        llm: {
+          enabled: settings.llmEnabled,
+          base_url: settings.llmEnabled ? settings.llmBaseUrl : undefined,
+          model: settings.llmEnabled ? settings.llmModel : undefined,
+          api_key: settings.llmEnabled ? settings.llmApiKey : undefined,
+        },
+      };
+      const config = await putRuntimeConfig(body);
+      setRuntimeConfig(config);
+      setSettings((current) => ({ ...current, bwPassword: '', llmApiKey: '' }));
+      setResult(
+        'Runtime settings saved in backend process memory only. Secrets were not returned by the API.',
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearSettings() {
+    setBusy(true);
+    setError('');
+    try {
+      const config = await clearRuntimeConfig();
+      setRuntimeConfig(config);
+      setSettings(defaultSettings);
+      setResult('Runtime settings cleared from backend process memory.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
+
+  function updateSettings<K extends keyof SettingsState>(key: K, value: SettingsState[K]) {
+    setSettings((current) => ({ ...current, [key]: value }));
+  }
+
+  const bwConfigured = runtimeConfig?.bw.configured ?? false;
+  const llmConfigured = runtimeConfig?.llm.configured ?? false;
 
   return (
     <main className="shell">
@@ -84,7 +206,10 @@ export default function App() {
           <span className={health?.status === 'ok' ? 'dot ok' : 'dot'} />
           <div>
             <strong>{health ? `Backend ${health.status}` : 'Backend 확인 중'}</strong>
-            <span>v{health?.version ?? '—'} · read-only · LLM off by default</span>
+            <span>
+              v{health?.version ?? '—'} · BW {bwConfigured ? 'configured' : 'not configured'} · LLM{' '}
+              {llmConfigured ? 'configured' : 'off'}
+            </span>
           </div>
         </div>
       </section>
@@ -107,15 +232,30 @@ export default function App() {
         <section className="panel formPanel">
           <div className="panelHeader">
             <h2>{toolLabels[tool]}</h2>
-            <select
-              value={form.format}
-              onChange={(event) => update('format', event.target.value as OutputFormat)}
-            >
-              <option value="md">Markdown</option>
-              <option value="json">JSON</option>
-              {tool === 'lineage' ? <option value="mermaid">Mermaid</option> : null}
-            </select>
+            {tool === 'settings' ? (
+              <span>process-memory only</span>
+            ) : (
+              <select
+                value={form.format}
+                onChange={(event) => update('format', event.target.value as OutputFormat)}
+              >
+                <option value="md">Markdown</option>
+                <option value="json">JSON</option>
+                {tool === 'lineage' ? <option value="mermaid">Mermaid</option> : null}
+              </select>
+            )}
           </div>
+
+          {tool === 'settings' ? (
+            <SettingsPanel
+              busy={busy}
+              settings={settings}
+              runtimeConfig={runtimeConfig}
+              onClear={() => void clearSettings()}
+              onSave={() => void saveSettings()}
+              updateSettings={updateSettings}
+            />
+          ) : null}
 
           {tool === 'lineage' || tool === 'impact' ? (
             <Field label="Graph JSON path" value={form.graphPath} onChange={(v) => update('graphPath', v)} />
@@ -141,9 +281,11 @@ export default function App() {
             </>
           ) : null}
 
-          <button className="run" disabled={busy} onClick={() => void runAnalysis()} type="button">
-            {busy ? '실행 중…' : 'Run local analysis'}
-          </button>
+          {tool !== 'settings' ? (
+            <button className="run" disabled={busy} onClick={() => void runAnalysis()} type="button">
+              {busy ? '실행 중…' : 'Run local analysis'}
+            </button>
+          ) : null}
           {error ? <p className="error">{error}</p> : null}
         </section>
 
@@ -159,16 +301,123 @@ export default function App() {
   );
 }
 
-function Field({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+function SettingsPanel({
+  busy,
+  settings,
+  runtimeConfig,
+  onClear,
+  onSave,
+  updateSettings,
+}: {
+  busy: boolean;
+  settings: SettingsState;
+  runtimeConfig: RuntimeConfigResponse | null;
+  onClear: () => void;
+  onSave: () => void;
+  updateSettings: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
+}) {
+  return (
+    <div className="settingsStack">
+      <p className="notice">
+        입력값은 로컬 백엔드 프로세스 메모리에만 보관됩니다. 파일/env에 저장하지 않고, API 응답에는
+        secret을 반환하지 않습니다.
+      </p>
+      <h3>BW runtime env</h3>
+      <Field label="BW_URL" value={settings.bwUrl} onChange={(v) => updateSettings('bwUrl', v)} />
+      <Field label="BW_USER" value={settings.bwUser} onChange={(v) => updateSettings('bwUser', v)} />
+      <Field
+        inputType="password"
+        label="BW_PASSWORD"
+        value={settings.bwPassword}
+        onChange={(v) => updateSettings('bwPassword', v)}
+      />
+      <div className="twoColumn">
+        <Field label="BW_CLIENT" value={settings.bwClient} onChange={(v) => updateSettings('bwClient', v)} />
+        <Field
+          label="BW_LANGUAGE"
+          value={settings.bwLanguage}
+          onChange={(v) => updateSettings('bwLanguage', v)}
+        />
+      </div>
+      <Checkbox
+        checked={settings.bwVerifySsl}
+        label="BW_VERIFY_SSL"
+        onChange={(value) => updateSettings('bwVerifySsl', value)}
+      />
+
+      <h3>Local OpenAI-compatible LLM</h3>
+      <Checkbox
+        checked={settings.llmEnabled}
+        label="Enable optional local LLM explainer"
+        onChange={(value) => updateSettings('llmEnabled', value)}
+      />
+      <Field
+        label="BWLI_LLM_BASE_URL"
+        value={settings.llmBaseUrl}
+        onChange={(v) => updateSettings('llmBaseUrl', v)}
+      />
+      <Field label="BWLI_LLM_MODEL" value={settings.llmModel} onChange={(v) => updateSettings('llmModel', v)} />
+      <Field
+        inputType="password"
+        label="BWLI_LLM_API_KEY"
+        value={settings.llmApiKey}
+        onChange={(v) => updateSettings('llmApiKey', v)}
+      />
+
+      <div className="buttonRow">
+        <button className="run" disabled={busy} onClick={onSave} type="button">
+          {busy ? '저장 중…' : 'Save runtime settings'}
+        </button>
+        <button className="secondary" disabled={busy} onClick={onClear} type="button">
+          Clear
+        </button>
+      </div>
+      <p className="configSummary">
+        BW: {runtimeConfig?.bw.configured ? 'configured' : 'not configured'} · LLM:{' '}
+        {runtimeConfig?.llm.configured ? 'configured' : 'not configured'} · storage:{' '}
+        {runtimeConfig?.storage ?? 'process-memory'}
+      </p>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  inputType = 'text',
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  inputType?: 'text' | 'password';
+}) {
   return (
     <label className="field">
       <span>{label}</span>
-      <input value={value} onChange={(event) => onChange(event.target.value)} />
+      <input type={inputType} value={value} onChange={(event) => onChange(event.target.value)} />
     </label>
   );
 }
 
-function buildRequest(tool: Tool, form: FormState): unknown {
+function Checkbox({
+  checked,
+  label,
+  onChange,
+}: {
+  checked: boolean;
+  label: string;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <label className="checkboxRow">
+      <input checked={checked} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+function buildRequest(tool: Exclude<Tool, 'settings'>, form: FormState): unknown {
   if (tool === 'lineage') {
     return {
       graph_path: form.graphPath,

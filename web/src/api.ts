@@ -13,9 +13,65 @@ export interface HealthResponse {
   version: string;
 }
 
+export interface RuntimeConfigResponse {
+  storage: 'process-memory';
+  bw: {
+    configured: boolean;
+    url: string | null;
+    user: string | null;
+    password: string | null;
+    client: string | null;
+    language: string;
+    verify_ssl: boolean;
+  };
+  llm: {
+    enabled: boolean;
+    configured: boolean;
+    base_url: string | null;
+    model: string | null;
+    api_key: string | null;
+  };
+}
+
+export interface RuntimeConfigRequest {
+  bw?: {
+    url: string;
+    user: string;
+    password: string;
+    client: string;
+    language: string;
+    verify_ssl: boolean;
+  };
+  llm?: {
+    enabled: boolean;
+    base_url?: string;
+    model?: string;
+    api_key?: string;
+  };
+}
+
 export async function getHealth(): Promise<HealthResponse> {
   const response = await fetch('/api/health');
   return parseJsonResponse<HealthResponse>(response);
+}
+
+export async function getRuntimeConfig(): Promise<RuntimeConfigResponse> {
+  const response = await fetch('/api/runtime-config');
+  return parseJsonResponse<RuntimeConfigResponse>(response);
+}
+
+export async function putRuntimeConfig(body: RuntimeConfigRequest): Promise<RuntimeConfigResponse> {
+  const response = await fetch('/api/runtime-config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return parseJsonResponse<RuntimeConfigResponse>(response);
+}
+
+export async function clearRuntimeConfig(): Promise<RuntimeConfigResponse> {
+  const response = await fetch('/api/runtime-config', { method: 'DELETE' });
+  return parseJsonResponse<RuntimeConfigResponse>(response);
 }
 
 export async function postRendered(path: string, body: unknown): Promise<RenderedResponse> {

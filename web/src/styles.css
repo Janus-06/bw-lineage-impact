@@ -41,6 +41,15 @@ h1 { margin: 8px 0 12px; font-size: 44px; line-height: 1; }
 .field span { display: block; color: #a8b6c8; margin-bottom: 7px; font-size: 13px; font-weight: 650; }
 input, select { width: 100%; color: #e8f1ff; border: 1px solid rgba(143,168,205,.22); border-radius: 12px; background: rgba(0,0,0,.24); padding: 11px 12px; outline: none; }
 input:focus, select:focus { border-color: #7ea2ff; box-shadow: 0 0 0 3px rgba(126,162,255,.14); }
+.settingsStack h3 { margin: 18px 0 12px; color: #e8f1ff; font-size: 15px; }
+.notice { color: #b8c9df; background: rgba(126, 162, 255, .1); border: 1px solid rgba(126, 162, 255, .22); border-radius: 12px; padding: 12px; line-height: 1.5; }
+.twoColumn { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.checkboxRow { display: flex; align-items: center; gap: 10px; margin: 8px 0 14px; color: #c4d2e5; }
+.checkboxRow input { width: auto; }
+.buttonRow { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+.secondary { border: 1px solid rgba(143,168,205,.26); border-radius: 13px; padding: 13px 16px; color: #dce7f5; background: rgba(255,255,255,.05); font-weight: 800; cursor: pointer; }
+.secondary:disabled { cursor: wait; opacity: .65; }
+.configSummary { color: #95a8bf; font-size: 13px; line-height: 1.5; }
 .run { width: 100%; margin-top: 8px; border: none; border-radius: 13px; padding: 13px 16px; color: #07111f; background: linear-gradient(135deg, #8fb0ff, #4ee2b2); font-weight: 800; cursor: pointer; }
 .run:disabled { cursor: wait; opacity: .65; }
 .error { color: #ff9b9b; background: rgba(255, 84, 84, .1); border: 1px solid rgba(255, 84, 84, .22); border-radius: 12px; padding: 12px; }
