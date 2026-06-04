@@ -121,20 +121,20 @@ def collect_live_snapshot(
     payloads = []
     client = client_factory()
     try:
-        for term in search_terms:
+        for index, term in enumerate(search_terms):
             payloads.append(
                 writer.write_payload(
-                    payload_id=f"search-{_safe_fragment(term)}",
+                    payload_id=f"search-{index}-{_safe_fragment(term)}",
                     kind="bw_search",
                     source="bw://bw_search",
                     payload=client.fetch_search(term),
                 )
             )
-        for object_name in object_names:
+        for index, object_name in enumerate(object_names):
             if include_dataflow:
                 payloads.append(
                     writer.write_payload(
-                        payload_id=f"dataflow-{_safe_fragment(object_name)}",
+                        payload_id=f"dataflow-{index}-{_safe_fragment(object_name)}",
                         kind="bw_get_dataflow",
                         source="bw://bw_get_dataflow",
                         payload=client.fetch_dataflow(object_name),
@@ -143,7 +143,7 @@ def collect_live_snapshot(
             if include_xref:
                 payloads.append(
                     writer.write_payload(
-                        payload_id=f"xref-{_safe_fragment(object_name)}-{xref_direction}",
+                        payload_id=f"xref-{index}-{_safe_fragment(object_name)}-{xref_direction}",
                         kind="bw_xref",
                         source=f"bw://bw_xref/{xref_direction}",
                         payload=client.fetch_xref(object_name, direction=xref_direction),
@@ -198,9 +198,10 @@ def _payload_shape(payload: Any) -> tuple[str, int | None]:
 
 def _safe_fragment(value: str) -> str:
     safe = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value)
-    if safe:
-        return safe[:80]
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    if not safe:
+        return digest
+    return f"{safe[:67]}-{digest}"
 
 
 def _redact_text(value: str, *, secret_values: Sequence[str]) -> str:

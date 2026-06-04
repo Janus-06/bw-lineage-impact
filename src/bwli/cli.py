@@ -53,6 +53,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--live", action="store_true", help="Enable gated live collection path.")
     collect.add_argument(
+        "--confirm-read-only",
+        action="store_true",
+        help="Required with --live to explicitly confirm read-only BW calls.",
+    )
+    collect.add_argument(
         "--search-term",
         dest="search_terms",
         action="append",
@@ -222,6 +227,17 @@ def _collect(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if not args.confirm_read_only:
+            print(
+                "live collection requires --confirm-read-only; no BW calls were made",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            out_dir = _resolve_live_output_dir(Path.cwd(), args.out)
+        except ValueError as exc:
+            print(f"{exc}; no BW calls were made", file=sys.stderr)
+            return 2
         try:
             config = BwConnectionConfig.from_env()
         except ConfigError as exc:
@@ -240,7 +256,7 @@ def _collect(args: argparse.Namespace) -> int:
 
         try:
             manifest = collect_live_snapshot(
-                out_dir=args.out,
+                out_dir=out_dir,
                 client_factory=factory,
                 search_terms=args.search_terms,
                 object_names=args.objects,
@@ -251,7 +267,7 @@ def _collect(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"live collection failed: {type(exc).__name__}", file=sys.stderr)
             return 1
-        print(f"wrote {args.out / 'manifest.json'} with {len(manifest.payloads)} payload(s)")
+        print(f"wrote {out_dir / 'manifest.json'} with {len(manifest.payloads)} payload(s)")
         return 0
     print(SAFE_STUB_MESSAGE)
     return 0
@@ -330,3 +346,14 @@ def _write_or_print(rendered: str, out: Path | None) -> int:
     else:
         print(rendered, end="")
     return 0
+
+
+def _resolve_live_output_dir(root: Path, out_dir: Path) -> Path:
+    root_resolved = root.resolve()
+    resolved = out_dir if out_dir.is_absolute() else root_resolved / out_dir
+    resolved = resolved.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("live output path is outside project root") from exc
+    return resolved

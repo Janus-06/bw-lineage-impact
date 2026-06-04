@@ -28,3 +28,44 @@ def test_collect_live_requires_explicit_gate(capsys, monkeypatch) -> None:
     captured = capsys.readouterr()
     assert "gated" in captured.err
     assert "no BW calls" in captured.err
+
+
+def test_collect_live_requires_explicit_read_only_confirmation(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("BWLI_LIVE", "1")
+
+    assert app(["collect", "--live", "--search-term", "Z"]) == 2
+
+    captured = capsys.readouterr()
+    assert "--confirm-read-only" in captured.err
+    assert "no BW calls" in captured.err
+
+
+def test_collect_live_rejects_output_path_escape_before_bw_config(
+    tmp_path,
+    capsys,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("BWLI_LIVE", "1")
+
+    assert (
+        app(
+            [
+                "collect",
+                "--live",
+                "--confirm-read-only",
+                "--search-term",
+                "Z",
+                "--out",
+                "../outside",
+            ]
+        )
+        == 2
+    )
+
+    captured = capsys.readouterr()
+    assert "outside project root" in captured.err
+    assert "BW_URL" not in captured.err
+    assert not (tmp_path / "outside").exists()
