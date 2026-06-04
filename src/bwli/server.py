@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -11,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from bwli import __version__
+from bwli.client import BwClient
 from bwli.config import ConfigError, validate_local_llm_base_url
 from bwli.field_lineage import (
     load_text,
@@ -28,6 +30,13 @@ from bwli.impact import (
     run_impact_analysis,
 )
 from bwli.lineage import load_graph, render_lineage
+from bwli.live import (
+    BwReadClient,
+    LiveCollectionResponse,
+    LiveSmokeResult,
+    collect_live_snapshot,
+    run_live_smoke,
+)
 
 LineageFormat = Literal["json", "mermaid", "md"]
 ImpactFormat = Literal["json", "md"]
@@ -193,10 +202,35 @@ class FieldLineageRequest(BaseModel):
     format: EvidenceFormat = "json"
 
 
+class LiveSmokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_read_only: bool = False
+    search_term: str = "*"
+    object_name: str | None = None
+    xref_direction: Literal["upstream", "downstream"] = "downstream"
+
+
+class LiveCollectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_read_only: bool = False
+    out_dir: str = ".tmp/live-snapshot"
+    search_terms: list[str] = Field(default_factory=list)
+    object_names: list[str] = Field(default_factory=list)
+    include_dataflow: bool = True
+    include_xref: bool = True
+    xref_direction: Literal["upstream", "downstream"] = "downstream"
+
+
+BwClientFactory = Callable[[RuntimeBwConfigState], BwReadClient]
+
+
 def create_app(
     *,
     project_root: Path | None = None,
     static_dir: Path | None = None,
+    bw_client_factory: BwClientFactory | None = None,
 ) -> FastAPI:
     """Create the local read-only API and optional static frontend server."""
 
@@ -311,6 +345,38 @@ def create_app(
         except Exception as exc:
             raise _http_error(exc) from exc
         return RenderedResponse(format=request.format, content=content)
+
+    @app.post("/api/live/smoke", response_model=LiveSmokeResult)
+    def live_smoke(request: LiveSmokeRequest) -> LiveSmokeResult:
+        state = _ensure_live_ready(runtime_config, request.confirm_read_only)
+        return run_live_smoke(
+            client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
+            search_term=request.search_term,
+            object_name=request.object_name,
+            xref_direction=request.xref_direction,
+            secret_values=_runtime_secret_values(state),
+        )
+
+    @app.post("/api/collect/live", response_model=LiveCollectionResponse)
+    def live_collect(request: LiveCollectRequest) -> LiveCollectionResponse:
+        state = _ensure_live_ready(runtime_config, request.confirm_read_only)
+        try:
+            out_dir = _resolve_local_output_dir(root, request.out_dir)
+            manifest = collect_live_snapshot(
+                out_dir=out_dir,
+                client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
+                search_terms=request.search_terms,
+                object_names=request.object_names,
+                include_dataflow=request.include_dataflow,
+                include_xref=request.include_xref,
+                xref_direction=request.xref_direction,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        return LiveCollectionResponse(
+            manifest_path=str(out_dir / "manifest.json"),
+            manifest=manifest,
+        )
 
     frontend_dir = _frontend_static_dir(root, static_dir)
     if frontend_dir is not None:
@@ -452,6 +518,50 @@ def _resolve_local_path(root: Path, user_path: str) -> Path:
         raise FileNotFoundError(f"local file not found: {user_path}")
     if not resolved.is_file():
         raise ValueError(f"local path is not a file: {user_path}")
+    return resolved
+
+
+def _ensure_live_ready(state: RuntimeConfigState, confirm_read_only: bool) -> RuntimeBwConfigState:
+    if not state.bw.configured:
+        raise HTTPException(status_code=400, detail="BW runtime config is not configured")
+    if not confirm_read_only:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm_read_only=true is required before live BW calls",
+        )
+    return state.bw
+
+
+def _build_runtime_bw_client(
+    state: RuntimeBwConfigState,
+    factory: BwClientFactory | None,
+) -> BwReadClient:
+    if factory is not None:
+        return factory(state)
+    if not state.url or not state.user or not state.password or not state.client:
+        raise ConfigError("BW runtime config is incomplete")
+    return BwClient(
+        base_url=state.url,
+        username=state.user,
+        password=state.password,
+        sap_client=state.client,
+        language=state.language,
+        verify=state.verify_ssl,
+    )
+
+
+def _runtime_secret_values(state: RuntimeBwConfigState) -> list[str]:
+    return [state.password] if state.password else []
+
+
+def _resolve_local_output_dir(root: Path, user_path: str) -> Path:
+    path = Path(user_path)
+    resolved = path if path.is_absolute() else root / path
+    resolved = resolved.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("live output path is outside project root") from exc
     return resolved
 
 

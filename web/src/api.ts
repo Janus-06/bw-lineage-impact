@@ -50,6 +50,30 @@ export interface RuntimeConfigRequest {
   };
 }
 
+export interface LiveOperationSummary {
+  name: string;
+  label: string;
+  ok: boolean;
+  status: 'ok' | 'error';
+  payload_kind: string | null;
+  item_count: number | null;
+  error: string | null;
+}
+
+export interface LiveSmokeResponse {
+  mode: 'live-read-only';
+  read_only: boolean;
+  status: 'ok' | 'partial' | 'error';
+  operations: LiveOperationSummary[];
+}
+
+export interface LiveCollectResponse {
+  mode: 'live-read-only';
+  read_only: boolean;
+  manifest_path: string;
+  manifest: unknown;
+}
+
 export async function getHealth(): Promise<HealthResponse> {
   const response = await fetch('/api/health');
   return parseJsonResponse<HealthResponse>(response);
@@ -75,12 +99,16 @@ export async function clearRuntimeConfig(): Promise<RuntimeConfigResponse> {
 }
 
 export async function postRendered(path: string, body: unknown): Promise<RenderedResponse> {
+  return postJson<RenderedResponse>(path, body);
+}
+
+export async function postJson<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  return parseJsonResponse<RenderedResponse>(response);
+  return parseJsonResponse<T>(response);
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {

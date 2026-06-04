@@ -22,6 +22,7 @@ class BwConnectionConfig(BaseModel):
     password: SecretStr
     client: str
     language: str = "EN"
+    verify_ssl: bool = True
 
     @classmethod
     def from_env(cls) -> BwConnectionConfig:
@@ -39,6 +40,7 @@ class BwConnectionConfig(BaseModel):
             password=SecretStr(os.environ["BW_PASSWORD"]),
             client=os.environ["BW_CLIENT"],
             language=os.environ.get("BW_LANGUAGE", "EN"),
+            verify_ssl=_resolve_env_bool("BW_VERIFY_SSL", default=True),
         )
 
 
@@ -106,6 +108,13 @@ def _resolve_env_ref(ref: str) -> str:
     if not value:
         raise ConfigError(f"missing runtime value for {ref}")
     return value
+
+
+def _resolve_env_bool(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def validate_local_llm_base_url(base_url: str) -> None:

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import cast
 
 from bwli import __version__
+from bwli.client import BwClient
+from bwli.config import BwConnectionConfig, ConfigError
 from bwli.field_lineage import (
     FieldOutputFormat,
     SqlOutputFormat,
@@ -27,6 +29,7 @@ from bwli.impact import (
     run_impact_analysis,
 )
 from bwli.lineage import load_graph, render_lineage
+from bwli.live import collect_live_snapshot
 from bwli.snapshot import write_fixture_snapshot
 
 SAFE_STUB_MESSAGE = "offline stub: no BW calls were made"
@@ -49,6 +52,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output snapshot directory.",
     )
     collect.add_argument("--live", action="store_true", help="Enable gated live collection path.")
+    collect.add_argument(
+        "--confirm-read-only",
+        action="store_true",
+        help="Required with --live to explicitly confirm read-only BW calls.",
+    )
+    collect.add_argument(
+        "--search-term",
+        dest="search_terms",
+        action="append",
+        default=[],
+        help="BW search term to collect; repeatable.",
+    )
+    collect.add_argument(
+        "--object",
+        dest="objects",
+        action="append",
+        default=[],
+        help="BW object name to collect dataflow/xref; repeatable.",
+    )
+    collect.add_argument(
+        "--xref-direction",
+        choices=["upstream", "downstream"],
+        default="downstream",
+        help="Xref direction for live collection.",
+    )
+    collect.add_argument(
+        "--skip-dataflow",
+        action="store_true",
+        help="Skip live dataflow calls for --object values.",
+    )
+    collect.add_argument(
+        "--skip-xref",
+        action="store_true",
+        help="Skip live xref calls for --object values.",
+    )
 
     lineage = subparsers.add_parser("lineage", help="Traverse a local graph snapshot.")
     lineage.add_argument("--graph", type=Path, required=True, help="Graph JSON file to read.")
@@ -189,7 +227,47 @@ def _collect(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        print("live collection placeholder enabled; no BW calls were made in this stub")
+        if not args.confirm_read_only:
+            print(
+                "live collection requires --confirm-read-only; no BW calls were made",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            out_dir = _resolve_live_output_dir(Path.cwd(), args.out)
+        except ValueError as exc:
+            print(f"{exc}; no BW calls were made", file=sys.stderr)
+            return 2
+        try:
+            config = BwConnectionConfig.from_env()
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+        def factory() -> BwClient:
+            return BwClient(
+                base_url=config.url,
+                username=config.user,
+                password=config.password.get_secret_value(),
+                sap_client=config.client,
+                language=config.language,
+                verify=config.verify_ssl,
+            )
+
+        try:
+            manifest = collect_live_snapshot(
+                out_dir=out_dir,
+                client_factory=factory,
+                search_terms=args.search_terms,
+                object_names=args.objects,
+                include_dataflow=not args.skip_dataflow,
+                include_xref=not args.skip_xref,
+                xref_direction=args.xref_direction,
+            )
+        except Exception as exc:
+            print(f"live collection failed: {type(exc).__name__}", file=sys.stderr)
+            return 1
+        print(f"wrote {out_dir / 'manifest.json'} with {len(manifest.payloads)} payload(s)")
         return 0
     print(SAFE_STUB_MESSAGE)
     return 0
@@ -268,3 +346,14 @@ def _write_or_print(rendered: str, out: Path | None) -> int:
     else:
         print(rendered, end="")
     return 0
+
+
+def _resolve_live_output_dir(root: Path, out_dir: Path) -> Path:
+    root_resolved = root.resolve()
+    resolved = out_dir if out_dir.is_absolute() else root_resolved / out_dir
+    resolved = resolved.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("live output path is outside project root") from exc
+    return resolved
