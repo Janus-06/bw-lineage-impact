@@ -36,6 +36,43 @@ uv run bwli collect --fixture tests/fixtures/sample-search.json --out .tmp/snaps
 uv run pytest -q
 uv run ruff check .
 uv run mypy src
+npm --prefix web install
+npm --prefix web run build
+```
+
+## Local backend + frontend
+
+Run both local servers for development:
+
+```bash
+./scripts/dev-local.sh
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5173
+```
+
+This starts:
+
+- Backend API: `http://127.0.0.1:8787`
+- Frontend dev server: `http://127.0.0.1:5173`
+
+The frontend talks to the local backend through Vite's `/api` proxy. It does not need BW credentials in the browser.
+
+You can also build the frontend and serve it from the Python backend only:
+
+```bash
+npm --prefix web install
+npm --prefix web run build
+uv run bwli serve --host 127.0.0.1 --port 8787
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8787
 ```
 
 Live BW collection is gated and should only be run with a read-only account after explicit setup:
