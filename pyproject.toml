@@ -13,6 +13,7 @@ authors = [{ name = "BW Lineage Impact Contributors" }]
 dependencies = [
   "httpx>=0.27,<1",
   "pydantic>=2.7,<3",
+  "sqlglot>=25,<30",
 ]
 
 [project.scripts]

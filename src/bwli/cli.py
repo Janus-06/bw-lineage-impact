@@ -8,6 +8,15 @@ from pathlib import Path
 from typing import cast
 
 from bwli import __version__
+from bwli.field_lineage import (
+    FieldOutputFormat,
+    SqlOutputFormat,
+    load_text,
+    parse_native_sql_view,
+    parse_transformation_mapping_xml,
+    render_field_lineage,
+    render_sql_view_evidence,
+)
 from bwli.graph import Direction
 from bwli.impact import (
     ImpactOutputFormat,
@@ -76,6 +85,36 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--after", type=Path, help="After graph JSON file.")
     diff.add_argument("--out", type=Path, help="Optional output path.")
 
+    field_lineage = subparsers.add_parser(
+        "field-lineage",
+        help="Parse local Transformation XML field mapping evidence.",
+    )
+    field_lineage.add_argument("--xml", type=Path, required=True, help="Transformation XML file.")
+    field_lineage.add_argument("--transformation-id", required=True, help="Transformation id.")
+    field_lineage.add_argument("--source-object", required=True, help="Source object id.")
+    field_lineage.add_argument("--target-object", required=True, help="Target object id.")
+    field_lineage.add_argument(
+        "--format",
+        choices=["json", "md"],
+        default="json",
+        help="Output format.",
+    )
+    field_lineage.add_argument("--out", type=Path, help="Optional output path.")
+
+    sql_view = subparsers.add_parser(
+        "sql-view",
+        help="Parse local Native SQL View SQL text into deterministic evidence.",
+    )
+    sql_view.add_argument("--id", required=True, help="Native SQL View id.")
+    sql_view.add_argument("--sql-file", type=Path, required=True, help="SQL definition file.")
+    sql_view.add_argument(
+        "--format",
+        choices=["json", "md"],
+        default="json",
+        help="Output format.",
+    )
+    sql_view.add_argument("--out", type=Path, help="Optional output path.")
+
     subparsers.add_parser("report", help="report command placeholder for later milestones.")
 
     return parser
@@ -101,6 +140,10 @@ def app(argv: Sequence[str] | None = None) -> int:
         return _impact(args)
     if command == "diff":
         return _diff(args)
+    if command == "field-lineage":
+        return _field_lineage(args)
+    if command == "sql-view":
+        return _sql_view(args)
     if command == "report":
         print(f"{command} {SAFE_STUB_MESSAGE}")
         return 0
@@ -133,13 +176,7 @@ def _lineage(args: argparse.Namespace) -> int:
     graph = load_graph(args.graph)
     result = graph.traverse(args.object, direction=args.direction, max_depth=args.max_depth)
     rendered = render_lineage(result, output_format=args.format)
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(rendered, encoding="utf-8")
-        print(f"wrote {args.out}")
-    else:
-        print(rendered, end="")
-    return 0
+    return _write_or_print(rendered, args.out)
 
 
 def _impact(args: argparse.Namespace) -> int:
@@ -153,13 +190,7 @@ def _impact(args: argparse.Namespace) -> int:
     changes = load_changes(args.changes)
     report = run_impact_analysis(graph, changes, max_depth=args.max_depth)
     rendered = render_impact_report(report, output_format=cast(ImpactOutputFormat, args.format))
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(rendered, encoding="utf-8")
-        print(f"wrote {args.out}")
-    else:
-        print(rendered, end="")
-    return 0
+    return _write_or_print(rendered, args.out)
 
 
 def _diff(args: argparse.Namespace) -> int:
@@ -171,10 +202,31 @@ def _diff(args: argparse.Namespace) -> int:
         return 0
     diff = diff_graphs(load_graph(args.before), load_graph(args.after))
     rendered = render_snapshot_diff(diff)
-    if args.out:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(rendered, encoding="utf-8")
-        print(f"wrote {args.out}")
+    return _write_or_print(rendered, args.out)
+
+
+def _field_lineage(args: argparse.Namespace) -> int:
+    document = parse_transformation_mapping_xml(
+        load_text(args.xml),
+        transformation_id=args.transformation_id,
+        source_object_id=args.source_object,
+        target_object_id=args.target_object,
+    )
+    rendered = render_field_lineage(document, output_format=cast(FieldOutputFormat, args.format))
+    return _write_or_print(rendered, args.out)
+
+
+def _sql_view(args: argparse.Namespace) -> int:
+    result = parse_native_sql_view(load_text(args.sql_file), view_id=args.id)
+    rendered = render_sql_view_evidence(result, output_format=cast(SqlOutputFormat, args.format))
+    return _write_or_print(rendered, args.out)
+
+
+def _write_or_print(rendered: str, out: Path | None) -> int:
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered, encoding="utf-8")
+        print(f"wrote {out}")
     else:
         print(rendered, end="")
     return 0

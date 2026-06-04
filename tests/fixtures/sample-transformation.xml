@@ -1,0 +1,8 @@
+<Transformation id="ZTR_SALES">
+  <Mappings>
+    <Mapping sourceObject="ZADSO_SRC" sourceField="AMOUNT" targetObject="ZADSO_TGT" targetField="NETVAL" />
+    <Mapping sourceObject="ZADSO_SRC" sourceField="CURRENCY" targetObject="ZADSO_TGT" targetField="WAERS" />
+    <Mapping sourceObject="ZADSO_SRC" expression="AMOUNT * RATE" targetObject="ZADSO_TGT" targetField="LC_AMOUNT" />
+    <Mapping routine="ROUTINE_001" targetObject="ZADSO_TGT" targetField="RISK_FLAG" />
+  </Mappings>
+</Transformation>
