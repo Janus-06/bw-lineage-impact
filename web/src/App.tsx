@@ -10,6 +10,7 @@ import {
   getRuntimeConfig,
   listObjects,
   listSnapshots,
+  postImpactAdvice,
   postImpactScenario,
   postLineage,
   putRuntimeConfig,
@@ -21,6 +22,7 @@ import {
   type Direction,
   type XrefDirection,
   type HealthResponse,
+  type ImpactAdviceResponse,
   type ImpactScenarioResponse,
   type LineageResponse,
   type RuntimeConfigResponse,
@@ -41,6 +43,17 @@ const changeTypes: ChangeType[] = [
   'dtp_filter_changed',
   'compositeprovider_mapping_changed',
 ];
+
+function parseObjectNamesText(value: string): string[] {
+  return value
+    .split(/[\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function joinObjectNames(values: string[]): string {
+  return Array.from(new Set(values)).join(', ');
+}
 
 interface SetupForm {
   url: string;
@@ -83,6 +96,7 @@ export default function App() {
   const [sqlQuestion, setSqlQuestion] = useState('이 뷰의 주요 소스와 집계 로직을 설명하는 조회 초안');
   const [lineage, setLineage] = useState<LineageResponse | null>(null);
   const [impact, setImpact] = useState<ImpactScenarioResponse | null>(null);
+  const [impactAdvice, setImpactAdvice] = useState<ImpactAdviceResponse | null>(null);
   const [sqlExplain, setSqlExplain] = useState<SqlExplainResponse | null>(null);
   const [sqlDraft, setSqlDraft] = useState<SqlDraftResponse | null>(null);
   const [busy, setBusy] = useState('');
@@ -117,6 +131,8 @@ export default function App() {
     ?? (allowHiddenSelection && objectDetail?.id === selectedObjectId ? objectDetail : null);
   const runtimeMissing = runtime ? !runtime.bw.configured : true;
   const showDiagnostics = diagnosticsOpen || runtimeMissing;
+  const liveObjectNameTokens = useMemo(() => parseObjectNamesText(liveObjectNames), [liveObjectNames]);
+  const snapshotPickObjects = useMemo(() => objects.slice(0, 16), [objects]);
 
   useEffect(() => {
     void refreshAll();
@@ -147,6 +163,7 @@ export default function App() {
       setSelectedObjectId(objects[0]?.id ?? '');
       setLineage(null);
       setImpact(null);
+      setImpactAdvice(null);
     }
   }, [allowHiddenSelection, objects, selectedObjectId]);
 
@@ -171,6 +188,7 @@ export default function App() {
   function clearAnalysisState() {
     setLineage(null);
     setImpact(null);
+    setImpactAdvice(null);
     setSqlExplain(null);
     setSqlDraft(null);
     setObjectDetail(null);
@@ -185,11 +203,21 @@ export default function App() {
   }
 
   function parseLiveObjectNames(): string[] {
-    const raw = liveObjectNames.trim() || selectedObjectId;
-    return raw
-      .split(/[\n,]+/)
-      .map((value) => value.trim())
-      .filter(Boolean);
+    const names = parseObjectNamesText(liveObjectNames);
+    return names.length > 0 ? names : parseObjectNamesText(selectedObjectId);
+  }
+
+  function addLiveObjectName(objectId: string) {
+    if (!objectId.trim()) return;
+    setLiveObjectNames((current) => joinObjectNames([...parseObjectNamesText(current), objectId.trim()]));
+  }
+
+  function removeLiveObjectName(objectId: string) {
+    setLiveObjectNames((current) => joinObjectNames(parseObjectNamesText(current).filter((item) => item !== objectId)));
+  }
+
+  function clearLiveObjectNames() {
+    setLiveObjectNames('');
   }
 
   async function refreshAll() {
@@ -376,21 +404,39 @@ export default function App() {
     }
   }
 
+  function impactRequestBody() {
+    return {
+      object_id: selectedObjectId,
+      change_type: changeType,
+      field: fieldName.trim() || null,
+      description: scenarioDescription.trim() || null,
+      depth: Math.max(impactDepth, 1),
+      node_cap: nodeCap,
+      edge_cap: edgeCap,
+    };
+  }
+
   async function runImpact() {
     if (!selectedSnapshotId || !selectedObjectId) return;
     setBusy('impact');
     try {
-      setImpact(
-        await postImpactScenario(selectedSnapshotId, {
-          object_id: selectedObjectId,
-          change_type: changeType,
-          field: fieldName.trim() || null,
-          description: scenarioDescription.trim() || null,
-          depth: Math.max(impactDepth, 1),
-          node_cap: nodeCap,
-          edge_cap: edgeCap,
-        }),
-      );
+      setImpact(await postImpactScenario(selectedSnapshotId, impactRequestBody()));
+      setImpactAdvice(null);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runImpactAdvice() {
+    if (!selectedSnapshotId || !selectedObjectId) return;
+    setBusy('impact-advice');
+    try {
+      const response = await postImpactAdvice(selectedSnapshotId, impactRequestBody());
+      setImpact(response.impact);
+      setImpactAdvice(response);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -552,6 +598,34 @@ export default function App() {
               onChange={(event) => setLiveObjectNames(event.target.value)}
             />
           </label>
+          <div className="liveObjectTools">
+            <button className="secondaryButton" onClick={() => addLiveObjectName(selectedObjectId)} disabled={!selectedObjectId}>
+              Add selected object
+            </button>
+            <button className="secondaryButton" onClick={clearLiveObjectNames} disabled={liveObjectNameTokens.length === 0}>
+              Clear picks
+            </button>
+          </div>
+          {liveObjectNameTokens.length > 0 ? (
+            <div className="selectedLiveObjects" aria-label="selected live capture objects">
+              {liveObjectNameTokens.map((name) => (
+                <button key={name} className="selectedObjectChip" onClick={() => removeLiveObjectName(name)} title="Remove object from live capture">
+                  {name} ×
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="livePickerHint">스냅샷 객체를 선택하면 입력 없이도 해당 객체로 live capture를 실행할 수 있습니다.</p>
+          )}
+          {snapshotPickObjects.length > 0 ? (
+            <div className="snapshotPickList" aria-label="snapshot object quick picker">
+              {snapshotPickObjects.map((item) => (
+                <button key={item.id} className="snapshotPickButton" onClick={() => addLiveObjectName(item.id)}>
+                  <span>{item.type}</span>{item.id}
+                </button>
+              ))}
+            </div>
+          ) : null}
 
           <div className="liveOptionsGrid">
             <label>
@@ -647,6 +721,7 @@ export default function App() {
                     setSelectedObjectId(item.id);
                     setLineage(null);
                     setImpact(null);
+                    setImpactAdvice(null);
                   }}
                 >
                   <span className="objectType">{item.type}</span>
@@ -693,10 +768,12 @@ export default function App() {
                 setAllowHiddenSelection(true);
                 setSelectedObjectId(id);
                 setImpact(null);
+                setImpactAdvice(null);
               }}
               onExpand={(id) => {
                 setAllowHiddenSelection(true);
                 setImpact(null);
+                setImpactAdvice(null);
                 void runLineage(id);
               }}
               busy={busy === 'lineage'}
@@ -705,6 +782,7 @@ export default function App() {
 
           {activeTab === 'impact' ? (
             <ImpactTab
+              runtime={runtime}
               selectedObject={selectedObject}
               changeType={changeType}
               setChangeType={setChangeType}
@@ -715,8 +793,11 @@ export default function App() {
               impactDepth={impactDepth}
               setImpactDepth={setImpactDepth}
               onRun={() => void runImpact()}
+              onAdvice={() => void runImpactAdvice()}
               impact={impact}
+              impactAdvice={impactAdvice}
               busy={busy === 'impact'}
+              adviceBusy={busy === 'impact-advice'}
             />
           ) : null}
 
@@ -817,6 +898,7 @@ function LineageTab(props: {
 }
 
 function ImpactTab(props: {
+  runtime: RuntimeConfigResponse | null;
   selectedObject: CatalogObject | null;
   changeType: ChangeType;
   setChangeType: (value: ChangeType) => void;
@@ -827,8 +909,11 @@ function ImpactTab(props: {
   impactDepth: number;
   setImpactDepth: (value: number) => void;
   onRun: () => void;
+  onAdvice: () => void;
   impact: ImpactScenarioResponse | null;
+  impactAdvice: ImpactAdviceResponse | null;
   busy: boolean;
+  adviceBusy: boolean;
 }) {
   return (
     <div className="impactLayout">
@@ -848,12 +933,26 @@ function ImpactTab(props: {
           <textarea value={props.description} onChange={(event) => props.setDescription(event.target.value)} rows={4} />
         </label>
         <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
-        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy}>
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
           Run deterministic impact
         </button>
+        <button className="secondaryButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
+          Draft LLM review notes
+        </button>
+        <p className="mutedSmall">
+          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : 'disabled until local endpoint configured'}
+        </p>
       </section>
       <section className="resultCard">
         <span className="eyebrow">Affected objects</span>
+        {props.impactAdvice ? (
+          <div className={`llmAdviceBox ${props.impactAdvice.status}`}>
+            <h3>LLM advisory review</h3>
+            <p>{props.impactAdvice.message}</p>
+            {props.impactAdvice.advice ? <pre>{props.impactAdvice.advice}</pre> : null}
+            <small>Citations: {props.impactAdvice.citations.join(', ') || 'none'}</small>
+          </div>
+        ) : null}
         {props.impact ? (
           <div className="severityList">
             {props.impact.affected_objects.map((item) => (

@@ -386,6 +386,105 @@ def test_v1_sql_draft_rejects_empty_local_llm_draft_without_storing(
     assert count == 0
 
 
+def test_v1_impact_advice_returns_deterministic_impact_when_llm_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/advice",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "CUSTOMER_ID",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "disabled"
+    assert payload["config_required"] is True
+    assert payload["advisory"] is True
+    assert payload["advice"] == ""
+    assert payload["impact"]["deterministic"] is True
+    assert payload["impact"]["scenario"]["field"] == "CUSTOMER_ID"
+    assert [item["object_id"] for item in payload["impact"]["affected_objects"]]
+
+
+def test_v1_impact_advice_uses_local_llm_with_citation_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    configured = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "llm": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "local-fixture-model",
+                "api_key": "fixture-api-key",
+            }
+        },
+    )
+    assert configured.status_code == 200, configured.text
+
+    class CitedImpactAdviceClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def chat(self, request: object) -> LlmCompletion:
+            citation_ids = request.citation_ids  # type: ignore[attr-defined]
+            return LlmCompletion(
+                content=(
+                    f"Scenario should be reviewed in BWMT [{citation_ids[0]}].\n"
+                    f"First affected object needs owner confirmation [{citation_ids[1]}]."
+                ),
+                audit=LlmAuditMetadata(
+                    model="local-fixture-model",
+                    prompt_sha256="impact-prompt-sha",
+                    sanitized_input_sha256="impact-input-sha",
+                    request_citation_ids=list(citation_ids),
+                    response_timestamp="2026-06-08T00:00:00+00:00",
+                ),
+            )
+
+    monkeypatch.setattr(
+        "bwli.llm.impact_advisor.OpenAICompatibleClient",
+        CitedImpactAdviceClient,
+    )
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/advice",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "CUSTOMER_ID",
+            "description": "Check downstream sales flow",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["config_required"] is False
+    assert "fixture-api-key" not in response.text
+    assert payload["llm_audit"]["citation_validation"] == "passed"
+    assert "[scenario:change]" in payload["advice"]
+    assert payload["citations"][0] == "scenario:change"
+    assert payload["impact"]["deterministic"] is True
+
+
 def test_catalog_store_rejects_obvious_secret_bearing_metadata(tmp_path: Path) -> None:
     store = CatalogStore(tmp_path / "catalog.sqlite")
     snapshot = store.create_snapshot(mode="test", source="fixture://secret-guard")

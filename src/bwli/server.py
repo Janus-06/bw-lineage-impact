@@ -410,6 +410,15 @@ class SqlDraftFactory(Protocol):
     ) -> dict[str, object]: ...
 
 
+class ImpactAdviceFactory(Protocol):
+    def __call__(
+        self,
+        impact_payload: dict[str, object],
+        *,
+        runtime: LlmRuntimeConfig,
+    ) -> dict[str, object]: ...
+
+
 def create_app(
     *,
     project_root: Path | None = None,
@@ -596,6 +605,20 @@ def create_app(
     ) -> dict[str, object]:
         try:
             return _run_v1_impact_scenario(catalog_store, snapshot_id, request)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/impact/advice")
+    def impact_advice_v1(
+        snapshot_id: str,
+        request: V1ImpactScenarioRequest,
+    ) -> dict[str, object]:
+        try:
+            impact_payload = _run_v1_impact_scenario(catalog_store, snapshot_id, request)
+            return _impact_advice_payload(
+                runtime_config=runtime_config,
+                impact_payload=impact_payload,
+            )
         except Exception as exc:
             raise _http_error(exc) from exc
 
@@ -1252,6 +1275,62 @@ def _run_v1_impact_scenario(
     }
 
 
+def _impact_advice_payload(
+    *,
+    runtime_config: RuntimeConfigState,
+    impact_payload: dict[str, object],
+) -> dict[str, object]:
+    if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        return {
+            "schema_version": "1.0",
+            "status": "disabled",
+            "advisory": True,
+            "config_required": True,
+            "message": (
+                "Configure a local OpenAI-compatible LLM endpoint to create advisory impact "
+                "review notes."
+            ),
+            "advice": "",
+            "citations": [],
+            "impact": impact_payload,
+        }
+    if (
+        not runtime_config.llm.base_url
+        or not runtime_config.llm.model
+        or not runtime_config.llm.api_key
+    ):
+        raise ConfigError("LLM runtime config is incomplete")
+    advice_result = _create_llm_impact_advice(
+        impact_payload,
+        runtime=LlmRuntimeConfig(
+            base_url=runtime_config.llm.base_url,
+            model=runtime_config.llm.model,
+            api_key=SecretStr(runtime_config.llm.api_key),
+        ),
+    )
+    advice = str(advice_result["advice"]).strip()
+    if not advice:
+        raise ValueError("LLM returned empty impact advice")
+    assert_no_persisted_secrets({"llm_advice": advice})
+    raw_citations = advice_result.get("citations", [])
+    citations = (
+        [item for item in raw_citations if isinstance(item, str)]
+        if isinstance(raw_citations, list)
+        else []
+    )
+    return {
+        "schema_version": "1.0",
+        "status": "ok",
+        "advisory": True,
+        "config_required": False,
+        "message": "Advisory impact review generated from deterministic snapshot evidence.",
+        "advice": advice,
+        "citations": citations,
+        "llm_audit": advice_result["llm_audit"],
+        "impact": impact_payload,
+    }
+
+
 def _parse_v1_sql(root: Path, request: V1SqlExplainRequest | V1SqlDraftRequest) -> SqlParseResult:
     if request.sql_text and request.sql_file:
         raise ValueError("provide sql_text or sql_file, not both")
@@ -1380,6 +1459,16 @@ def _create_llm_sql_draft(
         target_dialect=target_dialect,
         runtime=runtime,
     )
+
+
+def _create_llm_impact_advice(
+    impact_payload: dict[str, object],
+    *,
+    runtime: LlmRuntimeConfig,
+) -> dict[str, object]:
+    module = import_module("bwli.llm.impact_advisor")
+    create_impact_advice = cast(ImpactAdviceFactory, module.create_impact_advice)
+    return create_impact_advice(impact_payload, runtime=runtime)
 
 
 def _frontend_static_dir(root: Path, static_dir: Path | None) -> Path | None:

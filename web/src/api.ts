@@ -169,6 +169,18 @@ export interface ImpactScenarioResponse {
   };
 }
 
+export interface ImpactAdviceResponse {
+  schema_version: string;
+  status: 'ok' | 'disabled';
+  advisory: boolean;
+  config_required: boolean;
+  message: string;
+  advice: string;
+  citations: string[];
+  llm_audit?: Record<string, unknown>;
+  impact: ImpactScenarioResponse;
+}
+
 export interface SqlExplainResponse {
   schema_version: string;
   advisory: boolean;
@@ -299,6 +311,25 @@ export async function postImpactScenario(
 ): Promise<ImpactScenarioResponse> {
   return postJson<ImpactScenarioResponse>(
     `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/scenario`,
+    body,
+  );
+}
+
+export async function postImpactAdvice(
+  snapshotId: string,
+  body: {
+    object_id: string;
+    change_type: ChangeType;
+    field?: string | null;
+    value_description?: string | null;
+    description?: string | null;
+    depth: number;
+    node_cap: number;
+    edge_cap: number;
+  },
+): Promise<ImpactAdviceResponse> {
+  return postJson<ImpactAdviceResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/advice`,
     body,
   );
 }

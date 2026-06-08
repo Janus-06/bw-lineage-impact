@@ -15,6 +15,7 @@ from bwli.llm.explainer import (
     build_sql_explainer_request,
     explain_sql_with_llm,
 )
+from bwli.llm.impact_advisor import build_impact_advice_request
 from bwli.llm.openai_compatible import OpenAICompatibleClient, write_llm_audit_log
 from bwli.llm.sanitizer import REDACTED, sanitize_llm_evidence, sanitize_text
 from bwli.llm.sql_assistant import build_sql_draft_request
@@ -885,3 +886,55 @@ def test_disabled_llm_config_does_not_perform_network_io() -> None:
 
     assert completion is None
     assert calls == 0
+
+
+def test_build_impact_advice_request_uses_sanitized_deterministic_evidence_only() -> None:
+    long_reason = "safe downstream detail " * 80
+    impact_payload: dict[str, object] = {
+        "scenario": {
+            "object_id": "SRC",
+            "object_type": "ADSO",
+            "change_type": "field_removed",
+            "field": "password_hash",
+            "description": ("x" * 590) + "person@example.invalid",
+        },
+        "affected_objects": [
+            {
+                "object_id": "TGT",
+                "object_type": "ADSO",
+                "severity": "HIGH",
+                "confidence": "direct",
+                "reason": long_reason,
+                "manual_verification": ["Open BW Modeling Tools and compare target mapping"],
+                "evidence_ids": ["e2"],
+                "host": "sapbw.internal",
+            }
+        ],
+        "lineage_bounds": {
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+            "truncated": True,
+            "omitted_neighbor_counts": {
+                "person@example.invalid": 4,
+                "sapbw.internal": 6,
+            },
+        },
+        "raw_snapshot": {"payload": "must not reach prompt"},
+    }
+
+    request = build_impact_advice_request(impact_payload)
+    prompt = "\n".join(message.content for message in request.messages)
+
+    assert request.metadata == {"task": "impact_advice"}
+    assert request.citation_ids == ["scenario:change", "affected:1"]
+    assert "must not reach prompt" not in prompt
+    assert "person@example.invalid" not in prompt
+    assert "sapbw.internal" not in prompt
+    assert "password_hash" not in prompt
+    assert "omitted_neighbor_counts" not in prompt
+    assert "omitted_neighbor_object_count" in prompt
+    assert "omitted_neighbor_total" in prompt
+    assert long_reason not in prompt
+    assert "…(truncated)" in prompt
+    assert "[affected:1]" in prompt
