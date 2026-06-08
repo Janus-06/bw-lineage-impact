@@ -19,6 +19,9 @@ BW connection values are supplied by the user at runtime. The project supports t
 - `BW_PASSWORD`
 - `BW_CLIENT`
 - optional `BW_LANGUAGE`
+- optional `BW_VERIFY_SSL`
+- optional `BW_CA_BUNDLE` for a corporate CA PEM file when internal TLS inspection is used
+- optional `BW_TRUST_ENV` to let HTTPX honor proxy/`NO_PROXY` environment settings
 
 Optional local LLM values are also supplied by the user at runtime:
 
@@ -67,7 +70,7 @@ Use the `Runtime Settings` tab to enter BW and optional local LLM runtime values
 - Secret values are not returned by API responses; the UI only receives `[REDACTED]` status.
 - Values are cleared when the backend process stops or when you click `Clear`.
 
-Current live-BW readiness note: the project has GET-only calls for `bw_search`, `bw_get_dataflow`, and `bw_xref`. Live smoke/snapshot collection is available for controlled sandbox use only: it remains opt-in, local-only, and requires explicit read-only confirmation before any SAP BW metadata call.
+Current live-BW readiness note: the project has GET-only calls for `bw_search`, `bw_get_dataflow`, `bw_xref`, `fetch_hcpr`, and `fetch_adso`. Live smoke/snapshot/dataflow rendering is available for controlled sandbox use only: it remains opt-in, local-only, and requires explicit read-only confirmation before any SAP BW metadata call.
 
 You can also build the frontend and serve it from the Python backend only:
 
@@ -91,6 +94,8 @@ BW_URL=<user-supplied> \
 BW_USER=<user-supplied> \
 BW_PASSWORD=<user-supplied> \
 BW_CLIENT=<user-supplied> \
+BW_CA_BUNDLE=<optional-corporate-ca-pem-path> \
+NO_PROXY=<optional-bw-host> \
 uv run bwli collect --live --confirm-read-only --search-term Z* --out .tmp/live-snapshot
 ```
 
@@ -100,6 +105,10 @@ The web UI includes a **Live BW Smoke** tab. It uses the BW runtime settings sto
 local backend process memory and requires an explicit read-only confirmation checkbox before
 making SAP BW metadata calls. API responses include operation summaries and local manifest
 metadata only; BW passwords and LLM API keys are never returned.
+
+The same tab can render BW Dataflow XML into Mermaid/Markdown/JSON using the read-only
+`/api/live/dataflow` endpoint. Use object types such as `ADSO`, `HCPR`, or `RSDS`; for `RSDS`,
+also provide the source system so the 30-character-padded object name can be built correctly.
 
 CLI live collection remains gated by `BWLI_LIVE=1` and runtime environment variables:
 
@@ -111,8 +120,14 @@ BW_PASSWORD=<user-supplied> \
 BW_CLIENT=<user-supplied> \
 BW_LANGUAGE=EN \
 BW_VERIFY_SSL=true \
-uv run bwli collect --live --confirm-read-only --search-term Z* --object ZCUBE --out .tmp/live-snapshot
+BW_CA_BUNDLE=<optional-corporate-ca-pem-path> \
+NO_PROXY=<optional-bw-host> \
+uv run bwli collect --live --confirm-read-only --search-term Z* --object ZCUBE --object-type ADSO --dataflow-direction downwards --dataflow-levels 3 --out .tmp/live-snapshot
 ```
+
+If a corporate certificate is provided as a `.cer`, convert it to a PEM file outside the repo,
+then point `BW_CA_BUNDLE` at that PEM path. Never commit real endpoints, user IDs, passwords,
+certificates, snapshots, or audit logs.
 
 This command performs read-only `bw_search`, `bw_get_dataflow`, and `bw_xref` metadata calls
 and writes a local snapshot manifest under the chosen output directory. Do not commit `.tmp/`

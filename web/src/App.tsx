@@ -14,7 +14,7 @@ import {
 } from './api';
 
 type Tool = 'settings' | 'live' | 'lineage' | 'impact' | 'sql-view' | 'field-lineage';
-type LiveMode = 'smoke' | 'collect';
+type LiveMode = 'smoke' | 'collect' | 'dataflow';
 
 interface FormState {
   graphPath: string;
@@ -30,6 +30,10 @@ interface FormState {
   liveMode: LiveMode;
   liveSearchTerm: string;
   liveObjectName: string;
+  liveObjectType: string;
+  liveSourceSystem: string;
+  liveDataflowDirection: 'upwards' | 'downwards' | 'both';
+  liveDataflowLevels: string;
   liveOutDir: string;
   liveConfirm: boolean;
 }
@@ -41,6 +45,7 @@ interface SettingsState {
   bwClient: string;
   bwLanguage: string;
   bwVerifySsl: boolean;
+  bwCaBundle: string;
   llmEnabled: boolean;
   llmBaseUrl: string;
   llmModel: string;
@@ -61,6 +66,10 @@ const defaultState: FormState = {
   liveMode: 'smoke',
   liveSearchTerm: 'Z*',
   liveObjectName: '',
+  liveObjectType: 'ADSO',
+  liveSourceSystem: '',
+  liveDataflowDirection: 'downwards',
+  liveDataflowLevels: '3',
   liveOutDir: '.tmp/live-snapshot',
   liveConfirm: false,
 };
@@ -72,6 +81,7 @@ const defaultSettings: SettingsState = {
   bwClient: '100',
   bwLanguage: 'EN',
   bwVerifySsl: true,
+  bwCaBundle: '',
   llmEnabled: false,
   llmBaseUrl: 'http://127.0.0.1:11434/v1',
   llmModel: '',
@@ -122,6 +132,7 @@ export default function App() {
       bwClient: config.bw.client ?? current.bwClient,
       bwLanguage: config.bw.language ?? current.bwLanguage,
       bwVerifySsl: config.bw.verify_ssl,
+      bwCaBundle: config.bw.ca_bundle ?? current.bwCaBundle,
       llmEnabled: config.llm.enabled,
       llmBaseUrl: config.llm.base_url ?? current.llmBaseUrl,
       llmModel: config.llm.model ?? current.llmModel,
@@ -159,9 +170,13 @@ export default function App() {
           search_term: form.liveSearchTerm,
           object_name: form.liveObjectName || undefined,
           xref_direction: 'downstream',
+          object_type: form.liveObjectType,
+          source_system: form.liveSourceSystem || undefined,
+          dataflow_direction: form.liveDataflowDirection,
+          dataflow_levels: Number(form.liveDataflowLevels || 3),
         });
         setResult(JSON.stringify(payload, null, 2));
-      } else {
+      } else if (form.liveMode === 'collect') {
         const payload = await postJson<LiveCollectResponse>('/api/collect/live', {
           confirm_read_only: form.liveConfirm,
           out_dir: form.liveOutDir,
@@ -170,8 +185,23 @@ export default function App() {
           include_dataflow: true,
           include_xref: true,
           xref_direction: 'downstream',
+          object_type: form.liveObjectType,
+          source_system: form.liveSourceSystem || undefined,
+          dataflow_direction: form.liveDataflowDirection,
+          dataflow_levels: Number(form.liveDataflowLevels || 3),
         });
         setResult(JSON.stringify(payload, null, 2));
+      } else {
+        const rendered = await postRendered('/api/live/dataflow', {
+          confirm_read_only: form.liveConfirm,
+          object_name: form.liveObjectName,
+          object_type: form.liveObjectType,
+          source_system: form.liveSourceSystem || undefined,
+          direction: form.liveDataflowDirection,
+          levels: Number(form.liveDataflowLevels || 3),
+          format: form.format,
+        });
+        setResult(rendered.content);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -193,6 +223,7 @@ export default function App() {
               client: settings.bwClient,
               language: settings.bwLanguage,
               verify_ssl: settings.bwVerifySsl,
+              ca_bundle: settings.bwCaBundle || undefined,
             }
           : undefined,
         llm: {
@@ -284,14 +315,14 @@ export default function App() {
             <h2>{toolLabels[tool]}</h2>
             {tool === 'settings' ? <span>process-memory only</span> : null}
             {tool === 'live' ? <span>explicit read-only confirmation required</span> : null}
-            {tool !== 'settings' && tool !== 'live' ? (
+            {tool !== 'settings' && (tool !== 'live' || form.liveMode === 'dataflow') ? (
               <select
                 value={form.format}
                 onChange={(event) => update('format', event.target.value as OutputFormat)}
               >
                 <option value="md">Markdown</option>
                 <option value="json">JSON</option>
-                {tool === 'lineage' ? <option value="mermaid">Mermaid</option> : null}
+                {tool === 'lineage' || (tool === 'live' && form.liveMode === 'dataflow') ? <option value="mermaid">Mermaid</option> : null}
               </select>
             ) : null}
           </div>
@@ -396,6 +427,11 @@ function SettingsPanel({
         label="BW_VERIFY_SSL"
         onChange={(value) => updateSettings('bwVerifySsl', value)}
       />
+      <Field
+        label="BW_CA_BUNDLE / corporate CA PEM path (optional)"
+        value={settings.bwCaBundle}
+        onChange={(v) => updateSettings('bwCaBundle', v)}
+      />
 
       <h3>Local OpenAI-compatible LLM</h3>
       <Checkbox
@@ -451,10 +487,29 @@ function LivePanel({
         <select value={form.liveMode} onChange={(event) => update('liveMode', event.target.value as LiveMode)}>
           <option value="smoke">Smoke only</option>
           <option value="collect">Collect snapshot</option>
+          <option value="dataflow">Render Dataflow</option>
         </select>
       </label>
       <Field label="Search term" value={form.liveSearchTerm} onChange={(v) => update('liveSearchTerm', v)} />
-      <Field label="Object name (optional)" value={form.liveObjectName} onChange={(v) => update('liveObjectName', v)} />
+      <Field label="Object name" value={form.liveObjectName} onChange={(v) => update('liveObjectName', v)} />
+      <div className="twoColumn">
+        <Field label="Object type" value={form.liveObjectType} onChange={(v) => update('liveObjectType', v)} />
+        <Field label="Source system for RSDS" value={form.liveSourceSystem} onChange={(v) => update('liveSourceSystem', v)} />
+      </div>
+      <div className="twoColumn">
+        <label className="field">
+          <span>Dataflow direction</span>
+          <select
+            value={form.liveDataflowDirection}
+            onChange={(event) => update('liveDataflowDirection', event.target.value as FormState['liveDataflowDirection'])}
+          >
+            <option value="downwards">downwards</option>
+            <option value="upwards">upwards</option>
+            <option value="both">both</option>
+          </select>
+        </label>
+        <Field label="Dataflow levels" value={form.liveDataflowLevels} onChange={(v) => update('liveDataflowLevels', v)} />
+      </div>
       {form.liveMode === 'collect' ? (
         <Field label="Output directory" value={form.liveOutDir} onChange={(v) => update('liveOutDir', v)} />
       ) : null}

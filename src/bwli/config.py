@@ -23,6 +23,8 @@ class BwConnectionConfig(BaseModel):
     client: str
     language: str = "EN"
     verify_ssl: bool = True
+    ca_bundle: str | None = None
+    trust_env: bool = True
 
     @classmethod
     def from_env(cls) -> BwConnectionConfig:
@@ -41,7 +43,14 @@ class BwConnectionConfig(BaseModel):
             client=os.environ["BW_CLIENT"],
             language=os.environ.get("BW_LANGUAGE", "EN"),
             verify_ssl=_resolve_env_bool("BW_VERIFY_SSL", default=True),
+            ca_bundle=_resolve_optional_env_path("BW_CA_BUNDLE"),
+            trust_env=_resolve_env_bool("BW_TRUST_ENV", default=True),
         )
+
+    def httpx_verify_arg(self) -> bool | str:
+        if self.verify_ssl and self.ca_bundle:
+            return self.ca_bundle
+        return self.verify_ssl
 
 
 class BwConfigRefs(BaseModel):
@@ -115,6 +124,13 @@ def _resolve_env_bool(name: str, *, default: bool) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _resolve_optional_env_path(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
 
 
 def validate_local_llm_base_url(base_url: str) -> None:

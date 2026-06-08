@@ -1,2 +1,2 @@
 cache-dir = ".uv-cache"
-python-downloads = "never"
+python-downloads = "manual"

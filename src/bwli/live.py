@@ -8,6 +8,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from bwli.endpoints import DataflowDirection
 from bwli.snapshot import SnapshotManifest, SnapshotWriter
 
 XrefDirection = Literal["upstream", "downstream"]
@@ -16,7 +17,15 @@ XrefDirection = Literal["upstream", "downstream"]
 class BwReadClient(Protocol):
     def fetch_search(self, search_term: str, *, object_type: str | None = None) -> Any: ...
 
-    def fetch_dataflow(self, object_name: str) -> Any: ...
+    def fetch_dataflow(
+        self,
+        object_name: str,
+        *,
+        object_type: str = "ADSO",
+        source_system: str | None = None,
+        direction: DataflowDirection = "downwards",
+        levels: int = 3,
+    ) -> Any: ...
 
     def fetch_xref(self, object_name: str, *, direction: str = "downstream") -> Any: ...
 
@@ -62,6 +71,10 @@ def run_live_smoke(
     search_term: str,
     object_name: str | None = None,
     xref_direction: XrefDirection = "downstream",
+    dataflow_object_type: str = "ADSO",
+    dataflow_source_system: str | None = None,
+    dataflow_direction: DataflowDirection = "downwards",
+    dataflow_levels: int = 3,
     secret_values: Sequence[str] = (),
 ) -> LiveSmokeResult:
     client = client_factory()
@@ -79,7 +92,13 @@ def run_live_smoke(
                 _run_operation(
                     name="bw_get_dataflow",
                     label="bw://bw_get_dataflow",
-                    func=lambda: client.fetch_dataflow(object_name),
+                    func=lambda: client.fetch_dataflow(
+                        object_name,
+                        object_type=dataflow_object_type,
+                        source_system=dataflow_source_system,
+                        direction=dataflow_direction,
+                        levels=dataflow_levels,
+                    ),
                     secret_values=secret_values,
                 )
             )
@@ -113,6 +132,10 @@ def collect_live_snapshot(
     include_dataflow: bool = True,
     include_xref: bool = True,
     xref_direction: XrefDirection = "downstream",
+    dataflow_object_type: str = "ADSO",
+    dataflow_source_system: str | None = None,
+    dataflow_direction: DataflowDirection = "downwards",
+    dataflow_levels: int = 3,
 ) -> SnapshotManifest:
     if not search_terms and not object_names:
         raise ValueError("at least one search term or object name is required for live collection")
@@ -137,7 +160,13 @@ def collect_live_snapshot(
                         payload_id=f"dataflow-{index}-{_safe_fragment(object_name)}",
                         kind="bw_get_dataflow",
                         source="bw://bw_get_dataflow",
-                        payload=client.fetch_dataflow(object_name),
+                        payload=client.fetch_dataflow(
+                            object_name,
+                            object_type=dataflow_object_type,
+                            source_system=dataflow_source_system,
+                            direction=dataflow_direction,
+                            levels=dataflow_levels,
+                        ),
                     )
                 )
             if include_xref:

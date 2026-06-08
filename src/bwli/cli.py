@@ -72,6 +72,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="BW object name to collect dataflow/xref; repeatable.",
     )
     collect.add_argument(
+        "--object-type",
+        default="ADSO",
+        help="BW object type for dataflow calls, e.g. ADSO/HCPR/RSDS.",
+    )
+    collect.add_argument("--source-system", help="Required for RSDS dataflow object names.")
+    collect.add_argument(
+        "--dataflow-direction",
+        choices=["upwards", "downwards", "both"],
+        default="downwards",
+        help="Direction depth for live dataflow calls.",
+    )
+    collect.add_argument("--dataflow-levels", type=int, default=3, help="Dataflow traversal depth.")
+    collect.add_argument(
         "--xref-direction",
         choices=["upstream", "downstream"],
         default="downstream",
@@ -251,7 +264,8 @@ def _collect(args: argparse.Namespace) -> int:
                 password=config.password.get_secret_value(),
                 sap_client=config.client,
                 language=config.language,
-                verify=config.verify_ssl,
+                verify=config.httpx_verify_arg(),
+                trust_env=config.trust_env,
             )
 
         try:
@@ -263,6 +277,10 @@ def _collect(args: argparse.Namespace) -> int:
                 include_dataflow=not args.skip_dataflow,
                 include_xref=not args.skip_xref,
                 xref_direction=args.xref_direction,
+                dataflow_object_type=args.object_type,
+                dataflow_source_system=args.source_system,
+                dataflow_direction=args.dataflow_direction,
+                dataflow_levels=args.dataflow_levels,
             )
         except Exception as exc:
             print(f"live collection failed: {type(exc).__name__}", file=sys.stderr)

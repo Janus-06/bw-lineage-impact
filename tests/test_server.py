@@ -20,9 +20,26 @@ class FakeLiveBwClient:
         self.calls.append(("search", search_term, object_type))
         return {"objects": [{"name": "ZCUBE"}, {"name": "ZQUERY"}]}
 
-    def fetch_dataflow(self, object_name: str) -> dict[str, Any]:
-        self.calls.append(("dataflow", object_name))
-        return {"nodes": [{"id": object_name}], "edges": []}
+    def fetch_dataflow(
+        self,
+        object_name: str,
+        *,
+        object_type: str = "ADSO",
+        source_system: str | None = None,
+        direction: str = "downwards",
+        levels: int = 3,
+    ) -> str:
+        self.calls.append(("dataflow", object_name, object_type, source_system, direction, levels))
+        return """
+<dmod:dataFlow>
+  <node nodeID=\"1\" objectName=\"ZADSO_SRC\" objectType=\"ADSO\" objectDescription=\"Source\">
+    <targetNode>#///2</targetNode>
+  </node>
+  <node nodeID=\"2\" objectName=\"ZHCPR_MAIN\" objectType=\"HCPR\" objectDescription=\"Provider\">
+    <sourceNode>#///1</sourceNode>
+  </node>
+</dmod:dataFlow>
+""".strip()
 
     def fetch_xref(self, object_name: str, *, direction: str = "downstream") -> dict[str, Any]:
         self.calls.append(("xref", object_name, direction))
@@ -37,8 +54,16 @@ class FailingDataflowBwClient(FakeLiveBwClient):
         super().__init__()
         self._leaked_value = leaked_value
 
-    def fetch_dataflow(self, object_name: str) -> dict[str, Any]:
-        self.calls.append(("dataflow", object_name))
+    def fetch_dataflow(
+        self,
+        object_name: str,
+        *,
+        object_type: str = "ADSO",
+        source_system: str | None = None,
+        direction: str = "downwards",
+        levels: int = 3,
+    ) -> str:
+        self.calls.append(("dataflow", object_name, object_type, source_system, direction, levels))
         raise RuntimeError(f"authorization token={self._leaked_value} failed")
 
 
@@ -214,6 +239,7 @@ def test_runtime_config_is_stored_in_memory_and_redacts_secrets(monkeypatch) -> 
         "client": "100",
         "language": "EN",
         "verify_ssl": True,
+        "ca_bundle": None,
     }
     assert payload["llm"] == {
         "enabled": True,
@@ -464,7 +490,7 @@ def test_live_smoke_uses_runtime_config_and_returns_safe_operation_summaries() -
     assert payload["operations"][0]["item_count"] == 2
     assert fake.calls == [
         ("search", "Z", None),
-        ("dataflow", "ZCUBE"),
+        ("dataflow", "ZCUBE", "ADSO", None, "downwards", 3),
         ("xref", "ZCUBE", "upstream"),
     ]
     assert fake.closed is True
@@ -526,9 +552,35 @@ def test_live_collect_writes_local_snapshot_manifest_without_secrets(tmp_path) -
     assert "bw://bw_search" in manifest_text
     assert fake.calls == [
         ("search", "Z", None),
-        ("dataflow", "ZCUBE"),
+        ("dataflow", "ZCUBE", "ADSO", None, "downwards", 3),
         ("xref", "ZCUBE", "downstream"),
     ]
+
+
+def test_live_dataflow_endpoint_renders_mermaid_without_secrets() -> None:
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: fake))
+    _put_runtime_bw_config(client)
+
+    response = client.post(
+        "/api/live/dataflow",
+        json={
+            "confirm_read_only": True,
+            "object_name": "ZHCPR_MAIN",
+            "object_type": "HCPR",
+            "direction": "both",
+            "levels": 2,
+            "format": "mermaid",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "fixture-user" not in response.text
+    payload = response.json()
+    assert payload["format"] == "mermaid"
+    assert payload["content"].startswith("flowchart LR")
+    assert "N1 --> N2" in payload["content"]
+    assert fake.calls == [("dataflow", "ZHCPR_MAIN", "HCPR", None, "both", 2)]
 
 
 def test_live_collect_rejects_output_path_escape(tmp_path) -> None:

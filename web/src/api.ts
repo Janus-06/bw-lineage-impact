@@ -23,6 +23,7 @@ export interface RuntimeConfigResponse {
     client: string | null;
     language: string;
     verify_ssl: boolean;
+    ca_bundle: string | null;
   };
   llm: {
     enabled: boolean;
@@ -41,6 +42,7 @@ export interface RuntimeConfigRequest {
     client: string;
     language: string;
     verify_ssl: boolean;
+    ca_bundle?: string;
   };
   llm?: {
     enabled: boolean;

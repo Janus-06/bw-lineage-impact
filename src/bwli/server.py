@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from bwli import __version__
 from bwli.client import BwClient
 from bwli.config import ConfigError, validate_local_llm_base_url
+from bwli.dataflow import DataflowOutputFormat, render_dataflow
+from bwli.endpoints import DataflowDirection
 from bwli.field_lineage import (
     load_text,
     parse_native_sql_view,
@@ -65,6 +67,7 @@ class RuntimeBwConfigRequest(BaseModel):
     client: str
     language: str = "EN"
     verify_ssl: bool = True
+    ca_bundle: str | None = None
 
 
 class RuntimeLlmConfigRequest(BaseModel):
@@ -93,6 +96,7 @@ class RuntimeBwConfigState(BaseModel):
     client: str | None = None
     language: str = "EN"
     verify_ssl: bool = True
+    ca_bundle: str | None = None
 
 
 class RuntimeLlmConfigState(BaseModel):
@@ -123,6 +127,7 @@ class RuntimeConfigState(BaseModel):
                 client=self.bw.client,
                 language=self.bw.language,
                 verify_ssl=self.bw.verify_ssl,
+                ca_bundle=self.bw.ca_bundle,
             ),
             llm=RuntimeLlmConfigPublic(
                 enabled=self.llm.enabled,
@@ -142,6 +147,7 @@ class RuntimeBwConfigPublic(BaseModel):
     client: str | None = None
     language: str = "EN"
     verify_ssl: bool = True
+    ca_bundle: str | None = None
 
 
 class RuntimeLlmConfigPublic(BaseModel):
@@ -209,6 +215,10 @@ class LiveSmokeRequest(BaseModel):
     search_term: str = "*"
     object_name: str | None = None
     xref_direction: Literal["upstream", "downstream"] = "downstream"
+    object_type: str = "ADSO"
+    source_system: str | None = None
+    dataflow_direction: DataflowDirection = "downwards"
+    dataflow_levels: int = Field(default=3, ge=0, le=20)
 
 
 class LiveCollectRequest(BaseModel):
@@ -221,6 +231,22 @@ class LiveCollectRequest(BaseModel):
     include_dataflow: bool = True
     include_xref: bool = True
     xref_direction: Literal["upstream", "downstream"] = "downstream"
+    object_type: str = "ADSO"
+    source_system: str | None = None
+    dataflow_direction: DataflowDirection = "downwards"
+    dataflow_levels: int = Field(default=3, ge=0, le=20)
+
+
+class LiveDataflowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_read_only: bool = False
+    object_name: str
+    object_type: str = "ADSO"
+    source_system: str | None = None
+    direction: DataflowDirection = "downwards"
+    levels: int = Field(default=3, ge=0, le=20)
+    format: DataflowOutputFormat = "mermaid"
 
 
 BwClientFactory = Callable[[RuntimeBwConfigState], BwReadClient]
@@ -354,6 +380,10 @@ def create_app(
             search_term=request.search_term,
             object_name=request.object_name,
             xref_direction=request.xref_direction,
+            dataflow_object_type=request.object_type,
+            dataflow_source_system=request.source_system,
+            dataflow_direction=request.dataflow_direction,
+            dataflow_levels=request.dataflow_levels,
             secret_values=_runtime_secret_values(state),
         )
 
@@ -370,6 +400,10 @@ def create_app(
                 include_dataflow=request.include_dataflow,
                 include_xref=request.include_xref,
                 xref_direction=request.xref_direction,
+                dataflow_object_type=request.object_type,
+                dataflow_source_system=request.source_system,
+                dataflow_direction=request.dataflow_direction,
+                dataflow_levels=request.dataflow_levels,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -377,6 +411,27 @@ def create_app(
             manifest_path=str(out_dir / "manifest.json"),
             manifest=manifest,
         )
+
+    @app.post("/api/live/dataflow", response_model=RenderedResponse)
+    def live_dataflow(request: LiveDataflowRequest) -> RenderedResponse:
+        state = _ensure_live_ready(runtime_config, request.confirm_read_only)
+        client = _build_runtime_bw_client(state, bw_client_factory)
+        try:
+            payload = client.fetch_dataflow(
+                request.object_name,
+                object_type=request.object_type,
+                source_system=request.source_system,
+                direction=request.direction,
+                levels=request.levels,
+            )
+            if not isinstance(payload, str):
+                raise ValueError("live dataflow response is not XML text")
+            content = render_dataflow(payload, output_format=request.format)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        finally:
+            client.close()
+        return RenderedResponse(format=request.format, content=content)
 
     frontend_dir = _frontend_static_dir(root, static_dir)
     if frontend_dir is not None:
@@ -434,6 +489,11 @@ def _build_bw_state(
     if missing:
         raise ConfigError(f"missing BW runtime config fields: {', '.join(missing)}")
     assert password is not None
+    ca_bundle = (
+        request.ca_bundle.strip()
+        if request.ca_bundle and request.ca_bundle.strip()
+        else None
+    )
     return RuntimeBwConfigState(
         configured=True,
         url=request.url.strip(),
@@ -442,6 +502,7 @@ def _build_bw_state(
         client=request.client.strip(),
         language=request.language.strip(),
         verify_ssl=request.verify_ssl,
+        ca_bundle=ca_bundle,
     )
 
 
@@ -546,7 +607,7 @@ def _build_runtime_bw_client(
         password=state.password,
         sap_client=state.client,
         language=state.language,
-        verify=state.verify_ssl,
+        verify=state.ca_bundle if state.verify_ssl and state.ca_bundle else state.verify_ssl,
     )
 
 

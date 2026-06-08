@@ -22,6 +22,29 @@ def test_bw_env_config_loads_reference_mcp_names(monkeypatch: pytest.MonkeyPatch
     assert config.language == "KO"
 
 
+def test_bw_env_config_accepts_optional_ca_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    ca_bundle = tmp_path / "corp-ca.pem"
+    ca_bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
+    monkeypatch.setenv("BW_USER", "fixture-user")
+    monkeypatch.setenv("BW_PASSWORD", "fakepass")
+    monkeypatch.setenv("BW_CLIENT", "100")
+    monkeypatch.setenv("BW_CA_BUNDLE", str(ca_bundle))
+
+    config = BwConnectionConfig.from_env()
+
+    assert config.verify_ssl is True
+    assert config.ca_bundle == str(ca_bundle)
+    assert config.trust_env is True
+    assert config.httpx_verify_arg() == str(ca_bundle)
+
+
 def test_bw_env_config_requires_runtime_values(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ["BW_URL", "BW_USER", "BW_PASSWORD", "BW_CLIENT", "BW_LANGUAGE"]:
         monkeypatch.delenv(name, raising=False)

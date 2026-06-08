@@ -13,8 +13,22 @@ class RecordingLiveClient:
     def fetch_search(self, search_term: str, *, object_type: str | None = None) -> dict[str, Any]:
         return {"term": search_term, "object_type": object_type}
 
-    def fetch_dataflow(self, object_name: str) -> dict[str, Any]:
-        return {"object": object_name}
+    def fetch_dataflow(
+        self,
+        object_name: str,
+        *,
+        object_type: str = "ADSO",
+        source_system: str | None = None,
+        direction: str = "downwards",
+        levels: int = 3,
+    ) -> dict[str, Any]:
+        return {
+            "object": object_name,
+            "object_type": object_type,
+            "source_system": source_system,
+            "direction": direction,
+            "levels": levels,
+        }
 
     def fetch_xref(self, object_name: str, *, direction: str = "downstream") -> dict[str, Any]:
         return {"object": object_name, "direction": direction}
