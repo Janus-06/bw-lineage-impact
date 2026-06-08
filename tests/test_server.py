@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from bwli.server import create_app
@@ -142,7 +143,7 @@ def test_sql_view_endpoint_uses_local_sql_file_only() -> None:
     assert "no SQL rewrite or DB change is applied" in payload["content"]
 
 
-def test_sql_view_endpoint_rejects_absolute_path_outside_project_root(tmp_path) -> None:
+def test_sql_view_endpoint_rejects_absolute_path_outside_project_root(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
     outside = tmp_path / "outside.sql"
@@ -159,7 +160,7 @@ def test_sql_view_endpoint_rejects_absolute_path_outside_project_root(tmp_path) 
     assert "sensitive_table" not in response.text
 
 
-def test_sql_view_endpoint_rejects_parent_directory_traversal(tmp_path) -> None:
+def test_sql_view_endpoint_rejects_parent_directory_traversal(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
     outside = tmp_path / "outside.sql"
@@ -197,7 +198,9 @@ def test_field_lineage_endpoint_renders_from_local_xml() -> None:
     assert "`NETVAL` <= `AMOUNT`" in payload["content"]
 
 
-def test_runtime_config_is_stored_in_memory_and_redacts_secrets(monkeypatch) -> None:
+def test_runtime_config_is_stored_in_memory_and_redacts_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("BW_URL", raising=False)
     monkeypatch.delenv("BW_USER", raising=False)
     monkeypatch.delenv("BW_PASSWORD", raising=False)
@@ -421,6 +424,20 @@ def test_runtime_config_can_be_cleared() -> None:
     assert payload["llm"]["configured"] is False
 
 
+def test_legacy_runtime_config_clear_ignores_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
+    monkeypatch.setenv("BW_USER", "env-user")
+    monkeypatch.setenv("BW_PASSWORD", "env-password")
+    monkeypatch.setenv("BW_CLIENT", "100")
+    client = TestClient(create_app(project_root=Path.cwd()))
+    assert client.get("/api/runtime-config").json()["bw"]["configured"] is True
+
+    response = client.delete("/api/runtime-config")
+
+    assert response.status_code == 200
+    assert response.json()["bw"]["configured"] is False
+
+
 def _put_runtime_bw_config(client: TestClient, *, password: str = "[REDACTED]") -> None:
     response = client.put(
         "/api/runtime-config",
@@ -520,7 +537,7 @@ def test_live_smoke_redacts_runtime_secret_from_partial_error() -> None:
     assert fake.closed is True
 
 
-def test_live_collect_writes_local_snapshot_manifest_without_secrets(tmp_path) -> None:
+def test_live_collect_writes_local_snapshot_manifest_without_secrets(tmp_path: Path) -> None:
     fake = FakeLiveBwClient()
     client = TestClient(create_app(project_root=tmp_path, bw_client_factory=lambda _state: fake))
     _put_runtime_bw_config(client)
@@ -583,7 +600,7 @@ def test_live_dataflow_endpoint_renders_mermaid_without_secrets() -> None:
     assert fake.calls == [("dataflow", "ZHCPR_MAIN", "HCPR", None, "both", 2)]
 
 
-def test_live_collect_rejects_output_path_escape(tmp_path) -> None:
+def test_live_collect_rejects_output_path_escape(tmp_path: Path) -> None:
     fake = FakeLiveBwClient()
     client = TestClient(create_app(project_root=tmp_path, bw_client_factory=lambda _state: fake))
     _put_runtime_bw_config(client)

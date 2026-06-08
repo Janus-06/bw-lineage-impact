@@ -1,1634 +1,1044 @@
-import { type ReactNode, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
+  captureFixtureSnapshot,
+  captureLiveSnapshot,
   clearRuntimeConfig,
+  draftSql,
+  explainSql,
   getHealth,
+  getObject,
   getRuntimeConfig,
-  postJson,
-  postRendered,
+  listObjects,
+  listSnapshots,
+  postImpactScenario,
+  postLineage,
   putRuntimeConfig,
+  type AppTab,
+  type CatalogObject,
+  type CatalogObjectDetail,
+  type ChangeType,
+  type DataflowDirection,
+  type Direction,
+  type XrefDirection,
   type HealthResponse,
-  type LiveCollectResponse,
-  type LiveSmokeResponse,
-  type OutputFormat,
+  type ImpactScenarioResponse,
+  type LineageResponse,
   type RuntimeConfigResponse,
+  type SnapshotSummary,
+  type SqlDraftResponse,
+  type SqlExplainResponse,
 } from './api';
 
-type Tool = 'settings' | 'live' | 'lineage' | 'impact' | 'sql-view' | 'field-lineage';
-type AnalysisTool = Exclude<Tool, 'settings' | 'live'>;
-type LiveMode = 'smoke' | 'collect' | 'dataflow';
-type Tone = 'ok' | 'warning' | 'danger' | 'neutral' | 'info' | 'accent';
+const fixtureGraphPath = 'tests/fixtures/sample-graph.json';
+const fixtureSqlPath = 'tests/fixtures/native_sql_view.sql';
+const typeFilters = ['', 'ADSO', 'HCPR', 'TRFN', 'QUERY', 'NATIVE_SQL_VIEW'];
+const changeTypes: ChangeType[] = [
+  'field_removed',
+  'field_type_changed',
+  'infoobject_attribute_changed',
+  'infoobject_type_changed',
+  'routine_changed',
+  'dtp_filter_changed',
+  'compositeprovider_mapping_changed',
+];
 
-interface FormState {
-  graphPath: string;
-  changesPath: string;
-  objectId: string;
-  lineageDirection: 'upstream' | 'downstream' | 'both';
-  lineageMaxDepth: string;
-  impactMaxDepth: string;
-  sqlFile: string;
-  viewId: string;
-  xmlFile: string;
-  transformationId: string;
-  sourceObject: string;
-  targetObject: string;
-  format: OutputFormat;
-  liveMode: LiveMode;
-  liveSearchTerm: string;
-  liveObjectName: string;
-  liveObjectType: string;
-  liveSourceSystem: string;
-  liveDataflowDirection: 'upwards' | 'downwards' | 'both';
-  liveDataflowLevels: string;
-  liveOutDir: string;
-  liveConfirm: boolean;
-}
-
-interface SettingsState {
-  bwUrl: string;
-  bwUser: string;
-  bwPassword: string;
-  bwClient: string;
-  bwLanguage: string;
-  bwVerifySsl: boolean;
-  bwCaBundle: string;
+interface SetupForm {
+  url: string;
+  user: string;
+  password: string;
+  client: string;
+  language: string;
+  verifySsl: boolean;
+  caBundle: string;
+  trustEnv: boolean;
   llmEnabled: boolean;
   llmBaseUrl: string;
   llmModel: string;
   llmApiKey: string;
 }
 
-interface ToolMeta {
-  id: Tool;
-  label: string;
-  shortLabel: string;
-  eyebrow: string;
-  description: string;
-  endpoint: string;
-  runLabel: string;
-  outputLabel: string;
-  emptyHint: string;
-  helperCards: HelperCard[];
-}
-
-interface HelperCard {
-  tag: string;
-  title: string;
-  body: string;
-  tone?: Tone;
-}
-
-interface ResultMeta {
-  title: string;
-  endpoint: string;
-  format: string;
-  timestamp: string;
-  mode: string;
-  summary: string;
-}
-
-const defaultState: FormState = {
-  graphPath: 'tests/fixtures/sample-graph.json',
-  changesPath: 'tests/fixtures/sample-changes.json',
-  objectId: 'SRC',
-  lineageDirection: 'downstream',
-  lineageMaxDepth: '3',
-  impactMaxDepth: '3',
-  sqlFile: 'tests/fixtures/native_sql_view.sql',
-  viewId: 'ZSQL_VIEW',
-  xmlFile: 'tests/fixtures/sample-transformation.xml',
-  transformationId: 'T1',
-  sourceObject: 'SRC',
-  targetObject: 'TGT',
-  format: 'md',
-  liveMode: 'smoke',
-  liveSearchTerm: 'Z*',
-  liveObjectName: '',
-  liveObjectType: 'ADSO',
-  liveSourceSystem: '',
-  liveDataflowDirection: 'downwards',
-  liveDataflowLevels: '3',
-  liveOutDir: '.tmp/live-snapshot',
-  liveConfirm: false,
-};
-
-const defaultSettings: SettingsState = {
-  bwUrl: '',
-  bwUser: '',
-  bwPassword: '',
-  bwClient: '100',
-  bwLanguage: 'EN',
-  bwVerifySsl: true,
-  bwCaBundle: '',
-  llmEnabled: false,
-  llmBaseUrl: 'http://127.0.0.1:11434/v1',
-  llmModel: '',
-  llmApiKey: '',
-};
-
-const toolOrder: Tool[] = ['settings', 'live', 'lineage', 'impact', 'sql-view', 'field-lineage'];
-
-const toolCatalog: Record<Tool, ToolMeta> = {
-  settings: {
-    id: 'settings',
-    label: 'Runtime Settings',
-    shortLabel: 'Settings',
-    eyebrow: 'Secure runtime drawer',
-    description:
-      'Configure SAP BW and optional local LLM access for this process only. Secrets are transient and write-only.',
-    endpoint: '/api/runtime-config',
-    runLabel: 'Save runtime settings',
-    outputLabel: 'Configuration status',
-    emptyHint: '저장 후 BW/LLM 상태와 secret redaction 결과가 여기에 표시됩니다.',
-    helperCards: [
-      {
-        tag: 'Safety',
-        title: 'Process-memory only',
-        body: 'Password and API key fields are never persisted to files or browser storage. Save clears the form values immediately.',
-        tone: 'ok',
-      },
-      {
-        tag: 'LLM',
-        title: 'Optional local explainer',
-        body: 'OpenAI-compatible local endpoints can be enabled for explanations without changing the read-only BW contract.',
-        tone: 'info',
-      },
-    ],
-  },
-  live: {
-    id: 'live',
-    label: 'Live BW Workbench',
-    shortLabel: 'Live BW',
-    eyebrow: 'Read-only live metadata',
-    description:
-      'Run smoke checks, collect a local snapshot, or render a BW dataflow with explicit read-only confirmation.',
-    endpoint: '/api/live/*',
-    runLabel: 'Run confirmed read-only action',
-    outputLabel: 'Live response',
-    emptyHint: 'BW runtime 설정과 read-only 확인을 완료한 뒤 smoke/collect/dataflow 결과를 확인하세요.',
-    helperCards: [
-      {
-        tag: 'Gate',
-        title: 'Explicit safety confirmation',
-        body: 'The API rejects live calls unless confirm_read_only is true. The UI keeps this confirmation visible at execution time.',
-        tone: 'ok',
-      },
-      {
-        tag: 'Dataflow',
-        title: 'Mermaid graph preview',
-        body: 'Choose Dataflow + Mermaid to receive copyable graph source for reviews or Markdown reports.',
-        tone: 'accent',
-      },
-      {
-        tag: 'Snapshot',
-        title: 'Collect for offline evidence',
-        body: 'Collect writes a local manifest and evidence snapshot under the selected output directory.',
-        tone: 'info',
-      },
-    ],
-  },
-  lineage: {
-    id: 'lineage',
-    label: 'Lineage Graph',
-    shortLabel: 'Lineage',
-    eyebrow: 'Graph traversal workspace',
-    description:
-      'Traverse a local BW lineage graph by object, direction, and depth; export Markdown, JSON, or Mermaid source.',
-    endpoint: '/api/lineage',
-    runLabel: 'Run lineage traversal',
-    outputLabel: 'Lineage result',
-    emptyHint: 'Fixture graph defaults are loaded. Run traversal or switch to Mermaid for a graph-source preview.',
-    helperCards: [
-      {
-        tag: 'Sample path',
-        title: 'SRC → downstream impact chain',
-        body: 'Start with tests/fixtures/sample-graph.json and object SRC at depth 3 to validate local analysis before live snapshots.',
-        tone: 'info',
-      },
-      {
-        tag: 'Review',
-        title: 'Direction matters',
-        body: 'Use upstream for dependency discovery, downstream for blast radius, and both for object-centered reviews.',
-        tone: 'accent',
-      },
-    ],
-  },
-  impact: {
-    id: 'impact',
-    label: 'Change Impact',
-    shortLabel: 'Impact',
-    eyebrow: 'Risk review',
-    description:
-      'Combine a graph snapshot and change list to produce affected-object review evidence for release decisions.',
-    endpoint: '/api/impact',
-    runLabel: 'Run change-impact review',
-    outputLabel: 'Risk report',
-    emptyHint: '변경 파일을 지정하면 영향 경로, 위험 요약, 검토용 Markdown/JSON evidence를 생성합니다.',
-    helperCards: [
-      {
-        tag: 'Risk cards',
-        title: 'Release-ready impact summary',
-        body: 'Markdown output is optimized for reviewer handoff; JSON is better for downstream automation.',
-        tone: 'warning',
-      },
-      {
-        tag: 'Evidence',
-        title: 'Local graph + changes only',
-        body: 'No backend mutation is required. The report is deterministic for the selected graph and change inputs.',
-        tone: 'ok',
-      },
-    ],
-  },
-  'sql-view': {
-    id: 'sql-view',
-    label: 'Native SQL Evidence',
-    shortLabel: 'SQL Evidence',
-    eyebrow: 'SQL view analyzer',
-    description:
-      'Parse a Native SQL View file and extract structured evidence that supports lineage and review conversations.',
-    endpoint: '/api/sql-view',
-    runLabel: 'Analyze SQL evidence',
-    outputLabel: 'SQL evidence',
-    emptyHint: 'SQL view id and file path are ready with fixture defaults. Run to extract native SQL evidence.',
-    helperCards: [
-      {
-        tag: 'Native SQL',
-        title: 'Reviewer-readable evidence',
-        body: 'Use Markdown for audit packets and JSON when another tool should consume parsed SQL metadata.',
-        tone: 'info',
-      },
-      {
-        tag: 'Boundary',
-        title: 'No database execution',
-        body: 'This workflow parses local SQL text; it does not execute SQL against BW or any database.',
-        tone: 'ok',
-      },
-    ],
-  },
-  'field-lineage': {
-    id: 'field-lineage',
-    label: 'Field Lineage',
-    shortLabel: 'Fields',
-    eyebrow: 'Transformation mapping',
-    description:
-      'Inspect transformation XML and render source-to-target field lineage for object-level evidence reviews.',
-    endpoint: '/api/field-lineage',
-    runLabel: 'Render field lineage',
-    outputLabel: 'Field mapping',
-    emptyHint: 'Transformation fixture defaults are ready. Run to review source/target field mapping evidence.',
-    helperCards: [
-      {
-        tag: 'Mapping',
-        title: 'Source → target field paths',
-        body: 'Pair this with object-level lineage to explain exactly which fields move through a transformation.',
-        tone: 'accent',
-      },
-      {
-        tag: 'Audit',
-        title: 'Deterministic XML parsing',
-        body: 'The parser uses the selected local transformation XML and returns stable Markdown or JSON evidence.',
-        tone: 'ok',
-      },
-    ],
-  },
-};
-
-const liveModeDetails: Record<LiveMode, { title: string; endpoint: string; body: string }> = {
-  smoke: {
-    title: 'Smoke only',
-    endpoint: '/api/live/smoke',
-    body: 'Health-oriented read-only calls for search, xref, and dataflow reachability.',
-  },
-  collect: {
-    title: 'Collect snapshot',
-    endpoint: '/api/collect/live',
-    body: 'Writes local manifest evidence for offline lineage and review workflows.',
-  },
-  dataflow: {
-    title: 'Render dataflow',
-    endpoint: '/api/live/dataflow',
-    body: 'Fetches one BW dataflow XML payload and renders JSON, Markdown, or Mermaid.',
-  },
-};
-
 export default function App() {
-  const [tool, setTool] = useState<Tool>('settings');
-  const [form, setForm] = useState<FormState>(defaultState);
-  const [settings, setSettings] = useState<SettingsState>(defaultSettings);
-  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfigResponse | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [result, setResult] = useState('');
-  const [resultMeta, setResultMeta] = useState<ResultMeta | null>(null);
+  const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null);
+  const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState('');
+  const [objects, setObjects] = useState<CatalogObject[]>([]);
+  const [objectNextCursor, setObjectNextCursor] = useState<string | null>(null);
+  const [selectedObjectId, setSelectedObjectId] = useState('');
+  const [allowHiddenSelection, setAllowHiddenSelection] = useState(false);
+  const [objectDetail, setObjectDetail] = useState<CatalogObjectDetail | null>(null);
+  const [activeTab, setActiveTab] = useState<AppTab>('lineage');
+  const [catalogQuery, setCatalogQuery] = useState('');
+  const [objectType, setObjectType] = useState('');
+  const [direction, setDirection] = useState<Direction>('downstream');
+  const [depth, setDepth] = useState(1);
+  const [nodeCap, setNodeCap] = useState(25);
+  const [edgeCap, setEdgeCap] = useState(60);
+  const [changeType, setChangeType] = useState<ChangeType>('field_removed');
+  const [fieldName, setFieldName] = useState('AMOUNT');
+  const [scenarioDescription, setScenarioDescription] = useState('컬럼/로직 변경 영향 검토');
+  const [impactDepth, setImpactDepth] = useState(3);
+  const [sqlViewId, setSqlViewId] = useState('ZSQL_VIEW');
+  const [sqlFile, setSqlFile] = useState(fixtureSqlPath);
+  const [sqlQuestion, setSqlQuestion] = useState('이 뷰의 주요 소스와 집계 로직을 설명하는 조회 초안');
+  const [lineage, setLineage] = useState<LineageResponse | null>(null);
+  const [impact, setImpact] = useState<ImpactScenarioResponse | null>(null);
+  const [sqlExplain, setSqlExplain] = useState<SqlExplainResponse | null>(null);
+  const [sqlDraft, setSqlDraft] = useState<SqlDraftResponse | null>(null);
+  const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [commandText, setCommandText] = useState('');
-  const [copyStatus, setCopyStatus] = useState('');
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [setupForm, setSetupForm] = useState<SetupForm>({
+    url: '',
+    user: '',
+    password: '',
+    client: '100',
+    language: 'EN',
+    verifySsl: true,
+    caBundle: '',
+    trustEnv: true,
+    llmEnabled: false,
+    llmBaseUrl: 'http://127.0.0.1:11434/v1',
+    llmModel: 'local-model',
+    llmApiKey: '',
+  });
+  const [bwSetupTouched, setBwSetupTouched] = useState(false);
+
+  const [liveObjectNames, setLiveObjectNames] = useState('');
+  const [liveObjectType, setLiveObjectType] = useState('ADSO');
+  const [liveSourceSystem, setLiveSourceSystem] = useState('');
+  const [liveDataflowDirection, setLiveDataflowDirection] = useState<DataflowDirection>('downwards');
+  const [liveXrefDirection, setLiveXrefDirection] = useState<XrefDirection>('downstream');
+  const [liveDataflowLevels, setLiveDataflowLevels] = useState(3);
+  const [liveReadOnlyConfirmed, setLiveReadOnlyConfirmed] = useState(false);
+
+  const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
+  const selectedObject = objects.find((item) => item.id === selectedObjectId)
+    ?? (allowHiddenSelection && objectDetail?.id === selectedObjectId ? objectDetail : null);
+  const runtimeMissing = runtime ? !runtime.bw.configured : true;
+  const showDiagnostics = diagnosticsOpen || runtimeMissing;
 
   useEffect(() => {
-    void refreshStatus();
+    void refreshAll();
   }, []);
 
   useEffect(() => {
-    const options = formatOptionsFor(tool, form.liveMode);
-    if (options.length > 0 && !options.includes(form.format)) {
-      setForm((current) => ({ ...current, format: options[0] }));
+    if (!selectedSnapshotId && snapshots.length > 0) {
+      setSelectedSnapshotId(snapshots[0].id);
     }
-  }, [tool, form.liveMode, form.format]);
-
-  const endpoint = useMemo(() => endpointForTool(tool, form.liveMode), [tool, form.liveMode]);
-  const meta = toolCatalog[tool];
-  const formatOptions = formatOptionsFor(tool, form.liveMode);
-  const bwConfigured = runtimeConfig?.bw.configured ?? false;
-  const llmConfigured = runtimeConfig?.llm.configured ?? false;
-  const runDisabledReason = getRunDisabledReason(tool, form, busy, runtimeConfig);
-  const quickStats = buildQuickStats(health, runtimeConfig);
+  }, [selectedSnapshotId, snapshots]);
 
   useEffect(() => {
-    setResult('');
-    setResultMeta(null);
-    setError('');
-    setCopyStatus('');
-  }, [tool, form.liveMode]);
+    if (selectedSnapshotId) {
+      void refreshObjects(selectedSnapshotId);
+    } else {
+      setObjects([]);
+      setObjectNextCursor(null);
+      setSelectedObjectId('');
+    }
+  }, [selectedSnapshotId, catalogQuery, objectType]);
 
-  async function refreshStatus() {
+  useEffect(() => {
+    if (!selectedObjectId && objects.length > 0) {
+      setSelectedObjectId(objects[0].id);
+      setAllowHiddenSelection(false);
+    }
+    if (selectedObjectId && !objects.some((item) => item.id === selectedObjectId) && !allowHiddenSelection) {
+      setSelectedObjectId(objects[0]?.id ?? '');
+      setLineage(null);
+      setImpact(null);
+    }
+  }, [allowHiddenSelection, objects, selectedObjectId]);
+
+  useEffect(() => {
+    if (selectedSnapshotId && selectedObjectId) {
+      void loadObjectDetail(selectedSnapshotId, selectedObjectId);
+    } else {
+      setObjectDetail(null);
+    }
+  }, [selectedSnapshotId, selectedObjectId]);
+
+  const latestSnapshotLabel = selectedSnapshot
+    ? compactDate(selectedSnapshot.created_at)
+    : 'No snapshot / 스냅샷 없음';
+
+  const graphStats = useMemo(() => {
+    if (!lineage) return 'Run lineage';
+    const capText = lineage.truncated ? `truncated ${lineage.truncation.omitted_neighbor_total}` : 'complete';
+    return `${lineage.nodes.length} nodes · ${lineage.edges.length} edges · ${capText}`;
+  }, [lineage]);
+
+  function clearAnalysisState() {
+    setLineage(null);
+    setImpact(null);
+    setSqlExplain(null);
+    setSqlDraft(null);
+    setObjectDetail(null);
+  }
+
+  function chooseSnapshot(snapshotId: string) {
+    setSelectedSnapshotId(snapshotId);
+    setSelectedObjectId('');
+    setObjectNextCursor(null);
+    setAllowHiddenSelection(false);
+    clearAnalysisState();
+  }
+
+  function parseLiveObjectNames(): string[] {
+    const raw = liveObjectNames.trim() || selectedObjectId;
+    return raw
+      .split(/[\n,]+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+
+  async function refreshAll() {
+    setBusy('status');
     try {
-      const [healthResponse, configResponse] = await Promise.all([getHealth(), getRuntimeConfig()]);
+      const [healthResponse, runtimeResponse, snapshotResponse] = await Promise.all([
+        getHealth(),
+        getRuntimeConfig(),
+        listSnapshots(),
+      ]);
       setHealth(healthResponse);
-      setRuntimeConfig(configResponse);
-      hydrateSettingsFromRedactedConfig(configResponse);
-      setError('');
-    } catch (err: unknown) {
-      setError(`Backend 연결 실패: ${String(err)}`);
-    }
-  }
-
-  function hydrateSettingsFromRedactedConfig(config: RuntimeConfigResponse) {
-    setSettings((current) => ({
-      ...current,
-      bwUrl: config.bw.url ?? current.bwUrl,
-      bwUser: config.bw.user ?? current.bwUser,
-      bwClient: config.bw.client ?? current.bwClient,
-      bwLanguage: config.bw.language ?? current.bwLanguage,
-      bwVerifySsl: config.bw.verify_ssl,
-      bwCaBundle: config.bw.ca_bundle ?? current.bwCaBundle,
-      llmEnabled: config.llm.enabled,
-      llmBaseUrl: config.llm.base_url ?? current.llmBaseUrl,
-      llmModel: config.llm.model ?? current.llmModel,
-    }));
-  }
-
-  function publishResult(
-    content: string,
-    options: { title: string; endpoint: string; format: string; mode: string },
-  ) {
-    setResult(content);
-    setResultMeta({
-      ...options,
-      timestamp: new Date().toISOString(),
-      summary: summarizeResult(content, options.format, options.title),
-    });
-    setCopyStatus('');
-  }
-
-  function beginExecution() {
-    setBusy(true);
-    setError('');
-    setResult('');
-    setResultMeta(null);
-    setCopyStatus('');
-  }
-
-  async function runAnalysis() {
-    if (tool === 'settings') {
-      await saveSettings();
-      return;
-    }
-    if (tool === 'live') {
-      await runLiveAction();
-      return;
-    }
-    beginExecution();
-    try {
-      const rendered = await postRendered(endpoint, buildRequest(tool, form));
-      publishResult(rendered.content, {
-        title: toolCatalog[tool].outputLabel,
-        endpoint,
-        format: rendered.format,
-        mode: toolCatalog[tool].label,
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function runLiveAction() {
-    beginExecution();
-    try {
-      if (form.liveMode === 'smoke') {
-        const payload = await postJson<LiveSmokeResponse>('/api/live/smoke', {
-          confirm_read_only: form.liveConfirm,
-          search_term: form.liveSearchTerm,
-          object_name: form.liveObjectName || undefined,
-          xref_direction: 'downstream',
-          object_type: form.liveObjectType,
-          source_system: form.liveSourceSystem || undefined,
-          dataflow_direction: form.liveDataflowDirection,
-          dataflow_levels: clampNumber(form.liveDataflowLevels, 3),
-        });
-        publishResult(JSON.stringify(payload, null, 2), {
-          title: 'Live smoke response',
-          endpoint: '/api/live/smoke',
-          format: 'json',
-          mode: liveModeDetails.smoke.title,
-        });
-      } else if (form.liveMode === 'collect') {
-        const payload = await postJson<LiveCollectResponse>('/api/collect/live', {
-          confirm_read_only: form.liveConfirm,
-          out_dir: form.liveOutDir,
-          search_terms: form.liveSearchTerm ? [form.liveSearchTerm] : [],
-          object_names: form.liveObjectName ? [form.liveObjectName] : [],
-          include_dataflow: true,
-          include_xref: true,
-          xref_direction: 'downstream',
-          object_type: form.liveObjectType,
-          source_system: form.liveSourceSystem || undefined,
-          dataflow_direction: form.liveDataflowDirection,
-          dataflow_levels: clampNumber(form.liveDataflowLevels, 3),
-        });
-        publishResult(JSON.stringify(payload, null, 2), {
-          title: 'Live collection manifest',
-          endpoint: '/api/collect/live',
-          format: 'json',
-          mode: liveModeDetails.collect.title,
-        });
-      } else {
-        const rendered = await postRendered('/api/live/dataflow', {
-          confirm_read_only: form.liveConfirm,
-          object_name: form.liveObjectName,
-          object_type: form.liveObjectType,
-          source_system: form.liveSourceSystem || undefined,
-          direction: form.liveDataflowDirection,
-          levels: clampNumber(form.liveDataflowLevels, 3),
-          format: form.format,
-        });
-        publishResult(rendered.content, {
-          title: 'Live dataflow render',
-          endpoint: '/api/live/dataflow',
-          format: rendered.format,
-          mode: liveModeDetails.dataflow.title,
-        });
+      setRuntime(runtimeResponse);
+      setSetupForm((current) => ({
+        ...current,
+        url: current.url || runtimeResponse.bw.url || '',
+        user: current.user || runtimeResponse.bw.user || '',
+        client: runtimeResponse.bw.client || current.client,
+        language: runtimeResponse.bw.language || current.language,
+        verifySsl: runtimeResponse.bw.verify_ssl,
+        caBundle: current.caBundle || runtimeResponse.bw.ca_bundle || '',
+        trustEnv: runtimeResponse.bw.trust_env,
+        llmEnabled: runtimeResponse.llm.enabled,
+        llmBaseUrl: runtimeResponse.llm.base_url || current.llmBaseUrl,
+        llmModel: runtimeResponse.llm.model || current.llmModel,
+      }));
+      setSnapshots(snapshotResponse.snapshots);
+      if (runtimeResponse.bw.configured) {
+        setDiagnosticsOpen(false);
       }
+      setError('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorText(err));
     } finally {
-      setBusy(false);
+      setBusy('');
     }
   }
 
-  async function saveSettings() {
-    beginExecution();
+  async function refreshObjects(snapshotId: string, cursor?: string | null) {
+    setBusy('catalog');
     try {
-      const body = {
-        bw: settings.bwUrl
+      const response = await listObjects(snapshotId, {
+        q: catalogQuery.trim() || undefined,
+        type: objectType || undefined,
+        limit: 80,
+        cursor,
+      });
+      setObjects((current) => (cursor ? [...current, ...response.items] : response.items));
+      setObjectNextCursor(response.next_cursor);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function loadObjectDetail(snapshotId: string, objectId: string) {
+    try {
+      setObjectDetail(await getObject(snapshotId, objectId));
+    } catch (err) {
+      setObjectDetail(null);
+      setError(errorText(err));
+    }
+  }
+
+  async function saveSetup() {
+    setBusy('setup');
+    try {
+      const bwConfigRequested = bwSetupTouched;
+      const llmFieldsProvided =
+        setupForm.llmEnabled || Boolean(setupForm.llmBaseUrl.trim() || setupForm.llmModel.trim() || setupForm.llmApiKey.trim());
+      const next = await putRuntimeConfig({
+        bw: bwConfigRequested
           ? {
-              url: settings.bwUrl,
-              user: settings.bwUser,
-              password: settings.bwPassword,
-              client: settings.bwClient,
-              language: settings.bwLanguage,
-              verify_ssl: settings.bwVerifySsl,
-              ca_bundle: settings.bwCaBundle || undefined,
+              url: setupForm.url.trim() || runtime?.bw.url || '',
+              user: setupForm.user.trim() || runtime?.bw.user || '',
+              password: setupForm.password,
+              client: setupForm.client.trim() || runtime?.bw.client || '100',
+              language: setupForm.language.trim() || runtime?.bw.language || 'EN',
+              verify_ssl: setupForm.verifySsl,
+              ca_bundle: setupForm.caBundle.trim() || runtime?.bw.ca_bundle || undefined,
+              trust_env: setupForm.trustEnv,
             }
           : undefined,
-        llm: {
-          enabled: settings.llmEnabled,
-          base_url: settings.llmEnabled ? settings.llmBaseUrl : undefined,
-          model: settings.llmEnabled ? settings.llmModel : undefined,
-          api_key: settings.llmEnabled ? settings.llmApiKey : undefined,
-        },
-      };
-      const config = await putRuntimeConfig(body);
-      setRuntimeConfig(config);
-      setSettings((current) => ({ ...current, bwPassword: '', llmApiKey: '' }));
-      publishResult(
-        'Runtime settings saved in backend process memory only. Secret fields were cleared from the form and were not returned by the API.',
-        {
-          title: 'Runtime settings saved',
-          endpoint: '/api/runtime-config',
-          format: 'status',
-          mode: 'Settings',
-        },
-      );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function clearSettings() {
-    beginExecution();
-    try {
-      const config = await clearRuntimeConfig();
-      setRuntimeConfig(config);
-      setSettings(defaultSettings);
-      publishResult('Runtime settings cleared from backend process memory.', {
-        title: 'Runtime settings cleared',
-        endpoint: '/api/runtime-config',
-        format: 'status',
-        mode: 'Settings',
+        llm: llmFieldsProvided
+          ? {
+              enabled: setupForm.llmEnabled,
+              base_url: setupForm.llmBaseUrl.trim() || undefined,
+              model: setupForm.llmModel.trim() || undefined,
+              api_key: setupForm.llmApiKey.trim() || undefined,
+            }
+          : undefined,
       });
+      setRuntime(next);
+      setSetupForm((current) => ({ ...current, password: '', llmApiKey: '' }));
+      setBwSetupTouched(false);
+      setDiagnosticsOpen(false);
+      setError('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorText(err));
     } finally {
-      setBusy(false);
+      setBusy('');
     }
   }
 
-  function update<K extends keyof FormState>(key: K, value: FormState[K]) {
-    setForm((current) => ({ ...current, [key]: value }));
-  }
-
-  function updateSettings<K extends keyof SettingsState>(key: K, value: SettingsState[K]) {
-    setSettings((current) => ({ ...current, [key]: value }));
-  }
-
-  function applyGlobalCommand() {
-    const value = commandText.trim();
-    if (!value) return;
-    if (tool === 'live') {
-      if (value.includes('*') || value.includes('?')) {
-        update('liveSearchTerm', value);
-      } else {
-        update('liveObjectName', value);
-      }
-    } else if (tool === 'lineage') {
-      update('objectId', value);
-    } else if (tool === 'sql-view') {
-      update('viewId', value);
-    } else if (tool === 'field-lineage') {
-      update('transformationId', value);
-    } else if (tool === 'impact') {
-      update('changesPath', value);
-    } else if (value.startsWith('http://') || value.startsWith('https://')) {
-      updateSettings('bwUrl', value);
-    }
-    setCommandText('');
-  }
-
-  async function copyResult() {
-    if (!result) return;
+  async function clearSetup() {
+    setBusy('setup');
     try {
-      await navigator.clipboard.writeText(result);
-      setCopyStatus('Copied');
-    } catch {
-      setCopyStatus('Copy failed');
+      setRuntime(await clearRuntimeConfig());
+      setSetupForm((current) => ({ ...current, password: '', llmApiKey: '' }));
+      setBwSetupTouched(false);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
     }
   }
 
-  function downloadResult() {
-    if (!result) return;
-    const extension = extensionForFormat(resultMeta?.format ?? form.format);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const blob = new Blob([result], { type: mimeForFormat(resultMeta?.format ?? form.format) });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `bw-lineage-impact-${tool}-${stamp}.${extension}`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+  async function captureFixture() {
+    setBusy('snapshot');
+    try {
+      const snapshot = await captureFixtureSnapshot(fixtureGraphPath);
+      await reloadSnapshots(snapshot.id);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function captureLive() {
+    const objectNames = parseLiveObjectNames();
+    if (objectNames.length === 0) {
+      setError('Live capture requires at least one object name so dataflow/xref edges can be collected.');
+      return;
+    }
+    setBusy('snapshot');
+    try {
+      const snapshot = await captureLiveSnapshot({
+        confirmReadOnly: liveReadOnlyConfirmed,
+        objectNames,
+        objectType: liveObjectType.trim() || undefined,
+        sourceSystem: liveSourceSystem.trim() || undefined,
+        dataflowDirection: liveDataflowDirection,
+        dataflowLevels: liveDataflowLevels,
+        xrefDirection: liveXrefDirection,
+      });
+      await reloadSnapshots(snapshot.id);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function reloadSnapshots(preferredId?: string) {
+    const snapshotResponse = await listSnapshots();
+    const nextSnapshotId = preferredId ?? snapshotResponse.snapshots[0]?.id ?? '';
+    setSnapshots(snapshotResponse.snapshots);
+    chooseSnapshot(nextSnapshotId);
+  }
+
+  async function runLineage(startId = selectedObjectId) {
+    if (!selectedSnapshotId || !startId) return;
+    setBusy('lineage');
+    try {
+      const response = await postLineage(selectedSnapshotId, {
+        object_id: startId,
+        direction,
+        depth,
+        node_cap: nodeCap,
+        edge_cap: edgeCap,
+      });
+      setLineage(response);
+      setSelectedObjectId(startId);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runImpact() {
+    if (!selectedSnapshotId || !selectedObjectId) return;
+    setBusy('impact');
+    try {
+      setImpact(
+        await postImpactScenario(selectedSnapshotId, {
+          object_id: selectedObjectId,
+          change_type: changeType,
+          field: fieldName.trim() || null,
+          description: scenarioDescription.trim() || null,
+          depth: Math.max(impactDepth, 1),
+          node_cap: nodeCap,
+          edge_cap: edgeCap,
+        }),
+      );
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runSqlExplain() {
+    if (!selectedSnapshotId) return;
+    setBusy('sql-explain');
+    try {
+      setSqlExplain(
+        await explainSql(selectedSnapshotId, {
+          view_id: sqlViewId,
+          sql_file: sqlFile,
+          format: 'json',
+        }),
+      );
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runSqlDraft() {
+    if (!selectedSnapshotId) return;
+    setBusy('sql-draft');
+    try {
+      setSqlDraft(
+        await draftSql(selectedSnapshotId, {
+          question: sqlQuestion,
+          target_dialect: 'sap-hana-sql',
+          view_id: sqlViewId,
+          sql_file: sqlFile,
+        }),
+      );
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
   }
 
   return (
-    <main className="appShell">
-      <TopStatusBar
-        bwConfigured={bwConfigured}
-        commandText={commandText}
-        health={health}
-        llmConfigured={llmConfigured}
-        onApplyCommand={applyGlobalCommand}
-        onCommandTextChange={setCommandText}
-        onRefresh={() => void refreshStatus()}
-        placeholder={placeholderForTool(tool)}
-        runtimeConfig={runtimeConfig}
-      />
+    <div className="appShell">
+      <header className="topStatus">
+        <div className="brandBlock">
+          <span className="brandMark">BW</span>
+          <div>
+            <strong>BW Lineage Impact</strong>
+            <span>local-first SAP BW/4HANA lineage analyzer</span>
+          </div>
+        </div>
+        <div className="statusStrip">
+          <StatusPill label="BW" value={bwStatus(runtime)} tone={runtime?.bw.configured ? 'ok' : 'warn'} />
+          <StatusPill label="Snapshot" value={latestSnapshotLabel} tone={selectedSnapshot ? 'info' : 'warn'} />
+          <StatusPill label="Local-only" value={health?.local_only ? '로컬 전용' : 'checking'} tone="ok" />
+          <StatusPill label="Read-only" value={health?.read_only ? 'GET only' : 'checking'} tone="ok" />
+          <StatusPill label="LLM" value={runtime?.llm.configured ? 'local configured' : 'disabled'} tone="neutral" />
+        </div>
+        <button className="ghostButton" onClick={() => setDiagnosticsOpen((value) => !value)}>
+          Diagnostics / 설정
+        </button>
+      </header>
 
-      <div className="appFrame">
-        <SideNavigation
-          activeTool={tool}
-          form={form}
-          health={health}
-          onSelectTool={setTool}
-          runtimeConfig={runtimeConfig}
-        />
+      {error ? <div className="errorBar">{error}</div> : null}
 
-        <section className="mainStage" aria-label="BW Lineage Impact workbench">
-          <WorkbenchHero
-            endpoint={endpoint}
-            meta={meta}
-            quickStats={quickStats}
-            status={readinessForTool(tool, runtimeConfig, health, form)}
-          />
-
-          <div className="workspaceGrid">
-            <section className="workbenchPanel controlPanel">
-              <PanelTitle
-                kicker={tool === 'settings' ? 'Secure configuration' : 'Execution controls'}
-                rightSlot={
-                  formatOptions.length > 0 ? (
-                    <FormatSelect
-                      format={form.format}
-                      onChange={(value) => update('format', value)}
-                      options={formatOptions}
-                    />
-                  ) : null
-                }
-                title={tool === 'settings' ? 'Runtime configuration workspace' : meta.label}
+      {showDiagnostics ? (
+        <section className="diagnosticsPanel">
+          <div>
+            <h2>Setup / Diagnostics</h2>
+            <p>
+              {runtime?.bw.source === 'env'
+                ? 'BW is configured from .env/environment; duplicate UI setup is not required.'
+                : 'BW 환경 설정이 없으면 live capture는 비활성입니다. Secrets stay in process memory only.'}
+            </p>
+          </div>
+          <div className="setupGrid">
+            <input placeholder="BW_URL" value={setupForm.url} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, url: event.target.value }); }} />
+            <input placeholder="BW_USER" value={setupForm.user} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, user: event.target.value }); }} />
+            <input placeholder="BW_PASSWORD" type="password" value={setupForm.password} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, password: event.target.value }); }} />
+            <input placeholder="BW_CLIENT" value={setupForm.client} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, client: event.target.value }); }} />
+            <input placeholder="BW_CA_BUNDLE (optional)" value={setupForm.caBundle} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, caBundle: event.target.value }); }} />
+            <label className="checkField">
+              <input
+                type="checkbox"
+                checked={setupForm.verifySsl}
+                onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, verifySsl: event.target.checked }); }}
               />
-
-              {tool === 'settings' ? (
-                <SettingsPanel
-                  busy={busy}
-                  onClear={() => void clearSettings()}
-                  onSave={() => void saveSettings()}
-                  runtimeConfig={runtimeConfig}
-                  settings={settings}
-                  updateSettings={updateSettings}
-                />
-              ) : null}
-
-              {tool === 'live' ? <LivePanel form={form} update={update} /> : null}
-
-              {tool !== 'settings' && tool !== 'live' ? (
-                <LocalAnalysisPanel form={form} tool={tool} update={update} />
-              ) : null}
-
-              {tool !== 'settings' ? (
-                <div className="runDock">
-                  <button
-                    className="primaryButton"
-                    disabled={Boolean(runDisabledReason)}
-                    onClick={() => void runAnalysis()}
-                    type="button"
-                  >
-                    {busy ? '실행 중…' : meta.runLabel}
-                  </button>
-                  {runDisabledReason && !busy ? <p className="runHint">{runDisabledReason}</p> : null}
-                </div>
-              ) : null}
-            </section>
-
-            <ResultViewer
-              activeTool={tool}
-              busy={busy}
-              copyStatus={copyStatus}
-              error={error}
-              meta={resultMeta}
-              onCopy={() => void copyResult()}
-              onDownload={downloadResult}
-              result={result}
-              toolMeta={meta}
+              Verify SSL
+            </label>
+            <label className="checkField">
+              <input
+                type="checkbox"
+                checked={setupForm.trustEnv}
+                onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, trustEnv: event.target.checked }); }}
+              />
+              Trust proxy env
+            </label>
+            <label className="checkField">
+              <input
+                type="checkbox"
+                checked={setupForm.llmEnabled}
+                onChange={(event) => setSetupForm({ ...setupForm, llmEnabled: event.target.checked })}
+              />
+              Enable local OpenAI-compatible SQL drafts
+            </label>
+            <input
+              placeholder="BWLI_LLM_BASE_URL (local only)"
+              value={setupForm.llmBaseUrl}
+              onChange={(event) => setSetupForm({ ...setupForm, llmBaseUrl: event.target.value })}
             />
+            <input placeholder="BWLI_LLM_MODEL" value={setupForm.llmModel} onChange={(event) => setSetupForm({ ...setupForm, llmModel: event.target.value })} />
+            <input
+              placeholder={runtime?.llm.configured ? 'BWLI_LLM_API_KEY already configured' : 'BWLI_LLM_API_KEY'}
+              type="password"
+              value={setupForm.llmApiKey}
+              onChange={(event) => setSetupForm({ ...setupForm, llmApiKey: event.target.value })}
+            />
+            <p className="setupHint">LLM: {llmStatus(runtime)} · SQL Assistant never executes SQL.</p>
+            <button className="primaryButton" onClick={saveSetup} disabled={busy === 'setup'}>Save runtime</button>
+            <button className="secondaryButton" onClick={clearSetup} disabled={busy === 'setup'}>Clear / env fallback</button>
           </div>
-
-          <WorkflowSupport meta={meta} tool={tool} />
         </section>
-      </div>
-    </main>
-  );
-}
+      ) : null}
 
-function TopStatusBar({
-  bwConfigured,
-  commandText,
-  health,
-  llmConfigured,
-  onApplyCommand,
-  onCommandTextChange,
-  onRefresh,
-  placeholder,
-  runtimeConfig,
-}: {
-  bwConfigured: boolean;
-  commandText: string;
-  health: HealthResponse | null;
-  llmConfigured: boolean;
-  onApplyCommand: () => void;
-  onCommandTextChange: (value: string) => void;
-  onRefresh: () => void;
-  placeholder: string;
-  runtimeConfig: RuntimeConfigResponse | null;
-}) {
-  const backendOk = health?.status === 'ok';
-  return (
-    <header className="topBar">
-      <div className="brandBlock" aria-label="Application identity">
-        <div className="brandMark">BW</div>
-        <div>
-          <strong>BW Lineage Impact</strong>
-          <span>Local-first read-only analyzer</span>
-        </div>
-      </div>
-
-      <div className="commandBar">
-        <span className="commandGlyph">⌘</span>
-        <input
-          aria-label="Global object or file command"
-          onChange={(event) => onCommandTextChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') onApplyCommand();
-          }}
-          placeholder={placeholder}
-          value={commandText}
-        />
-        <button onClick={onApplyCommand} type="button">
-          Apply
-        </button>
-      </div>
-
-      <div className="statusCluster" aria-label="Global runtime status">
-        <StatusPill label="Backend" tone={backendOk ? 'ok' : 'warning'} value={health?.status ?? 'checking'} />
-        <StatusPill label="BW" tone={bwConfigured ? 'ok' : 'neutral'} value={bwConfigured ? 'configured' : 'not set'} />
-        <StatusPill label="LLM" tone={llmConfigured ? 'accent' : 'neutral'} value={llmConfigured ? 'ready' : 'off'} />
-        <StatusPill
-          label="Mode"
-          tone={health ? (health.read_only === false ? 'danger' : 'ok') : 'neutral'}
-          value={health ? (health.read_only === false ? 'write?' : 'read-only') : 'checking'}
-        />
-        <button className="ghostButton" onClick={onRefresh} type="button">
-          Refresh
-        </button>
-        <span className="storageChip">{runtimeConfig?.storage ?? 'process-memory'}</span>
-      </div>
-    </header>
-  );
-}
-
-function SideNavigation({
-  activeTool,
-  form,
-  health,
-  onSelectTool,
-  runtimeConfig,
-}: {
-  activeTool: Tool;
-  form: FormState;
-  health: HealthResponse | null;
-  onSelectTool: (tool: Tool) => void;
-  runtimeConfig: RuntimeConfigResponse | null;
-}) {
-  return (
-    <aside className="sideNav" aria-label="Analysis modules">
-      <div className="navIntro">
-        <span className="eyebrow">Enterprise modules</span>
-        <h2>Workbench</h2>
-        <p>실제 검토 흐름 중심의 BW lineage, impact, evidence tools.</p>
-      </div>
-      <nav className="navList">
-        {toolOrder.map((item) => {
-          const meta = toolCatalog[item];
-          const readiness = readinessForTool(item, runtimeConfig, health, form);
-          return (
-            <button
-              aria-current={item === activeTool ? 'page' : undefined}
-              className={item === activeTool ? 'navItem active' : 'navItem'}
-              key={item}
-              onClick={() => onSelectTool(item)}
-              type="button"
-            >
-              <span className={`navState ${readiness.tone}`} />
-              <span>
-                <strong>{meta.shortLabel}</strong>
-                <small>{meta.description}</small>
-              </span>
-              <em>{readiness.label}</em>
-            </button>
-          );
-        })}
-      </nav>
-      <div className="readOnlyCard">
-        <span className="lockIcon">▣</span>
-        <strong>Read-only safety</strong>
-        <p>Live BW actions require explicit confirmation and runtime credentials remain process-memory only.</p>
-      </div>
-    </aside>
-  );
-}
-
-function WorkbenchHero({
-  endpoint,
-  meta,
-  quickStats,
-  status,
-}: {
-  endpoint: string;
-  meta: ToolMeta;
-  quickStats: Array<{ label: string; value: string; tone: Tone; detail: string }>;
-  status: { label: string; tone: Tone };
-}) {
-  return (
-    <section className="heroPanel">
-      <div className="heroCopy">
-        <span className="eyebrow">{meta.eyebrow}</span>
-        <div className="heroTitleRow">
-          <h1>{meta.label}</h1>
-          <StatusPill label="Module" tone={status.tone} value={status.label} />
-        </div>
-        <p>{meta.description}</p>
-        <div className="endpointLine">
-          <span>Endpoint</span>
-          <code>{endpoint}</code>
-        </div>
-      </div>
-      <div className="metricGrid" aria-label="Runtime quick stats">
-        {quickStats.map((stat) => (
-          <div className={`metricCard ${stat.tone}`} key={stat.label}>
-            <span>{stat.label}</span>
-            <strong>{stat.value}</strong>
-            <small>{stat.detail}</small>
+      <main className="appFrame">
+        <aside className="catalogPane">
+          <div className="paneHeader">
+            <div>
+              <span className="eyebrow">Object Catalog</span>
+              <h2>객체 카탈로그</h2>
+            </div>
+            <button className="iconButton" onClick={() => void refreshAll()} disabled={busy === 'status'}>↻</button>
           </div>
-        ))}
-      </div>
-    </section>
-  );
-}
 
-function PanelTitle({
-  kicker,
-  rightSlot,
-  title,
-}: {
-  kicker: string;
-  rightSlot?: ReactNode;
-  title: string;
-}) {
-  return (
-    <div className="panelTitle">
-      <div>
-        <span className="panelKicker">{kicker}</span>
-        <h2>{title}</h2>
-      </div>
-      {rightSlot}
+          <label className="fieldLabel">
+            Snapshot
+            <select value={selectedSnapshotId} onChange={(event) => chooseSnapshot(event.target.value)}>
+              <option value="">No snapshot</option>
+              {snapshots.map((snapshot) => (
+                <option key={snapshot.id} value={snapshot.id}>
+                  {compactDate(snapshot.created_at)} · {snapshot.object_count} objects
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="fieldLabel">
+            Live object names
+            <textarea
+              className="liveObjectInput"
+              placeholder="ZADSO_SALES, ZTRFN_MARGIN — required for live dataflow/xref edges"
+              value={liveObjectNames}
+              onChange={(event) => setLiveObjectNames(event.target.value)}
+            />
+          </label>
+
+          <div className="liveOptionsGrid">
+            <label>
+              Object type
+              <input value={liveObjectType} onChange={(event) => setLiveObjectType(event.target.value)} />
+            </label>
+            <label>
+              Source system
+              <input placeholder="optional for RSDS" value={liveSourceSystem} onChange={(event) => setLiveSourceSystem(event.target.value)} />
+            </label>
+            <label>
+              Dataflow
+              <select
+                value={liveDataflowDirection}
+                onChange={(event) => setLiveDataflowDirection(event.target.value as DataflowDirection)}
+              >
+                <option value="downwards">Downwards</option>
+                <option value="upwards">Upwards</option>
+                <option value="both">Both</option>
+              </select>
+            </label>
+            <label>
+              Where-used
+              <select value={liveXrefDirection} onChange={(event) => setLiveXrefDirection(event.target.value as XrefDirection)}>
+                <option value="downstream">Downstream</option>
+                <option value="upstream">Upstream</option>
+              </select>
+            </label>
+            <label>
+              Levels
+              <input
+                type="number"
+                min={0}
+                max={10}
+                value={liveDataflowLevels}
+                onChange={(event) => setLiveDataflowLevels(Number(event.target.value) || 0)}
+              />
+            </label>
+          </div>
+
+          <label className="checkField liveConfirm">
+            <input
+              type="checkbox"
+              checked={liveReadOnlyConfirmed}
+              onChange={(event) => setLiveReadOnlyConfirmed(event.target.checked)}
+            />
+            I confirm read-only GET metadata capture / 읽기 전용 메타데이터 조회를 확인합니다.
+          </label>
+
+          <div className="captureRow">
+            <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>
+              Fixture capture
+            </button>
+            <button className="secondaryButton" onClick={captureLive} disabled={!runtime?.bw.configured || !liveReadOnlyConfirmed || busy === 'snapshot'}>
+              Live GET capture
+            </button>
+          </div>
+
+          <input
+            className="catalogSearch"
+            placeholder="Search object / 이름 검색"
+            value={catalogQuery}
+            onChange={(event) => {
+              setAllowHiddenSelection(false);
+              setCatalogQuery(event.target.value);
+            }}
+          />
+          <div className="filterChips">
+            {typeFilters.map((filter) => (
+              <button
+                key={filter || 'all'}
+                className={filter === objectType ? 'chip active' : 'chip'}
+                onClick={() => {
+                  setAllowHiddenSelection(false);
+                  setObjectType(filter);
+                }}
+              >
+                {filter || 'All'}
+              </button>
+            ))}
+          </div>
+
+          <div className="objectList" aria-busy={busy === 'catalog'}>
+            {objects.length === 0 ? (
+              <div className="emptyState">No objects. Capture a snapshot first.</div>
+            ) : (
+              objects.map((item) => (
+                <button
+                  key={item.id}
+                  className={item.id === selectedObjectId ? 'objectItem active' : 'objectItem'}
+                  onClick={() => {
+                    setAllowHiddenSelection(false);
+                    setSelectedObjectId(item.id);
+                    setLineage(null);
+                    setImpact(null);
+                  }}
+                >
+                  <span className="objectType">{item.type}</span>
+                  <strong>{item.id}</strong>
+                  <small>{item.name || item.label || '—'}</small>
+                </button>
+              ))
+            )}
+          </div>
+            {objectNextCursor ? (
+              <button
+                className="secondaryButton fullWidth"
+                disabled={busy === 'catalog'}
+                onClick={() => void refreshObjects(selectedSnapshotId, objectNextCursor)}
+              >
+                Load more objects
+              </button>
+            ) : null}
+        </aside>
+
+        <section className="workspacePane">
+          <nav className="tabBar">
+            <TabButton id="lineage" active={activeTab} onClick={setActiveTab} label="Lineage" />
+            <TabButton id="impact" active={activeTab} onClick={setActiveTab} label="Impact" />
+            <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Assistant" />
+          </nav>
+
+          {activeTab === 'lineage' ? (
+            <LineageTab
+              selectedObject={selectedObject}
+              objectDetail={objectDetail}
+              lineage={lineage}
+              graphStats={graphStats}
+              direction={direction}
+              setDirection={setDirection}
+              depth={depth}
+              setDepth={setDepth}
+              nodeCap={nodeCap}
+              setNodeCap={setNodeCap}
+              edgeCap={edgeCap}
+              setEdgeCap={setEdgeCap}
+              onRun={() => void runLineage()}
+              onSelect={(id) => {
+                setAllowHiddenSelection(true);
+                setSelectedObjectId(id);
+                setImpact(null);
+              }}
+              onExpand={(id) => {
+                setAllowHiddenSelection(true);
+                setImpact(null);
+                void runLineage(id);
+              }}
+              busy={busy === 'lineage'}
+            />
+          ) : null}
+
+          {activeTab === 'impact' ? (
+            <ImpactTab
+              selectedObject={selectedObject}
+              changeType={changeType}
+              setChangeType={setChangeType}
+              fieldName={fieldName}
+              setFieldName={setFieldName}
+              description={scenarioDescription}
+              setDescription={setScenarioDescription}
+              impactDepth={impactDepth}
+              setImpactDepth={setImpactDepth}
+              onRun={() => void runImpact()}
+              impact={impact}
+              busy={busy === 'impact'}
+            />
+          ) : null}
+
+          {activeTab === 'sql' ? (
+            <SqlTab
+              runtime={runtime}
+              viewId={sqlViewId}
+              setViewId={setSqlViewId}
+              sqlFile={sqlFile}
+              setSqlFile={setSqlFile}
+              question={sqlQuestion}
+              setQuestion={setSqlQuestion}
+              explain={sqlExplain}
+              draft={sqlDraft}
+              onExplain={() => void runSqlExplain()}
+              onDraft={() => void runSqlDraft()}
+              busy={busy}
+            />
+          ) : null}
+        </section>
+      </main>
     </div>
   );
 }
 
-function SettingsPanel({
-  busy,
-  settings,
-  runtimeConfig,
-  onClear,
-  onSave,
-  updateSettings,
-}: {
+function LineageTab(props: {
+  selectedObject: CatalogObject | null;
+  objectDetail: CatalogObjectDetail | null;
+  lineage: LineageResponse | null;
+  graphStats: string;
+  direction: Direction;
+  setDirection: (value: Direction) => void;
+  depth: number;
+  setDepth: (value: number) => void;
+  nodeCap: number;
+  setNodeCap: (value: number) => void;
+  edgeCap: number;
+  setEdgeCap: (value: number) => void;
+  onRun: () => void;
+  onSelect: (id: string) => void;
+  onExpand: (id: string) => void;
   busy: boolean;
-  settings: SettingsState;
-  runtimeConfig: RuntimeConfigResponse | null;
-  onClear: () => void;
-  onSave: () => void;
-  updateSettings: <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => void;
 }) {
   return (
-    <div className="settingsStack">
-      <div className="secureNotice">
-        <span>Process-memory only</span>
-        <p>
-          입력값은 로컬 백엔드 프로세스 메모리에만 보관됩니다. 파일/env/browser storage에 저장하지 않고,
-          secret 값은 API 응답에 반환되지 않습니다.
-        </p>
-      </div>
-
-      <div className="runtimeSummaryGrid">
-        <SummaryTile label="BW" tone={runtimeConfig?.bw.configured ? 'ok' : 'neutral'} value={runtimeConfig?.bw.configured ? 'configured' : 'not configured'} />
-        <SummaryTile label="LLM" tone={runtimeConfig?.llm.configured ? 'accent' : 'neutral'} value={runtimeConfig?.llm.configured ? 'configured' : 'off'} />
-        <SummaryTile label="Storage" tone="ok" value={runtimeConfig?.storage ?? 'process-memory'} />
-      </div>
-
-      <section className="formSection">
-        <div className="sectionHeading">
-          <h3>BW runtime</h3>
-          <span>read-only SAP BW metadata access</span>
+    <div className="workspaceGrid">
+      <section className="controlCard">
+        <div className="sectionTitle">
+          <span className="eyebrow">Bounded graph</span>
+          <h1>{props.selectedObject?.id ?? 'Select object'}</h1>
+          <p>{props.graphStats}</p>
         </div>
-        <Field
-          autoComplete="off"
-          label="BW_URL"
-          onChange={(v) => updateSettings('bwUrl', v)}
-          placeholder="https://bw.example.internal"
-          value={settings.bwUrl}
-        />
-        <Field
-          autoComplete="off"
-          label="BW_USER"
-          onChange={(v) => updateSettings('bwUser', v)}
-          placeholder="read-only technical user"
-          value={settings.bwUser}
-        />
-        <Field
-          autoComplete="new-password"
-          hint="Write-only. The field clears immediately after Save."
-          inputType="password"
-          label="BW_PASSWORD"
-          onChange={(v) => updateSettings('bwPassword', v)}
-          value={settings.bwPassword}
-        />
-        <div className="twoColumn">
-          <Field label="BW_CLIENT" onChange={(v) => updateSettings('bwClient', v)} value={settings.bwClient} />
-          <Field label="BW_LANGUAGE" onChange={(v) => updateSettings('bwLanguage', v)} value={settings.bwLanguage} />
+        <div className="compactForm three">
+          <label>Direction
+            <select value={props.direction} onChange={(event) => props.setDirection(event.target.value as Direction)}>
+              <option value="downstream">downstream</option>
+              <option value="upstream">upstream</option>
+              <option value="both">both</option>
+            </select>
+          </label>
+          <NumberField label="Depth" value={props.depth} min={0} max={20} onChange={props.setDepth} />
+          <NumberField label="Node cap" value={props.nodeCap} min={1} max={500} onChange={props.setNodeCap} />
+          <NumberField label="Edge cap" value={props.edgeCap} min={0} max={1000} onChange={props.setEdgeCap} />
         </div>
-        <Checkbox
-          checked={settings.bwVerifySsl}
-          label="Verify SSL certificates"
-          onChange={(value) => updateSettings('bwVerifySsl', value)}
-        />
-        <Field
-          autoComplete="off"
-          hint="Optional local corporate CA bundle path; never required for fixture-only workflows."
-          label="BW_CA_BUNDLE"
-          onChange={(v) => updateSettings('bwCaBundle', v)}
-          placeholder="optional PEM path"
-          value={settings.bwCaBundle}
-        />
-      </section>
-
-      <section className="formSection">
-        <div className="sectionHeading">
-          <h3>Local OpenAI-compatible LLM</h3>
-          <span>optional explanation layer</span>
-        </div>
-        <Checkbox
-          checked={settings.llmEnabled}
-          label="Enable optional local LLM explainer"
-          onChange={(value) => updateSettings('llmEnabled', value)}
-        />
-        <Field
-          label="BWLI_LLM_BASE_URL"
-          onChange={(v) => updateSettings('llmBaseUrl', v)}
-          value={settings.llmBaseUrl}
-        />
-        <Field label="BWLI_LLM_MODEL" onChange={(v) => updateSettings('llmModel', v)} value={settings.llmModel} />
-        <Field
-          autoComplete="new-password"
-          hint="Write-only. No token is returned by the runtime-config API."
-          inputType="password"
-          label="BWLI_LLM_API_KEY"
-          onChange={(v) => updateSettings('llmApiKey', v)}
-          value={settings.llmApiKey}
-        />
-      </section>
-
-      <div className="buttonRow">
-        <button className="primaryButton" disabled={busy} onClick={onSave} type="button">
-          {busy ? '저장 중…' : 'Save runtime settings'}
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy}>
+          Run lineage / 영향 경로 보기
         </button>
-        <button className="secondaryButton" disabled={busy} onClick={onClear} type="button">
-          Clear process memory
-        </button>
-      </div>
+        {props.lineage ? (
+          <div className="metaGrid">
+            <Metric label="Truncated" value={props.lineage.truncated ? 'Yes' : 'No'} />
+            <Metric label="Cycles" value={props.lineage.cycles_detected ? 'Detected' : 'None'} />
+            <Metric label="Evidence" value={String(props.lineage.evidence_ids.length)} />
+          </div>
+        ) : null}
+      </section>
+      <section className="graphCard">
+        <LineageGraph lineage={props.lineage} onSelect={props.onSelect} />
+      </section>
+      <aside className="detailsDrawer">
+        <span className="eyebrow">Node details</span>
+        <h2>{props.objectDetail?.id ?? 'No node selected'}</h2>
+        {props.objectDetail ? (
+          <>
+            <p>{props.objectDetail.name || props.objectDetail.label || 'No description'}</p>
+            <div className="detailRows">
+              <span>Type</span><strong>{props.objectDetail.type}</strong>
+              <span>Incoming</span><strong>{props.objectDetail.incoming_count}</strong>
+              <span>Outgoing</span><strong>{props.objectDetail.outgoing_count}</strong>
+              <span>Evidence</span><strong>{props.objectDetail.evidence_ids.length}</strong>
+            </div>
+            <button className="secondaryButton wide" onClick={() => props.onExpand(props.objectDetail!.id)}>
+              Expand from node
+            </button>
+          </>
+        ) : <p>카탈로그에서 객체를 선택하세요.</p>}
+      </aside>
     </div>
   );
 }
 
-function LivePanel({
-  form,
-  update,
-}: {
-  form: FormState;
-  update: <K extends keyof FormState>(key: K, value: FormState[K]) => void;
+function ImpactTab(props: {
+  selectedObject: CatalogObject | null;
+  changeType: ChangeType;
+  setChangeType: (value: ChangeType) => void;
+  fieldName: string;
+  setFieldName: (value: string) => void;
+  description: string;
+  setDescription: (value: string) => void;
+  impactDepth: number;
+  setImpactDepth: (value: number) => void;
+  onRun: () => void;
+  impact: ImpactScenarioResponse | null;
+  busy: boolean;
 }) {
   return (
-    <div className="settingsStack">
-      <div className={form.liveConfirm ? 'confirmCard confirmed' : 'confirmCard'}>
-        <Checkbox
-          checked={form.liveConfirm}
-          label="I confirm this is a read-only live SAP BW metadata call"
-          onChange={(value) => update('liveConfirm', value)}
-        />
-        <p>Runtime Settings의 BW 계정을 사용하며 metadata GET/read-only flow만 실행합니다.</p>
-      </div>
-
-      <div className="modeGrid" role="list" aria-label="Live mode selector">
-        {(Object.keys(liveModeDetails) as LiveMode[]).map((mode) => (
-          <button
-            className={form.liveMode === mode ? 'modeCard active' : 'modeCard'}
-            key={mode}
-            onClick={() => update('liveMode', mode)}
-            type="button"
-          >
-            <span>{liveModeDetails[mode].endpoint}</span>
-            <strong>{liveModeDetails[mode].title}</strong>
-            <small>{liveModeDetails[mode].body}</small>
-          </button>
-        ))}
-      </div>
-
-      <section className="formSection">
-        <div className="sectionHeading">
-          <h3>Object search</h3>
-          <span>supports smoke, xref, collect and dataflow inputs</span>
-        </div>
-        <Field
-          hint="Wildcard search term for smoke/collect. Example: Z*"
-          label="Search term"
-          onChange={(v) => update('liveSearchTerm', v)}
-          value={form.liveSearchTerm}
-        />
-        <Field
-          hint={form.liveMode === 'dataflow' ? 'Required for live dataflow rendering.' : 'Optional exact object name.'}
-          label="Object name"
-          onChange={(v) => update('liveObjectName', v)}
-          placeholder="e.g. ZSALES_ADSO"
-          value={form.liveObjectName}
-        />
-        <div className="twoColumn">
-          <Field label="Object type" onChange={(v) => update('liveObjectType', v)} value={form.liveObjectType} />
-          <Field
-            hint="For RSDS-style source-specific dataflows."
-            label="Source system"
-            onChange={(v) => update('liveSourceSystem', v)}
-            placeholder="optional"
-            value={form.liveSourceSystem}
-          />
-        </div>
+    <div className="impactLayout">
+      <section className="controlCard">
+        <span className="eyebrow">Scenario form</span>
+        <h1>Impact / 변경 영향</h1>
+        <div className="scenarioObject">Selected: <strong>{props.selectedObject?.id ?? 'none'}</strong></div>
+        <label>Change type
+          <select value={props.changeType} onChange={(event) => props.setChangeType(event.target.value as ChangeType)}>
+            {changeTypes.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>Field / 필드
+          <input value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)} />
+        </label>
+        <label>Description / 설명
+          <textarea value={props.description} onChange={(event) => props.setDescription(event.target.value)} rows={4} />
+        </label>
+        <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy}>
+          Run deterministic impact
+        </button>
       </section>
+      <section className="resultCard">
+        <span className="eyebrow">Affected objects</span>
+        {props.impact ? (
+          <div className="severityList">
+            {props.impact.affected_objects.map((item) => (
+              <article key={item.object_id} className={`severityItem ${item.severity.toLowerCase()}`}>
+                <div>
+                  <strong>{item.object_id}</strong>
+                  <span>{item.object_type} · {item.confidence}</span>
+                </div>
+                <b>{item.severity}</b>
+                <p>{item.reason}</p>
+                <small>Evidence IDs: {item.evidence_ids.join(', ') || '—'}</small>
+              </article>
+            ))}
+            {props.impact.affected_objects.length === 0 ? <div className="emptyState">No downstream impacts.</div> : null}
+          </div>
+        ) : <div className="emptyState">Run a scenario. No changes_path required.</div>}
+      </section>
+    </div>
+  );
+}
 
-      <section className="formSection compactSection">
-        <div className="sectionHeading">
-          <h3>Dataflow controls</h3>
-          <span>direction and traversal limit</span>
-        </div>
-        <div className="twoColumn">
-          <SelectField
-            label="Direction"
-            onChange={(value) => update('liveDataflowDirection', value as FormState['liveDataflowDirection'])}
-            options={[
-              { value: 'downwards', label: 'downwards' },
-              { value: 'upwards', label: 'upwards' },
-              { value: 'both', label: 'both' },
-            ]}
-            value={form.liveDataflowDirection}
-          />
-          <Field
-            inputMode="numeric"
-            label="Levels"
-            onChange={(v) => update('liveDataflowLevels', v)}
-            value={form.liveDataflowLevels}
-          />
-        </div>
-        {form.liveMode === 'collect' ? (
-          <Field label="Output directory" onChange={(v) => update('liveOutDir', v)} value={form.liveOutDir} />
+function SqlTab(props: {
+  runtime: RuntimeConfigResponse | null;
+  viewId: string;
+  setViewId: (value: string) => void;
+  sqlFile: string;
+  setSqlFile: (value: string) => void;
+  question: string;
+  setQuestion: (value: string) => void;
+  explain: SqlExplainResponse | null;
+  draft: SqlDraftResponse | null;
+  onExplain: () => void;
+  onDraft: () => void;
+  busy: string;
+}) {
+  return (
+    <div className="sqlLayout">
+      <section className="controlCard">
+        <span className="eyebrow">SQL Assistant</span>
+        <h1>Native SQL View</h1>
+        <p className="warningText">Advisory only · execution_disabled=true · SQL은 실행하지 않습니다.</p>
+        <label>View ID
+          <input value={props.viewId} onChange={(event) => props.setViewId(event.target.value)} />
+        </label>
+        <label>SQL file
+          <input value={props.sqlFile} onChange={(event) => props.setSqlFile(event.target.value)} />
+        </label>
+        <button className="secondaryButton wide" onClick={props.onExplain} disabled={props.busy === 'sql-explain'}>
+          Explain deterministic view
+        </button>
+        <label>NL-to-SQL advisory prompt
+          <textarea value={props.question} onChange={(event) => props.setQuestion(event.target.value)} rows={4} />
+        </label>
+        <button className="primaryButton wide" onClick={props.onDraft} disabled={props.busy === 'sql-draft'}>
+          Draft advisory SQL
+        </button>
+        <p className="mutedSmall">
+          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : 'disabled until local endpoint configured'}
+        </p>
+      </section>
+      <section className="resultCard">
+        <span className="eyebrow">Citations / 실행 차단</span>
+        {props.explain ? (
+          <div className="sqlEvidence">
+            <h2>{props.explain.result.view.id}</h2>
+            <p>{props.explain.execution_disabled_warning}</p>
+            <div className="metaGrid">
+              <Metric label="Parser" value={props.explain.result.parser} />
+              <Metric label="Refs" value={String(props.explain.result.reference_edges.length)} />
+              <Metric label="Citations" value={String(props.explain.citations.length)} />
+            </div>
+            <pre>{JSON.stringify(props.explain.result.reference_edges, null, 2)}</pre>
+          </div>
+        ) : <div className="emptyState">Explain a local SQL file to see cited evidence.</div>}
+        {props.draft ? (
+          <div className="draftBox">
+            <h3>Draft status: {props.draft.status}</h3>
+            <pre>{props.draft.draft_sql || props.draft.message}</pre>
+            <small>Citations: {props.draft.citations.join(', ') || 'none'}</small>
+          </div>
         ) : null}
       </section>
     </div>
   );
 }
 
-function LocalAnalysisPanel({
-  form,
-  tool,
-  update,
-}: {
-  form: FormState;
-  tool: AnalysisTool;
-  update: <K extends keyof FormState>(key: K, value: FormState[K]) => void;
-}) {
-  if (tool === 'lineage') {
-    return (
-      <div className="settingsStack">
-        <section className="formSection">
-          <div className="sectionHeading">
-            <h3>Graph traversal</h3>
-            <span>local snapshot evidence</span>
-          </div>
-          <Field label="Graph JSON path" onChange={(v) => update('graphPath', v)} value={form.graphPath} />
-          <Field label="Start object id" onChange={(v) => update('objectId', v)} value={form.objectId} />
-          <div className="twoColumn">
-            <SelectField
-              label="Direction"
-              onChange={(value) => update('lineageDirection', value as FormState['lineageDirection'])}
-              options={[
-                { value: 'downstream', label: 'downstream' },
-                { value: 'upstream', label: 'upstream' },
-                { value: 'both', label: 'both' },
-              ]}
-              value={form.lineageDirection}
-            />
-            <Field
-              inputMode="numeric"
-              label="Max depth"
-              onChange={(v) => update('lineageMaxDepth', v)}
-              value={form.lineageMaxDepth}
-            />
-          </div>
-        </section>
-      </div>
-    );
+function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: string) => void }) {
+  if (!props.lineage) {
+    return <div className="emptyState graphEmpty">Run lineage to render a bounded graph.</div>;
   }
-
-  if (tool === 'impact') {
-    return (
-      <div className="settingsStack">
-        <section className="formSection">
-          <div className="sectionHeading">
-            <h3>Change-impact review</h3>
-            <span>risk and affected-object evidence</span>
-          </div>
-          <Field label="Graph JSON path" onChange={(v) => update('graphPath', v)} value={form.graphPath} />
-          <Field label="Changes JSON path" onChange={(v) => update('changesPath', v)} value={form.changesPath} />
-          <Field
-            inputMode="numeric"
-            label="Max depth"
-            onChange={(v) => update('impactMaxDepth', v)}
-            value={form.impactMaxDepth}
-          />
-        </section>
-      </div>
-    );
-  }
-
-  if (tool === 'sql-view') {
-    return (
-      <div className="settingsStack">
-        <section className="formSection">
-          <div className="sectionHeading">
-            <h3>Native SQL evidence</h3>
-            <span>local SQL text parsing only</span>
-          </div>
-          <Field label="Native SQL View id" onChange={(v) => update('viewId', v)} value={form.viewId} />
-          <Field label="SQL file path" onChange={(v) => update('sqlFile', v)} value={form.sqlFile} />
-        </section>
-      </div>
-    );
-  }
-
+  const positions = layoutPositions(props.lineage);
+  const width = Math.max(720, (Math.max(...Object.values(props.lineage.levels)) + 1) * 210);
+  const height = Math.max(420, props.lineage.nodes.length * 74);
   return (
-    <div className="settingsStack">
-      <section className="formSection">
-        <div className="sectionHeading">
-          <h3>Transformation field mapping</h3>
-          <span>source-to-target mapping evidence</span>
-        </div>
-        <Field label="Transformation XML path" onChange={(v) => update('xmlFile', v)} value={form.xmlFile} />
-        <Field label="Transformation id" onChange={(v) => update('transformationId', v)} value={form.transformationId} />
-        <div className="twoColumn">
-          <Field label="Source object" onChange={(v) => update('sourceObject', v)} value={form.sourceObject} />
-          <Field label="Target object" onChange={(v) => update('targetObject', v)} value={form.targetObject} />
-        </div>
-      </section>
-    </div>
+    <svg className="lineageSvg" viewBox={`0 0 ${width} ${height}`} role="img">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" />
+        </marker>
+      </defs>
+      {props.lineage.edges.map((edge) => {
+        const source = positions[edge.source];
+        const target = positions[edge.target];
+        if (!source || !target) return null;
+        return (
+          <g key={edge.id}>
+            <line x1={source.x + 72} y1={source.y} x2={target.x - 72} y2={target.y} className="edgeLine" markerEnd="url(#arrow)" />
+            <text x={(source.x + target.x) / 2} y={(source.y + target.y) / 2 - 8} className="edgeLabel">{edge.type}</text>
+          </g>
+        );
+      })}
+      {props.lineage.nodes.map((node) => {
+        const point = positions[node.id];
+        return (
+          <g key={node.id} transform={`translate(${point.x - 70}, ${point.y - 28})`} onClick={() => props.onSelect(node.id)} className="nodeGroup">
+            <rect width="140" height="56" rx="12" />
+            <text x="12" y="22" className="nodeId">{node.id}</text>
+            <text x="12" y="40" className="nodeType">{node.type}</text>
+          </g>
+        );
+      })}
+    </svg>
   );
 }
 
-function ResultViewer({
-  activeTool,
-  busy,
-  copyStatus,
-  error,
-  meta,
-  onCopy,
-  onDownload,
-  result,
-  toolMeta,
-}: {
-  activeTool: Tool;
-  busy: boolean;
-  copyStatus: string;
-  error: string;
-  meta: ResultMeta | null;
-  onCopy: () => void;
-  onDownload: () => void;
-  result: string;
-  toolMeta: ToolMeta;
-}) {
-  const visibleResult = !busy && !error ? result : '';
-  const visibleMeta = !busy && !error ? meta : null;
-  const lineCount = visibleResult ? visibleResult.split('\n').length : 0;
-  const isMermaid = (visibleMeta?.format ?? '') === 'mermaid';
-  return (
-    <section className="workbenchPanel resultPanel" aria-label="Result viewer">
-      <PanelTitle
-        kicker="Evidence viewer"
-        rightSlot={
-          <div className="resultActions">
-            <button className="secondaryButton compact" disabled={!visibleResult} onClick={onCopy} type="button">
-              {copyStatus || 'Copy'}
-            </button>
-            <button className="secondaryButton compact" disabled={!visibleResult} onClick={onDownload} type="button">
-              Download
-            </button>
-          </div>
-        }
-        title={toolMeta.outputLabel}
-      />
-
-      <div className="resultMetaBar">
-        <span className={`formatBadge ${visibleMeta?.format ?? 'idle'}`}>{visibleMeta?.format ?? 'idle'}</span>
-        <span>{visibleMeta?.endpoint ?? toolMeta.endpoint}</span>
-        <span>{visibleMeta ? formatTimestamp(visibleMeta.timestamp) : 'not run yet'}</span>
-        {visibleResult ? <span>{lineCount} lines</span> : null}
-      </div>
-
-      {busy ? (
-        <div className="resultState loadingState">
-          <span className="spinner" />
-          <strong>Running {toolCatalog[activeTool].label}</strong>
-          <p>요청을 실행하고 evidence payload를 기다리는 중입니다.</p>
-        </div>
-      ) : error ? (
-        <div className="resultState errorState" role="alert">
-          <strong>Execution failed</strong>
-          <p>{error}</p>
-        </div>
-      ) : visibleResult ? (
-        <>
-          <div className="executionSummary">
-            <span>{visibleMeta?.mode ?? toolMeta.label}</span>
-            <strong>{visibleMeta?.summary ?? 'Result ready'}</strong>
-          </div>
-          {isMermaid ? (
-            <div className="mermaidNotice">
-              <span>Mermaid source preview</span>
-              <p>Plain React/CSS mode keeps dependencies light. Copy or download this source into Mermaid-compatible review docs.</p>
-            </div>
-          ) : null}
-          <pre className={isMermaid ? 'resultPre mermaidSource' : 'resultPre'}>{visibleResult}</pre>
-        </>
-      ) : (
-        <EmptyResult hint={toolMeta.emptyHint} meta={toolMeta} />
-      )}
-    </section>
-  );
+function layoutPositions(lineage: LineageResponse): Record<string, { x: number; y: number }> {
+  const byLevel = new Map<number, string[]>();
+  Object.entries(lineage.levels).forEach(([id, level]) => {
+    byLevel.set(level, [...(byLevel.get(level) ?? []), id]);
+  });
+  const positions: Record<string, { x: number; y: number }> = {};
+  byLevel.forEach((ids, level) => {
+    ids.sort().forEach((id, index) => {
+      positions[id] = { x: 110 + level * 210, y: 90 + index * 86 };
+    });
+  });
+  return positions;
 }
 
-function EmptyResult({ hint, meta }: { hint: string; meta: ToolMeta }) {
+function NumberField(props: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) {
   return (
-    <div className="resultState emptyState">
-      <span className="emptyIcon">◇</span>
-      <strong>No output yet</strong>
-      <p>{hint}</p>
-      <div className="emptyChecklist">
-        <span>1. Confirm inputs</span>
-        <span>2. Run {meta.shortLabel}</span>
-        <span>3. Copy/download evidence</span>
-      </div>
-    </div>
-  );
-}
-
-function WorkflowSupport({ meta, tool }: { meta: ToolMeta; tool: Tool }) {
-  const checklist = checklistForTool(tool);
-  return (
-    <section className="supportGrid" aria-label="Workflow support panels">
-      {meta.helperCards.map((card) => (
-        <article className={`helperCard ${card.tone ?? 'neutral'}`} key={`${card.tag}-${card.title}`}>
-          <span>{card.tag}</span>
-          <h3>{card.title}</h3>
-          <p>{card.body}</p>
-        </article>
-      ))}
-      <article className="helperCard evidenceCard">
-        <span>Execution summary</span>
-        <h3>{meta.label} checklist</h3>
-        <ol>
-          {checklist.map((item) => (
-            <li key={item}>{item}</li>
-          ))}
-        </ol>
-      </article>
-    </section>
-  );
-}
-
-function FormatSelect({
-  format,
-  onChange,
-  options,
-}: {
-  format: OutputFormat;
-  onChange: (format: OutputFormat) => void;
-  options: OutputFormat[];
-}) {
-  return (
-    <label className="formatSelect">
-      <span>Output</span>
-      <select value={format} onChange={(event) => onChange(event.target.value as OutputFormat)}>
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {formatLabel(option)}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
-function Field({
-  autoComplete,
-  hint,
-  inputMode,
-  inputType = 'text',
-  label,
-  onChange,
-  placeholder,
-  value,
-}: {
-  autoComplete?: string;
-  hint?: string;
-  inputMode?: 'text' | 'numeric' | 'decimal' | 'search' | 'email' | 'tel' | 'url';
-  inputType?: 'text' | 'password';
-  label: string;
-  onChange: (value: string) => void;
-  placeholder?: string;
-  value: string;
-}) {
-  return (
-    <label className="field">
-      <span>{label}</span>
+    <label>{props.label}
       <input
-        autoComplete={autoComplete}
-        inputMode={inputMode}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={placeholder}
-        type={inputType}
-        value={value}
+        type="number"
+        min={props.min}
+        max={props.max}
+        value={props.value}
+        onChange={(event) => props.onChange(Number(event.target.value))}
       />
-      {hint ? <small>{hint}</small> : null}
     </label>
   );
 }
 
-function SelectField({
-  hint,
-  label,
-  onChange,
-  options,
-  value,
-}: {
-  hint?: string;
-  label: string;
-  onChange: (value: string) => void;
-  options: Array<{ value: string; label: string }>;
-  value: string;
-}) {
-  return (
-    <label className="field">
-      <span>{label}</span>
-      <select value={value} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-      {hint ? <small>{hint}</small> : null}
-    </label>
-  );
+function Metric(props: { label: string; value: string }) {
+  return <div className="metric"><span>{props.label}</span><strong>{props.value}</strong></div>;
 }
 
-function Checkbox({
-  checked,
-  label,
-  onChange,
-}: {
-  checked: boolean;
-  label: string;
-  onChange: (value: boolean) => void;
-}) {
-  return (
-    <label className="checkboxRow">
-      <input checked={checked} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
-      <span>{label}</span>
-    </label>
-  );
+function StatusPill(props: { label: string; value: string; tone: 'ok' | 'warn' | 'info' | 'neutral' }) {
+  return <span className={`statusPill ${props.tone}`}><small>{props.label}</small><strong>{props.value}</strong></span>;
 }
 
-function StatusPill({ label, tone, value }: { label: string; tone: Tone; value: string }) {
-  return (
-    <span className={`statusPill ${tone}`}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </span>
-  );
+function TabButton(props: { id: AppTab; active: AppTab; label: string; onClick: (tab: AppTab) => void }) {
+  return <button className={props.id === props.active ? 'tabButton active' : 'tabButton'} onClick={() => props.onClick(props.id)}>{props.label}</button>;
 }
 
-function SummaryTile({ label, tone, value }: { label: string; tone: Tone; value: string }) {
-  return (
-    <div className={`summaryTile ${tone}`}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+function bwStatus(runtime: RuntimeConfigResponse | null): string {
+  if (!runtime) return 'checking';
+  if (!runtime.bw.configured) return 'unset';
+  if (runtime.bw.source === 'env') return 'configured from .env';
+  return 'configured in UI';
 }
 
-function endpointForTool(tool: Tool, liveMode: LiveMode): string {
-  if (tool === 'live') return liveModeDetails[liveMode].endpoint;
-  return toolCatalog[tool].endpoint;
+function llmStatus(runtime: RuntimeConfigResponse | null): string {
+  if (!runtime) return 'checking';
+  if (!runtime.llm.enabled || !runtime.llm.configured) return 'disabled';
+  if (runtime.llm.source === 'env') return `configured from .env (${runtime.llm.model ?? 'model set'})`;
+  return `configured in UI (${runtime.llm.model ?? 'model set'})`;
 }
 
-function formatOptionsFor(tool: Tool, liveMode: LiveMode): OutputFormat[] {
-  if (tool === 'settings') return [];
-  if (tool === 'live') return liveMode === 'dataflow' ? ['mermaid', 'md', 'json'] : [];
-  if (tool === 'lineage') return ['md', 'json', 'mermaid'];
-  return ['md', 'json'];
+function compactDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
-function buildRequest(tool: AnalysisTool, form: FormState): unknown {
-  if (tool === 'lineage') {
-    return {
-      graph_path: form.graphPath,
-      object_id: form.objectId,
-      direction: form.lineageDirection,
-      max_depth: clampNumber(form.lineageMaxDepth, 3),
-      format: form.format,
-    };
-  }
-  if (tool === 'impact') {
-    return {
-      graph_path: form.graphPath,
-      changes_path: form.changesPath,
-      max_depth: clampNumber(form.impactMaxDepth, 3),
-      format: form.format === 'mermaid' ? 'md' : form.format,
-    };
-  }
-  if (tool === 'sql-view') {
-    return {
-      view_id: form.viewId,
-      sql_file: form.sqlFile,
-      format: form.format === 'mermaid' ? 'md' : form.format,
-    };
-  }
-  return {
-    xml_file: form.xmlFile,
-    transformation_id: form.transformationId,
-    source_object: form.sourceObject,
-    target_object: form.targetObject,
-    format: form.format === 'mermaid' ? 'md' : form.format,
-  };
-}
-
-function getRunDisabledReason(
-  tool: Tool,
-  form: FormState,
-  busy: boolean,
-  runtimeConfig: RuntimeConfigResponse | null,
-): string {
-  if (busy) return 'Execution in progress.';
-  if (tool !== 'live') return '';
-  if (!runtimeConfig) return 'Runtime status loading.';
-  if (!runtimeConfig.bw.configured) return 'Runtime Settings에서 BW runtime을 먼저 저장하세요.';
-  if (!form.liveConfirm) return 'Live BW 실행 전 read-only confirmation을 체크하세요.';
-  if (form.liveMode === 'dataflow' && !form.liveObjectName.trim()) {
-    return 'Dataflow rendering requires an object name.';
-  }
-  return '';
-}
-
-function readinessForTool(
-  tool: Tool,
-  runtimeConfig: RuntimeConfigResponse | null,
-  health: HealthResponse | null,
-  form: FormState,
-): { label: string; tone: Tone } {
-  if (tool === 'settings') {
-    return runtimeConfig ? { label: 'synced', tone: 'ok' } : { label: 'syncing', tone: 'neutral' };
-  }
-  if (health && health.status !== 'ok') return { label: 'backend', tone: 'warning' };
-  if (tool === 'live') {
-    if (!runtimeConfig?.bw.configured) return { label: 'needs BW', tone: 'warning' };
-    if (!form.liveConfirm) return { label: 'confirm', tone: 'warning' };
-    return { label: 'ready', tone: 'ok' };
-  }
-  return { label: 'ready', tone: 'ok' };
-}
-
-function buildQuickStats(
-  health: HealthResponse | null,
-  runtimeConfig: RuntimeConfigResponse | null,
-): Array<{ label: string; value: string; tone: Tone; detail: string }> {
-  return [
-    {
-      label: 'Backend',
-      value: health?.status ?? 'checking',
-      tone: health ? (health.status === 'ok' ? 'ok' : 'warning') : 'neutral',
-      detail: health?.version ? `v${health.version}` : 'waiting for /api/health',
-    },
-    {
-      label: 'BW runtime',
-      value: runtimeConfig?.bw.configured ? 'configured' : 'not set',
-      tone: runtimeConfig?.bw.configured ? 'ok' : 'neutral',
-      detail: runtimeConfig?.bw.client ? `client ${runtimeConfig.bw.client}` : 'process-memory config',
-    },
-    {
-      label: 'Safety',
-      value: health ? (health.read_only === false || health.local_only === false ? 'check' : 'read-only') : 'checking',
-      tone: health ? (health.read_only === false || health.local_only === false ? 'danger' : 'ok') : 'neutral',
-      detail: health ? (health.local_only === false ? 'remote mode reported' : 'local-only API') : 'waiting for /api/health',
-    },
-    {
-      label: 'LLM',
-      value: runtimeConfig?.llm.configured ? 'ready' : 'off',
-      tone: runtimeConfig?.llm.configured ? 'accent' : 'neutral',
-      detail: runtimeConfig?.llm.model ?? 'optional explainer',
-    },
-  ];
-}
-
-function summarizeResult(content: string, format: string, fallback: string): string {
-  if (!content.trim()) return fallback;
-  if (format === 'json') {
-    try {
-      const parsed = JSON.parse(content) as unknown;
-      if (isRecord(parsed)) {
-        if (Array.isArray(parsed.operations)) {
-          const okCount = parsed.operations.filter((item) => isRecord(item) && item.ok === true).length;
-          return `${parsed.operations.length} smoke operations · ${okCount} ok`;
-        }
-        if (typeof parsed.manifest_path === 'string') return `Manifest written: ${parsed.manifest_path}`;
-        if (typeof parsed.node_count === 'number' && typeof parsed.edge_count === 'number') {
-          return `${parsed.node_count} nodes · ${parsed.edge_count} edges`;
-        }
-        if (Array.isArray(parsed.nodes) && Array.isArray(parsed.edges)) {
-          return `${parsed.nodes.length} nodes · ${parsed.edges.length} edges`;
-        }
-      }
-    } catch {
-      return fallback;
-    }
-  }
-  if (format === 'mermaid') {
-    const edges = content.split('\n').filter((line) => line.includes('-->')).length;
-    return `Mermaid graph source · ${edges} edges`;
-  }
-  const firstHeading = content
-    .split('\n')
-    .map((line) => line.trim())
-    .find((line) => line.startsWith('#'));
-  return firstHeading ? firstHeading.replace(/^#+\s*/, '') : fallback;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-function formatLabel(format: OutputFormat): string {
-  if (format === 'md') return 'Markdown';
-  if (format === 'json') return 'JSON';
-  return 'Mermaid';
-}
-
-function formatTimestamp(value: string): string {
-  return new Intl.DateTimeFormat(undefined, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).format(new Date(value));
-}
-
-function placeholderForTool(tool: Tool): string {
-  if (tool === 'settings') return 'Paste a BW URL to stage it in Runtime Settings';
-  if (tool === 'live') return 'Search Z* or set exact object name';
-  if (tool === 'lineage') return 'Jump to object id, e.g. SRC';
-  if (tool === 'impact') return 'Set changes JSON path';
-  if (tool === 'sql-view') return 'Set Native SQL View id';
-  return 'Set transformation id';
-}
-
-function checklistForTool(tool: Tool): string[] {
-  if (tool === 'settings') {
-    return ['Enter only runtime values needed for this process.', 'Save clears secret fields from the browser form.', 'Use Clear to remove backend process-memory state.'];
-  }
-  if (tool === 'live') {
-    return ['Confirm read-only safety before every live run.', 'Use Smoke for connection health before Collect or Dataflow.', 'Copy or download the response for review evidence.'];
-  }
-  if (tool === 'lineage') {
-    return ['Select graph path, object id, direction, and depth.', 'Use Mermaid for graph-source review or Markdown for handoff.', 'Keep fixture runs as a baseline before live snapshots.'];
-  }
-  if (tool === 'impact') {
-    return ['Pair graph snapshot with changes JSON.', 'Review risk summary and affected object paths.', 'Export Markdown for release review packets.'];
-  }
-  if (tool === 'sql-view') {
-    return ['Set SQL view id and local SQL file.', 'Parse without database execution.', 'Attach Markdown/JSON evidence to lineage review.'];
-  }
-  return ['Select transformation XML and source/target objects.', 'Render field mapping evidence.', 'Use output with lineage and impact reports.'];
-}
-
-function extensionForFormat(format: string): string {
-  if (format === 'json') return 'json';
-  if (format === 'mermaid') return 'mmd';
-  if (format === 'status') return 'txt';
-  return 'md';
-}
-
-function mimeForFormat(format: string): string {
-  if (format === 'json') return 'application/json;charset=utf-8';
-  if (format === 'mermaid' || format === 'md') return 'text/markdown;charset=utf-8';
-  return 'text/plain;charset=utf-8';
-}
-
-function clampNumber(value: string, fallback: number): number {
-  const trimmed = value.trim();
-  if (!trimmed) return fallback;
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0, Math.min(20, Math.trunc(parsed)));
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

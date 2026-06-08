@@ -69,8 +69,8 @@ class SnapshotReader:
         return SnapshotManifest.model_validate(raw)
 
     def read_payload(self, metadata: PayloadMetadata) -> Any:
-        _ensure_relative(metadata.relative_path)
-        return json.loads((self.out_dir / metadata.relative_path).read_text(encoding="utf-8"))
+        payload_path = _resolve_snapshot_relative_path(self.out_dir, metadata.relative_path)
+        return json.loads(payload_path.read_text(encoding="utf-8"))
 
 
 def write_fixture_snapshot(fixture_path: Path, out_dir: Path) -> SnapshotManifest:
@@ -93,6 +93,17 @@ def write_fixture_snapshot(fixture_path: Path, out_dir: Path) -> SnapshotManifes
 def _safe_payload_id(value: str) -> str:
     safe = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value)
     return safe or "payload"
+
+
+def _resolve_snapshot_relative_path(out_dir: Path, relative_path: str) -> Path:
+    _ensure_relative(relative_path)
+    base = out_dir.resolve()
+    resolved = (base / relative_path).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"unsafe snapshot relative path: {relative_path}") from exc
+    return resolved
 
 
 def _ensure_relative(relative_path: str) -> None:

@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict
 
@@ -174,7 +175,10 @@ def collect_live_snapshot(
                     writer.write_payload(
                         payload_id=f"xref-{index}-{_safe_fragment(object_name)}-{xref_direction}",
                         kind="bw_xref",
-                        source=f"bw://bw_xref/{xref_direction}",
+                        source=(
+                            f"bw://bw_xref/{xref_direction}?"
+                            f"objectName={quote(object_name, safe='')}"
+                        ),
                         payload=client.fetch_xref(object_name, direction=xref_direction),
                     )
                 )

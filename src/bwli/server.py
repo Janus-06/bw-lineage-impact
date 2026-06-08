@@ -1,30 +1,36 @@
 from __future__ import annotations
 
+import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from importlib import import_module
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from bwli import __version__
 from bwli.client import BwClient
-from bwli.config import ConfigError, validate_local_llm_base_url
+from bwli.config import ConfigError, LlmRuntimeConfig, validate_local_llm_base_url
 from bwli.dataflow import DataflowOutputFormat, render_dataflow
 from bwli.endpoints import DataflowDirection
 from bwli.field_lineage import (
+    SqlParseResult,
     load_text,
     parse_native_sql_view,
     parse_transformation_mapping_xml,
     render_field_lineage,
     render_sql_view_evidence,
 )
-from bwli.graph import Direction
+from bwli.graph import BwGraph, Direction
 from bwli.impact import (
+    ChangeEvent,
+    ChangeSet,
+    ChangeType,
     diff_graphs,
     load_changes,
     render_impact_report,
@@ -39,10 +45,23 @@ from bwli.live import (
     collect_live_snapshot,
     run_live_smoke,
 )
+from bwli.store import (
+    CatalogEdgeRecord,
+    CatalogObjectRecord,
+    CatalogSnapshotRecord,
+    CatalogStore,
+    catalog_path_for,
+    ingest_fixture_payload,
+    ingest_manifest,
+)
+from bwli.store.catalog import EdgeInput, ObjectInput
+from bwli.store.secret_guard import SecretPersistenceError, assert_no_persisted_secrets
+from bwli.traversal import BoundedLineageResult, bounded_lineage
 
 LineageFormat = Literal["json", "mermaid", "md"]
 ImpactFormat = Literal["json", "md"]
 EvidenceFormat = Literal["json", "md"]
+RuntimeConfigSource = Literal["env", "ui", "unset"]
 
 
 class HealthResponse(BaseModel):
@@ -68,6 +87,7 @@ class RuntimeBwConfigRequest(BaseModel):
     language: str = "EN"
     verify_ssl: bool = True
     ca_bundle: str | None = None
+    trust_env: bool = True
 
 
 class RuntimeLlmConfigRequest(BaseModel):
@@ -89,6 +109,7 @@ class RuntimeConfigRequest(BaseModel):
 class RuntimeBwConfigState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    source: RuntimeConfigSource = "unset"
     configured: bool = False
     url: str | None = None
     user: str | None = None
@@ -97,11 +118,13 @@ class RuntimeBwConfigState(BaseModel):
     language: str = "EN"
     verify_ssl: bool = True
     ca_bundle: str | None = None
+    trust_env: bool = True
 
 
 class RuntimeLlmConfigState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    source: RuntimeConfigSource = "unset"
     enabled: bool = False
     configured: bool = False
     base_url: str | None = None
@@ -138,6 +161,31 @@ class RuntimeConfigState(BaseModel):
             ),
         )
 
+    def redacted_v1(self) -> V1RuntimeConfigResponse:
+        return V1RuntimeConfigResponse(
+            storage=self.storage,
+            bw=V1RuntimeBwConfigPublic(
+                source=self.bw.source,
+                configured=self.bw.configured,
+                url=self.bw.url,
+                user=self.bw.user,
+                password="[REDACTED]" if self.bw.configured else None,
+                client=self.bw.client,
+                language=self.bw.language,
+                verify_ssl=self.bw.verify_ssl,
+                ca_bundle=self.bw.ca_bundle,
+                trust_env=self.bw.trust_env,
+            ),
+            llm=V1RuntimeLlmConfigPublic(
+                source=self.llm.source,
+                enabled=self.llm.enabled,
+                configured=self.llm.configured,
+                base_url=self.llm.base_url,
+                model=self.llm.model,
+                api_key="[REDACTED]" if self.llm.configured else None,
+            ),
+        )
+
 
 class RuntimeBwConfigPublic(BaseModel):
     configured: bool
@@ -162,6 +210,21 @@ class RuntimeConfigResponse(BaseModel):
     storage: str
     bw: RuntimeBwConfigPublic
     llm: RuntimeLlmConfigPublic
+
+
+class V1RuntimeBwConfigPublic(RuntimeBwConfigPublic):
+    source: RuntimeConfigSource = "unset"
+    trust_env: bool = True
+
+
+class V1RuntimeLlmConfigPublic(RuntimeLlmConfigPublic):
+    source: RuntimeConfigSource = "unset"
+
+
+class V1RuntimeConfigResponse(BaseModel):
+    storage: str
+    bw: V1RuntimeBwConfigPublic
+    llm: V1RuntimeLlmConfigPublic
 
 
 class LineageRequest(BaseModel):
@@ -249,7 +312,102 @@ class LiveDataflowRequest(BaseModel):
     format: DataflowOutputFormat = "mermaid"
 
 
+class V1ConnectionTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_read_only: bool = False
+    search_term: str = "*"
+
+
+class V1SnapshotCaptureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_read_only: bool = False
+    fixture_path: str | None = None
+    manifest_path: str | None = None
+    search_terms: list[str] = Field(default_factory=list)
+    object_names: list[str] = Field(default_factory=list)
+    include_dataflow: bool = True
+    include_xref: bool = True
+    xref_direction: Literal["upstream", "downstream"] = "downstream"
+    object_type: str = "ADSO"
+    source_system: str | None = None
+    dataflow_direction: DataflowDirection = "downwards"
+    dataflow_levels: int = Field(default=3, ge=0, le=20)
+
+
+class V1SnapshotListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshots: list[dict[str, object]]
+
+
+class V1ObjectListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[dict[str, object]]
+    next_cursor: str | None = None
+    limit: int
+
+
+class V1LineageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object_id: str
+    direction: Direction = Direction.DOWNSTREAM
+    depth: int = Field(default=1, ge=0, le=20)
+    node_cap: int = Field(default=25, ge=1, le=500)
+    edge_cap: int = Field(default=60, ge=0, le=1000)
+
+
+class V1LineageExpandRequest(V1LineageRequest):
+    expand_object_id: str | None = None
+
+
+class V1ImpactScenarioRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object_id: str
+    change_type: ChangeType
+    field: str | None = None
+    value_description: str | None = None
+    description: str | None = None
+    depth: int = Field(default=3, ge=0, le=20)
+    node_cap: int = Field(default=25, ge=1, le=500)
+    edge_cap: int = Field(default=60, ge=0, le=1000)
+
+
+class V1SqlExplainRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    view_id: str
+    sql_file: str | None = None
+    sql_text: str | None = None
+    format: EvidenceFormat = "json"
+
+
+class V1SqlDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    target_dialect: str = "sap-hana-sql"
+    view_id: str | None = None
+    sql_file: str | None = None
+    sql_text: str | None = None
+
+
 BwClientFactory = Callable[[RuntimeBwConfigState], BwReadClient]
+
+
+class SqlDraftFactory(Protocol):
+    def __call__(
+        self,
+        result: SqlParseResult,
+        *,
+        question: str,
+        target_dialect: str,
+        runtime: LlmRuntimeConfig,
+    ) -> dict[str, object]: ...
 
 
 def create_app(
@@ -266,7 +424,8 @@ def create_app(
         version=__version__,
         summary="Local-first read-only BW lineage and change-impact analyzer API.",
     )
-    runtime_config = RuntimeConfigState()
+    runtime_config = _initial_runtime_config()
+    catalog_store = CatalogStore(catalog_path_for(root))
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_exception_handler(
@@ -296,9 +455,172 @@ def create_app(
 
     @app.delete("/api/runtime-config", response_model=RuntimeConfigResponse)
     def clear_runtime_config() -> RuntimeConfigResponse:
-        runtime_config.bw = RuntimeBwConfigState()
-        runtime_config.llm = RuntimeLlmConfigState()
+        _clear_runtime_config(runtime_config)
         return runtime_config.redacted()
+
+    @app.get("/api/v1/runtime-config", response_model=V1RuntimeConfigResponse)
+    def get_runtime_config_v1() -> V1RuntimeConfigResponse:
+        return runtime_config.redacted_v1()
+
+    @app.put("/api/v1/runtime-config", response_model=V1RuntimeConfigResponse)
+    def put_runtime_config_v1(request: RuntimeConfigRequest) -> V1RuntimeConfigResponse:
+        try:
+            _apply_runtime_config(runtime_config, request)
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return runtime_config.redacted_v1()
+
+    @app.delete("/api/v1/runtime-config", response_model=V1RuntimeConfigResponse)
+    def clear_runtime_config_v1() -> V1RuntimeConfigResponse:
+        _reset_runtime_config(runtime_config)
+        return runtime_config.redacted_v1()
+
+    @app.post("/api/v1/connection/test", response_model=LiveSmokeResult)
+    def connection_test_v1(request: V1ConnectionTestRequest) -> LiveSmokeResult:
+        state = _ensure_live_ready(runtime_config, request.confirm_read_only)
+        return run_live_smoke(
+            client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
+            search_term=request.search_term,
+            secret_values=_runtime_secret_values(state),
+        )
+
+    @app.post("/api/v1/snapshots/capture")
+    def capture_snapshot_v1(request: V1SnapshotCaptureRequest) -> dict[str, object]:
+        try:
+            snapshot = _capture_v1_snapshot(
+                root=root,
+                store=catalog_store,
+                runtime_config=runtime_config,
+                request=request,
+                bw_client_factory=bw_client_factory,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        return snapshot.model_dump(mode="json")
+
+    @app.get("/api/v1/snapshots", response_model=V1SnapshotListResponse)
+    def list_snapshots_v1() -> V1SnapshotListResponse:
+        return V1SnapshotListResponse(
+            snapshots=[
+                snapshot.model_dump(mode="json") for snapshot in catalog_store.list_snapshots()
+            ]
+        )
+
+    @app.get("/api/v1/snapshots/{snapshot_id}")
+    def get_snapshot_v1(snapshot_id: str) -> dict[str, object]:
+        snapshot = catalog_store.get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
+        return snapshot.model_dump(mode="json")
+
+    @app.get("/api/v1/snapshots/{snapshot_id}/objects", response_model=V1ObjectListResponse)
+    def list_snapshot_objects_v1(
+        snapshot_id: str,
+        q: str | None = None,
+        type: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> V1ObjectListResponse:
+        if catalog_store.get_snapshot(snapshot_id) is None:
+            raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
+        try:
+            offset = _parse_cursor(cursor)
+        except ValueError as exc:
+            raise _http_error(exc) from exc
+        items, next_cursor = catalog_store.list_objects(
+            snapshot_id,
+            q=q,
+            object_type=type,
+            limit=limit,
+            cursor=offset,
+        )
+        return V1ObjectListResponse(
+            items=[item.model_dump(mode="json") for item in items],
+            next_cursor=str(next_cursor) if next_cursor is not None else None,
+            limit=max(1, min(limit, 100)),
+        )
+
+    @app.get("/api/v1/snapshots/{snapshot_id}/objects/{object_id:path}")
+    def get_snapshot_object_v1(snapshot_id: str, object_id: str) -> dict[str, object]:
+        item = catalog_store.get_object(snapshot_id, object_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"object not found: {object_id}")
+        return item.model_dump(mode="json")
+
+    @app.post(
+        "/api/v1/snapshots/{snapshot_id}/lineage",
+        response_model=BoundedLineageResult,
+    )
+    def lineage_v1(snapshot_id: str, request: V1LineageRequest) -> BoundedLineageResult:
+        try:
+            graph = catalog_store.load_graph(snapshot_id)
+            return bounded_lineage(
+                graph,
+                snapshot_id=snapshot_id,
+                start_id=request.object_id,
+                direction=request.direction,
+                depth=request.depth,
+                node_cap=request.node_cap,
+                edge_cap=request.edge_cap,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post(
+        "/api/v1/snapshots/{snapshot_id}/lineage/expand",
+        response_model=BoundedLineageResult,
+    )
+    def lineage_expand_v1(
+        snapshot_id: str,
+        request: V1LineageExpandRequest,
+    ) -> BoundedLineageResult:
+        start_id = request.expand_object_id or request.object_id
+        try:
+            graph = catalog_store.load_graph(snapshot_id)
+            return bounded_lineage(
+                graph,
+                snapshot_id=snapshot_id,
+                start_id=start_id,
+                direction=request.direction,
+                depth=request.depth,
+                node_cap=request.node_cap,
+                edge_cap=request.edge_cap,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/impact/scenario")
+    def impact_scenario_v1(
+        snapshot_id: str,
+        request: V1ImpactScenarioRequest,
+    ) -> dict[str, object]:
+        try:
+            return _run_v1_impact_scenario(catalog_store, snapshot_id, request)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/sql/explain")
+    def sql_explain_v1(snapshot_id: str, request: V1SqlExplainRequest) -> dict[str, object]:
+        try:
+            _ensure_snapshot_exists(catalog_store, snapshot_id)
+            result = _parse_v1_sql(root, request)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        return _sql_explain_payload(result, output_format=request.format)
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/sql/draft")
+    def sql_draft_v1(snapshot_id: str, request: V1SqlDraftRequest) -> dict[str, object]:
+        try:
+            _ensure_snapshot_exists(catalog_store, snapshot_id)
+            return _sql_draft_payload(
+                root=root,
+                store=catalog_store,
+                snapshot_id=snapshot_id,
+                runtime_config=runtime_config,
+                request=request,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
 
     @app.post("/api/lineage", response_model=RenderedResponse)
     def lineage(request: LineageRequest) -> RenderedResponse:
@@ -453,6 +775,60 @@ def create_default_app() -> FastAPI:
     return create_app(project_root=project_root, static_dir=static_dir)
 
 
+def _initial_runtime_config() -> RuntimeConfigState:
+    return RuntimeConfigState(
+        bw=_env_bw_state(),
+        llm=_env_llm_state(),
+    )
+
+
+def _clear_runtime_config(state: RuntimeConfigState) -> None:
+    state.bw = RuntimeBwConfigState()
+    state.llm = RuntimeLlmConfigState()
+
+
+def _reset_runtime_config(state: RuntimeConfigState) -> None:
+    state.bw = _env_bw_state()
+    state.llm = _env_llm_state()
+
+
+def _env_bw_state() -> RuntimeBwConfigState:
+    required = ("BW_URL", "BW_USER", "BW_PASSWORD", "BW_CLIENT")
+    if any(not _has_text(os.environ.get(name)) for name in required):
+        return RuntimeBwConfigState()
+    return RuntimeBwConfigState(
+        source="env",
+        configured=True,
+        url=os.environ["BW_URL"].strip(),
+        user=os.environ["BW_USER"].strip(),
+        password=os.environ["BW_PASSWORD"],
+        client=os.environ["BW_CLIENT"].strip(),
+        language=os.environ.get("BW_LANGUAGE", "EN").strip() or "EN",
+        verify_ssl=_env_bool("BW_VERIFY_SSL", default=True),
+        ca_bundle=_optional_env("BW_CA_BUNDLE"),
+        trust_env=_env_bool("BW_TRUST_ENV", default=True),
+    )
+
+
+def _env_llm_state() -> RuntimeLlmConfigState:
+    required = ("BWLI_LLM_BASE_URL", "BWLI_LLM_MODEL", "BWLI_LLM_API_KEY")
+    if any(not _has_text(os.environ.get(name)) for name in required):
+        return RuntimeLlmConfigState()
+    base_url = os.environ["BWLI_LLM_BASE_URL"].strip()
+    try:
+        validate_local_llm_base_url(base_url)
+    except ConfigError:
+        return RuntimeLlmConfigState()
+    return RuntimeLlmConfigState(
+        source="env",
+        enabled=True,
+        configured=True,
+        base_url=base_url,
+        model=os.environ["BWLI_LLM_MODEL"].strip(),
+        api_key=os.environ["BWLI_LLM_API_KEY"],
+    )
+
+
 def _apply_runtime_config(state: RuntimeConfigState, request: RuntimeConfigRequest) -> None:
     new_bw = state.bw
     new_llm = state.llm
@@ -495,6 +871,7 @@ def _build_bw_state(
         else None
     )
     return RuntimeBwConfigState(
+        source="ui",
         configured=True,
         url=request.url.strip(),
         user=request.user.strip(),
@@ -503,6 +880,7 @@ def _build_bw_state(
         language=request.language.strip(),
         verify_ssl=request.verify_ssl,
         ca_bundle=ca_bundle,
+        trust_env=request.trust_env,
     )
 
 
@@ -533,6 +911,7 @@ def _build_llm_state(
     base_url = request.base_url.strip()
     validate_local_llm_base_url(base_url)
     return RuntimeLlmConfigState(
+        source="ui",
         enabled=True,
         configured=True,
         base_url=base_url,
@@ -553,6 +932,20 @@ def _coalesce_secret(candidate: str | None, previous: str | None) -> str | None:
         assert previous is not None
         return previous
     return None
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _optional_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
 
 
 def _redact_validation_errors(exc: RequestValidationError) -> list[dict[str, object]]:
@@ -608,6 +1001,7 @@ def _build_runtime_bw_client(
         sap_client=state.client,
         language=state.language,
         verify=state.ca_bundle if state.verify_ssl and state.ca_bundle else state.verify_ssl,
+        trust_env=state.trust_env,
     )
 
 
@@ -626,6 +1020,368 @@ def _resolve_local_output_dir(root: Path, user_path: str) -> Path:
     return resolved
 
 
+def _parse_cursor(cursor: str | None) -> int:
+    if cursor is None or not cursor.strip():
+        return 0
+    try:
+        value = int(cursor)
+    except ValueError as exc:
+        raise ValueError("cursor must be an integer offset") from exc
+    if value < 0:
+        raise ValueError("cursor must be >= 0")
+    return value
+
+
+def _capture_v1_snapshot(
+    *,
+    root: Path,
+    store: CatalogStore,
+    runtime_config: RuntimeConfigState,
+    request: V1SnapshotCaptureRequest,
+    bw_client_factory: BwClientFactory | None,
+) -> CatalogSnapshotRecord:
+    if request.fixture_path:
+        fixture_path = _resolve_local_path(root, request.fixture_path)
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        ingested = ingest_fixture_payload(payload, source=f"fixture://{fixture_path.name}")
+        snapshot = store.create_snapshot(
+            mode="offline-fixture",
+            source=f"fixture://{fixture_path.name}",
+        )
+        return _replace_catalog_or_delete_snapshot(
+            store,
+            snapshot.id,
+            objects=ingested.objects,
+            edges=ingested.edges,
+        )
+
+    if request.manifest_path:
+        manifest_path = _resolve_local_manifest_path(root, request.manifest_path)
+        manifest, ingested = ingest_manifest(manifest_path)
+        snapshot = store.create_snapshot(
+            mode=manifest.mode,
+            source=f"manifest://{manifest_path.name}",
+            manifest_path=_project_relative_path(root, manifest_path),
+        )
+        return _replace_catalog_or_delete_snapshot(
+            store,
+            snapshot.id,
+            objects=ingested.objects,
+            edges=ingested.edges,
+        )
+
+    state = _ensure_live_ready(runtime_config, request.confirm_read_only)
+    out_dir = _resolve_local_output_dir(root, _live_snapshot_output_dir())
+    if not request.search_terms and not request.object_names:
+        raise ValueError("live capture requires at least one search term or object name")
+    manifest = collect_live_snapshot(
+        out_dir=out_dir,
+        client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
+        search_terms=request.search_terms,
+        object_names=request.object_names,
+        include_dataflow=request.include_dataflow,
+        include_xref=request.include_xref,
+        xref_direction=request.xref_direction,
+        dataflow_object_type=request.object_type,
+        dataflow_source_system=request.source_system,
+        dataflow_direction=request.dataflow_direction,
+        dataflow_levels=request.dataflow_levels,
+    )
+    _, ingested = ingest_manifest(out_dir / "manifest.json")
+    snapshot = store.create_snapshot(
+        mode=manifest.mode,
+        source="live-read-only",
+        manifest_path=_project_relative_path(root, out_dir / "manifest.json"),
+    )
+    return _replace_catalog_or_delete_snapshot(
+        store,
+        snapshot.id,
+        objects=ingested.objects,
+        edges=ingested.edges,
+    )
+
+
+def _replace_catalog_or_delete_snapshot(
+    store: CatalogStore,
+    snapshot_id: str,
+    *,
+    objects: Sequence[ObjectInput | CatalogObjectRecord],
+    edges: Sequence[EdgeInput | CatalogEdgeRecord],
+) -> CatalogSnapshotRecord:
+    try:
+        return store.replace_catalog(snapshot_id, objects=objects, edges=edges)
+    except Exception:
+        store.delete_snapshot(snapshot_id)
+        raise
+
+
+def _project_relative_path(root: Path, path: Path) -> str:
+    root_resolved = root.resolve()
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(root_resolved))
+    except ValueError as exc:
+        raise ValueError(f"local snapshot path must stay under project root: {path}") from exc
+
+
+def _resolve_local_manifest_path(root: Path, user_path: str) -> Path:
+    path = Path(user_path)
+    resolved = path if path.is_absolute() else root / path
+    resolved = resolved.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"local manifest path must stay under project root: {user_path}") from exc
+    manifest = resolved / "manifest.json" if resolved.is_dir() else resolved
+    if not manifest.exists() or not manifest.is_file():
+        raise FileNotFoundError(f"local manifest not found: {user_path}")
+    return manifest
+
+
+def _live_snapshot_output_dir() -> str:
+    timestamp = datetime_safe_fragment()
+    return f".bwli/snapshots/{timestamp}"
+
+
+def datetime_safe_fragment() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat().replace(":", "").replace("+", "Z").replace(".", "-")
+
+
+def _ensure_snapshot_exists(store: CatalogStore, snapshot_id: str) -> None:
+    if store.get_snapshot(snapshot_id) is None:
+        raise FileNotFoundError(f"snapshot not found: {snapshot_id}")
+
+
+def _run_v1_impact_scenario(
+    store: CatalogStore,
+    snapshot_id: str,
+    request: V1ImpactScenarioRequest,
+) -> dict[str, object]:
+    assert_no_persisted_secrets(request.model_dump(mode="json"))
+    graph = store.load_graph(snapshot_id)
+    nodes_by_id = graph.node_map()
+    if request.object_id not in nodes_by_id:
+        raise ValueError(f"start node not found: {request.object_id}")
+    bounded = bounded_lineage(
+        graph,
+        snapshot_id=snapshot_id,
+        start_id=request.object_id,
+        direction=Direction.DOWNSTREAM,
+        depth=request.depth,
+        node_cap=request.node_cap,
+        edge_cap=request.edge_cap,
+    )
+    source_node = nodes_by_id[request.object_id]
+    change = ChangeEvent(
+        id=f"scenario:{request.object_id}:{request.change_type.value}",
+        object_id=request.object_id,
+        object_type=source_node.type,
+        change_type=request.change_type,
+        field=request.field,
+        metadata={
+            key: value
+            for key, value in {
+                "value_description": request.value_description,
+                "description": request.description,
+            }.items()
+            if value
+        },
+    )
+    capped_graph = BwGraph.model_validate(
+        {
+            "nodes": [
+                node.model_dump(mode="json", exclude={"evidence_ids"}) for node in bounded.nodes
+            ],
+            "edges": [
+                edge.model_dump(mode="json", exclude={"evidence_ids"}) for edge in bounded.edges
+            ],
+        }
+    )
+    report = run_impact_analysis(
+        capped_graph,
+        ChangeSet(changes=[change]),
+        max_depth=request.depth,
+    )
+    allowed_node_ids = {node.id for node in bounded.nodes}
+    severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNKNOWN": 3}
+    affected = []
+    for finding in report.findings:
+        if finding.impacted_object_id not in allowed_node_ids:
+            continue
+        evidence_ids = sorted({*finding.evidence_node_ids, *finding.evidence_edge_ids})
+        affected.append(
+            {
+                "object_id": finding.impacted_object_id,
+                "object_type": finding.impacted_object_type,
+                "severity": finding.severity.value,
+                "confidence": finding.confidence,
+                "reason": finding.reason,
+                "evidence_ids": evidence_ids,
+                "evidence_node_ids": finding.evidence_node_ids,
+                "evidence_edge_ids": finding.evidence_edge_ids,
+                "manual_verification": finding.manual_verification,
+            }
+        )
+    affected.sort(key=lambda item: (severity_order[str(item["severity"])], str(item["object_id"])))
+    return {
+        "schema_version": "1.0",
+        "snapshot_id": snapshot_id,
+        "deterministic": True,
+        "advisory": False,
+        "scenario": {
+            "object_id": request.object_id,
+            "object_type": source_node.type,
+            "change_type": request.change_type.value,
+            "field": request.field,
+            "value_description": request.value_description,
+            "description": request.description,
+            "changes_path_required": False,
+        },
+        "affected_objects": affected,
+        "lineage_bounds": {
+            "depth": request.depth,
+            "node_cap": request.node_cap,
+            "edge_cap": request.edge_cap,
+            "truncated": bounded.truncated,
+            "truncation": bounded.truncation.model_dump(mode="json"),
+            "omitted_neighbor_counts": bounded.omitted_neighbor_counts,
+            "cycles_detected": bounded.cycles_detected,
+        },
+    }
+
+
+def _parse_v1_sql(root: Path, request: V1SqlExplainRequest | V1SqlDraftRequest) -> SqlParseResult:
+    if request.sql_text and request.sql_file:
+        raise ValueError("provide sql_text or sql_file, not both")
+    if request.sql_text:
+        sql_text = request.sql_text
+    elif request.sql_file:
+        sql_text = load_text(_resolve_local_path(root, request.sql_file))
+    else:
+        raise ValueError("sql_text or sql_file is required")
+    view_id = request.view_id or "ADVISORY_SQL_VIEW"
+    return parse_native_sql_view(sql_text, view_id=view_id)
+
+
+def _sql_explain_payload(
+    result: SqlParseResult,
+    *,
+    output_format: EvidenceFormat,
+) -> dict[str, object]:
+    rendered = render_sql_view_evidence(result, output_format=output_format)
+    citations = _sql_citations(result)
+    return {
+        "schema_version": "1.0",
+        "advisory": True,
+        "execution_blocked": True,
+        "execution_disabled_warning": (
+            "SQL Assistant parses and drafts only; database execution is disabled."
+        ),
+        "target": "native_sql_view",
+        "format": output_format,
+        "content": rendered,
+        "result": result.model_dump(mode="json"),
+        "citations": citations,
+    }
+
+
+def _sql_draft_payload(
+    *,
+    root: Path,
+    store: CatalogStore,
+    snapshot_id: str,
+    runtime_config: RuntimeConfigState,
+    request: V1SqlDraftRequest,
+) -> dict[str, object]:
+    assert_no_persisted_secrets(request.model_dump(mode="json"))
+    if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        return {
+            "schema_version": "1.0",
+            "status": "disabled",
+            "advisory": True,
+            "execution_blocked": True,
+            "config_required": True,
+            "message": (
+                "Configure a local OpenAI-compatible LLM endpoint to create advisory SQL drafts."
+            ),
+            "target_dialect": request.target_dialect,
+            "draft_sql": "",
+            "citations": [],
+        }
+    if (
+        not runtime_config.llm.base_url
+        or not runtime_config.llm.model
+        or not runtime_config.llm.api_key
+    ):
+        raise ConfigError("LLM runtime config is incomplete")
+    result = _parse_v1_sql(root, request)
+    draft_result = _create_llm_sql_draft(
+        result,
+        question=request.question,
+        target_dialect=request.target_dialect,
+        runtime=LlmRuntimeConfig(
+            base_url=runtime_config.llm.base_url,
+            model=runtime_config.llm.model,
+            api_key=SecretStr(runtime_config.llm.api_key),
+        ),
+    )
+    draft = str(draft_result["draft_sql"]).strip()
+    if not draft:
+        raise ValueError("LLM returned an empty SQL draft")
+    raw_citations = draft_result.get("citations", [])
+    citations = (
+        [item for item in raw_citations if isinstance(item, str)]
+        if isinstance(raw_citations, list)
+        else []
+    )
+    assert_no_persisted_secrets({"draft_sql": draft})
+    store.record_sql_draft(
+        snapshot_id,
+        question=request.question,
+        target_dialect=request.target_dialect,
+        draft_sql=draft,
+        citation_ids=citations,
+    )
+    return {
+        "schema_version": "1.0",
+        "status": "ok",
+        "advisory": True,
+        "execution_blocked": True,
+        "config_required": False,
+        "target_dialect": request.target_dialect,
+        "draft_sql": draft,
+        "citations": citations,
+        "llm_audit": draft_result["llm_audit"],
+    }
+
+
+def _sql_citations(result: SqlParseResult) -> list[str]:
+    return [
+        *[edge.id for edge in result.reference_edges],
+        *[fragment.id for fragment in result.fragments],
+        *[column.id for column in result.columns],
+    ]
+
+
+def _create_llm_sql_draft(
+    result: SqlParseResult,
+    *,
+    question: str,
+    target_dialect: str,
+    runtime: LlmRuntimeConfig,
+) -> dict[str, object]:
+    module = import_module("bwli.llm.sql_assistant")
+    create_sql_draft = cast(SqlDraftFactory, module.create_sql_draft)
+    return create_sql_draft(
+        result,
+        question=question,
+        target_dialect=target_dialect,
+        runtime=runtime,
+    )
+
+
 def _frontend_static_dir(root: Path, static_dir: Path | None) -> Path | None:
     candidates = []
     if static_dir is not None:
@@ -639,8 +1395,14 @@ def _frontend_static_dir(root: Path, static_dir: Path | None) -> Path | None:
 
 
 def _http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
     if isinstance(exc, FileNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, KeyError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ConfigError | SecretPersistenceError):
+        return HTTPException(status_code=400, detail=str(exc))
     if isinstance(exc, ValueError):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=500, detail=type(exc).__name__)

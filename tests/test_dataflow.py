@@ -58,6 +58,17 @@ def test_parse_dataflow_xml_extracts_nodes_and_edges() -> None:
     assert graph.edges == ((1, 2), (2, 3))
 
 
+def test_parse_dataflow_xml_preserves_self_closing_leaf_nodes() -> None:
+    graph = parse_dataflow_xml(
+        '<dataflow><node nodeID="1" objectName="ZADSO" objectType="ADSO" /></dataflow>'
+    )
+
+    assert len(graph.nodes) == 1
+    assert graph.nodes[0].object_name == "ZADSO"
+    assert graph.nodes[0].object_type == "ADSO"
+    assert graph.edges == ()
+
+
 def test_render_dataflow_mermaid_visualizes_bw_flow() -> None:
     rendered = render_dataflow(SAMPLE_DATAFLOW_XML, output_format="mermaid")
 

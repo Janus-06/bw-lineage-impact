@@ -8,7 +8,7 @@ import pytest
 from pydantic import SecretStr
 
 from bwli.config import ConfigError, LlmConfig, LlmRuntimeConfig
-from bwli.field_lineage import SqlFragment, parse_native_sql_view
+from bwli.field_lineage import SqlFragment, SqlParseResult, parse_native_sql_view
 from bwli.llm.explainer import (
     LlmCitationError,
     LlmEvidenceError,
@@ -17,9 +17,10 @@ from bwli.llm.explainer import (
 )
 from bwli.llm.openai_compatible import OpenAICompatibleClient, write_llm_audit_log
 from bwli.llm.sanitizer import REDACTED, sanitize_llm_evidence, sanitize_text
+from bwli.llm.sql_assistant import build_sql_draft_request
 
 
-def _sample_sql_result():
+def _sample_sql_result() -> SqlParseResult:
     return parse_native_sql_view(
         """
         CREATE VIEW ZSQL_SALES_VIEW AS
@@ -241,6 +242,21 @@ def test_build_sql_explainer_request_specifies_bracketed_citation_format() -> No
 
     assert "square-bracket" in system_prompt
     assert "[sqlfrag:where:1]" in system_prompt
+
+
+def test_build_sql_draft_request_omits_explainer_task_messages() -> None:
+    request = build_sql_draft_request(
+        _sample_sql_result(),
+        question="draft a HANA view query",
+        target_dialect="sap-hana-sql",
+    )
+    prompt = "\n".join(message.content for message in request.messages).lower()
+
+    assert "explain the view logic" not in prompt
+    assert "task: create an advisory sql draft" in prompt
+    assert "draft a hana view query" in prompt
+    assert "sanitized cited evidence json" in prompt
+    assert request.citation_ids
 
 
 def test_build_sql_explainer_request_preserves_unique_citations_after_sensitive_redaction() -> None:
@@ -504,7 +520,7 @@ def test_openai_compatible_client_redacts_provider_usage_metadata() -> None:
     assert completion.audit.usage is not None
     assert completion.audit.usage["prompt_tokens"] == 10
     assert completion.audit.usage["api_key"] == REDACTED
-    assert completion.audit.usage["nested"]["password"] == REDACTED  # type: ignore[index]
+    assert completion.audit.usage["nested"]["password"] == REDACTED
 
 
 def test_openai_compatible_client_disables_environment_proxy_trust(

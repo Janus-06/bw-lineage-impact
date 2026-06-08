@@ -32,9 +32,10 @@ def parse_dataflow_xml(xml: str) -> DataflowGraph:
     """Parse SAP BW dmod 8TRANSIENT XML into deterministic node/edge evidence."""
 
     nodes: list[DataflowNode] = []
-    for match in re.finditer(r"<node\b([\s\S]*?)>([\s\S]*?)</node>", xml):
-        attrs = match.group(1)
-        body = match.group(2)
+    node_pattern = re.compile(r"<node\b([^>]*)/>|<node\b([\s\S]*?)>([\s\S]*?)</node>")
+    for match in node_pattern.finditer(xml):
+        attrs = match.group(1) if match.group(1) is not None else match.group(2)
+        body = match.group(3) or ""
         node_id = _int_attr(attrs, "nodeID")
         if node_id is None:
             continue

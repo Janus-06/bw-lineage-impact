@@ -7,6 +7,7 @@ coverage/
 .DS_Store
 .omx/
 .omc/
+.bwli/
 artifacts/claude/*.json
 artifacts/claude/*.txt
 artifacts/claude/*.md
