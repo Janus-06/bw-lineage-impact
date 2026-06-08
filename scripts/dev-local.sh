@@ -31,4 +31,20 @@ BW Lineage Impact local dev is starting:
 Press Ctrl+C to stop both.
 EOF
 
-wait -n "$BACKEND_PID" "$FRONTEND_PID"
+while true; do
+  if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+    set +e
+    wait "$BACKEND_PID"
+    status=$?
+    set -e
+    exit "$status"
+  fi
+  if ! kill -0 "$FRONTEND_PID" 2>/dev/null; then
+    set +e
+    wait "$FRONTEND_PID"
+    status=$?
+    set -e
+    exit "$status"
+  fi
+  sleep 1
+done
