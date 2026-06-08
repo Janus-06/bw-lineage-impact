@@ -355,6 +355,7 @@ export default function App() {
       setHealth(healthResponse);
       setRuntimeConfig(configResponse);
       hydrateSettingsFromRedactedConfig(configResponse);
+      setError('');
     } catch (err: unknown) {
       setError(`Backend 연결 실패: ${String(err)}`);
     }
@@ -388,6 +389,14 @@ export default function App() {
     setCopyStatus('');
   }
 
+  function beginExecution() {
+    setBusy(true);
+    setError('');
+    setResult('');
+    setResultMeta(null);
+    setCopyStatus('');
+  }
+
   async function runAnalysis() {
     if (tool === 'settings') {
       await saveSettings();
@@ -397,8 +406,7 @@ export default function App() {
       await runLiveAction();
       return;
     }
-    setBusy(true);
-    setError('');
+    beginExecution();
     try {
       const rendered = await postRendered(endpoint, buildRequest(tool, form));
       publishResult(rendered.content, {
@@ -415,8 +423,7 @@ export default function App() {
   }
 
   async function runLiveAction() {
-    setBusy(true);
-    setError('');
+    beginExecution();
     try {
       if (form.liveMode === 'smoke') {
         const payload = await postJson<LiveSmokeResponse>('/api/live/smoke', {
@@ -480,8 +487,7 @@ export default function App() {
   }
 
   async function saveSettings() {
-    setBusy(true);
-    setError('');
+    beginExecution();
     try {
       const body = {
         bw: settings.bwUrl
@@ -522,8 +528,7 @@ export default function App() {
   }
 
   async function clearSettings() {
-    setBusy(true);
-    setError('');
+    beginExecution();
     try {
       const config = await clearRuntimeConfig();
       setRuntimeConfig(config);
@@ -1195,18 +1200,20 @@ function ResultViewer({
   result: string;
   toolMeta: ToolMeta;
 }) {
-  const lineCount = result ? result.split('\n').length : 0;
-  const isMermaid = (meta?.format ?? '') === 'mermaid';
+  const visibleResult = !busy && !error ? result : '';
+  const visibleMeta = !busy && !error ? meta : null;
+  const lineCount = visibleResult ? visibleResult.split('\n').length : 0;
+  const isMermaid = (visibleMeta?.format ?? '') === 'mermaid';
   return (
     <section className="workbenchPanel resultPanel" aria-label="Result viewer">
       <PanelTitle
         kicker="Evidence viewer"
         rightSlot={
           <div className="resultActions">
-            <button className="secondaryButton compact" disabled={!result} onClick={onCopy} type="button">
+            <button className="secondaryButton compact" disabled={!visibleResult} onClick={onCopy} type="button">
               {copyStatus || 'Copy'}
             </button>
-            <button className="secondaryButton compact" disabled={!result} onClick={onDownload} type="button">
+            <button className="secondaryButton compact" disabled={!visibleResult} onClick={onDownload} type="button">
               Download
             </button>
           </div>
@@ -1215,10 +1222,10 @@ function ResultViewer({
       />
 
       <div className="resultMetaBar">
-        <span className={`formatBadge ${meta?.format ?? 'idle'}`}>{meta?.format ?? 'idle'}</span>
-        <span>{meta?.endpoint ?? toolMeta.endpoint}</span>
-        <span>{meta ? formatTimestamp(meta.timestamp) : 'not run yet'}</span>
-        {result ? <span>{lineCount} lines</span> : null}
+        <span className={`formatBadge ${visibleMeta?.format ?? 'idle'}`}>{visibleMeta?.format ?? 'idle'}</span>
+        <span>{visibleMeta?.endpoint ?? toolMeta.endpoint}</span>
+        <span>{visibleMeta ? formatTimestamp(visibleMeta.timestamp) : 'not run yet'}</span>
+        {visibleResult ? <span>{lineCount} lines</span> : null}
       </div>
 
       {busy ? (
@@ -1232,11 +1239,11 @@ function ResultViewer({
           <strong>Execution failed</strong>
           <p>{error}</p>
         </div>
-      ) : result ? (
+      ) : visibleResult ? (
         <>
           <div className="executionSummary">
-            <span>{meta?.mode ?? toolMeta.label}</span>
-            <strong>{meta?.summary ?? 'Result ready'}</strong>
+            <span>{visibleMeta?.mode ?? toolMeta.label}</span>
+            <strong>{visibleMeta?.summary ?? 'Result ready'}</strong>
           </div>
           {isMermaid ? (
             <div className="mermaidNotice">
@@ -1244,7 +1251,7 @@ function ResultViewer({
               <p>Plain React/CSS mode keeps dependencies light. Copy or download this source into Mermaid-compatible review docs.</p>
             </div>
           ) : null}
-          <pre className={isMermaid ? 'resultPre mermaidSource' : 'resultPre'}>{result}</pre>
+          <pre className={isMermaid ? 'resultPre mermaidSource' : 'resultPre'}>{visibleResult}</pre>
         </>
       ) : (
         <EmptyResult hint={toolMeta.emptyHint} meta={toolMeta} />
@@ -1513,8 +1520,8 @@ function buildQuickStats(
     },
     {
       label: 'Safety',
-      value: health ? (health.read_only === false ? 'check' : 'read-only') : 'checking',
-      tone: health ? (health.read_only === false ? 'danger' : 'ok') : 'neutral',
+      value: health ? (health.read_only === false || health.local_only === false ? 'check' : 'read-only') : 'checking',
+      tone: health ? (health.read_only === false || health.local_only === false ? 'danger' : 'ok') : 'neutral',
       detail: health ? (health.local_only === false ? 'remote mode reported' : 'local-only API') : 'waiting for /api/health',
     },
     {
