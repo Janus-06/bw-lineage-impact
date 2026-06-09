@@ -1,7 +1,7 @@
 export type ConfigSource = 'env' | 'ui' | 'unset';
+export type ConnectionStatus = 'unconfigured' | 'untested' | 'ok' | 'failed' | 'stale';
 export type Direction = 'upstream' | 'downstream' | 'both';
 export type DataflowDirection = 'upwards' | 'downwards' | 'both';
-export type XrefDirection = 'upstream' | 'downstream';
 export type AppTab = 'lineage' | 'impact' | 'sql';
 export type ChangeType =
   | 'field_removed'
@@ -22,6 +22,7 @@ export interface HealthResponse {
 
 export interface RuntimeConfigResponse {
   storage: 'process-memory';
+  connection_status: ConnectionStatus;
   bw: {
     source: ConfigSource;
     configured: boolean;
@@ -80,6 +81,61 @@ export interface LiveSmokeResult {
   operations: LiveOperationSummary[];
 }
 
+export interface LiveCaptureSummary {
+  mode: string;
+  succeeded: number;
+  failed: number;
+  operations: LiveOperationSummary[];
+}
+
+export interface CaptureScopeItem {
+  object_id: string;
+  object_type: string;
+  role: 'selected' | 'discovered';
+  operation: string;
+  status: 'selected' | 'ok' | 'error' | 'skipped';
+  error: string | null;
+  evidence_ids: string[];
+  metadata: Record<string, unknown>;
+}
+
+export interface GlossaryTerm {
+  id: string;
+  term: string;
+  normalized_term: string;
+  source: string;
+  candidate: boolean;
+  object_id: string | null;
+  object_type: string | null;
+  field_name: string | null;
+  evidence_ids: string[];
+  metadata: Record<string, unknown>;
+}
+
+export interface RepositoryNode {
+  id: string;
+  parent_path: string;
+  path: string;
+  name: string;
+  description: string;
+  object_type: string;
+  object_subtype: string | null;
+  status: string | null;
+  has_children: boolean;
+  self_url: string | null;
+  fiori_only: boolean;
+  children_path: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface RepositoryResponse {
+  path: string;
+  source: 'live' | 'cache' | 'empty';
+  count: number;
+  items: RepositoryNode[];
+  action_required: string | null;
+}
+
 export interface SnapshotSummary {
   id: string;
   created_at: string;
@@ -88,16 +144,24 @@ export interface SnapshotSummary {
   manifest_path: string | null;
   object_count: number;
   edge_count: number;
-  capture?: {
-    mode: string;
-    succeeded: number;
-    failed: number;
-    operations: LiveOperationSummary[];
-  };
+  capture?: LiveCaptureSummary;
+  capture_scope?: CaptureScopeItem[];
 }
 
 export interface SnapshotListResponse {
   snapshots: SnapshotSummary[];
+}
+
+export interface CaptureScopeResponse {
+  snapshot_id: string;
+  items: CaptureScopeItem[];
+}
+
+export interface GlossaryResponse {
+  snapshot_id: string;
+  query: string | null;
+  count: number;
+  items: GlossaryTerm[];
 }
 
 export interface CatalogObject {
@@ -112,6 +176,7 @@ export interface CatalogObject {
 export interface CatalogObjectDetail extends CatalogObject {
   incoming_count: number;
   outgoing_count: number;
+  glossary_terms?: GlossaryTerm[];
 }
 
 export interface ObjectListResponse {
@@ -193,6 +258,7 @@ export interface ImpactScenarioResponse {
     evidence_node_ids: string[];
     evidence_edge_ids: string[];
     manual_verification: boolean;
+    glossary_terms?: GlossaryTerm[];
   }>;
   lineage_bounds: {
     depth: number;
@@ -229,10 +295,13 @@ export interface SqlExplainResponse {
     confidence: string;
     parser: string;
     reference_edges: Array<{ id: string; source_object_id: string; target_object_id: string }>;
-    columns: Array<{ id: string; column_name: string; expression: string }>;
+    columns: Array<{ id: string; column_name: string; expression: string; table_alias?: string | null }>;
     fragments: Array<{ id: string; kind: string; text: string }>;
   };
   citations: string[];
+  referenced_objects: string[];
+  referenced_fields: Array<{ id: string; table_alias: string | null; column_name: string; expression: string }>;
+  glossary_terms: GlossaryTerm[];
 }
 
 export interface SqlDraftResponse {
@@ -269,6 +338,30 @@ export async function listSnapshots(): Promise<SnapshotListResponse> {
   return getJson<SnapshotListResponse>('/api/v1/snapshots');
 }
 
+export async function getRepository(options: {
+  path?: string;
+  refresh?: boolean;
+  confirmReadOnly?: boolean;
+} = {}): Promise<RepositoryResponse> {
+  const query = new URLSearchParams();
+  if (options.path) query.set('path', options.path);
+  if (options.refresh) query.set('refresh', 'true');
+  if (options.confirmReadOnly) query.set('confirm_read_only', 'true');
+  const suffix = query.toString() ? `?${query}` : '';
+  return getJson<RepositoryResponse>(`/api/v1/repository${suffix}`);
+}
+
+export async function getCaptureScope(snapshotId: string): Promise<CaptureScopeResponse> {
+  return getJson<CaptureScopeResponse>(`/api/v1/snapshots/${encodeURIComponent(snapshotId)}/capture-scope`);
+}
+
+export async function getGlossary(snapshotId: string, query?: string): Promise<GlossaryResponse> {
+  const params = new URLSearchParams();
+  if (query?.trim()) params.set('query', query.trim());
+  const suffix = params.toString() ? `?${params}` : '';
+  return getJson<GlossaryResponse>(`/api/v1/snapshots/${encodeURIComponent(snapshotId)}/glossary${suffix}`);
+}
+
 export async function captureFixtureSnapshot(fixturePath: string): Promise<SnapshotSummary> {
   return postJson<SnapshotSummary>('/api/v1/snapshots/capture', { fixture_path: fixturePath });
 }
@@ -281,7 +374,6 @@ export async function captureLiveSnapshot(options: {
   sourceSystem?: string;
   dataflowDirection?: DataflowDirection;
   dataflowLevels?: number;
-  xrefDirection?: XrefDirection;
 }): Promise<SnapshotSummary> {
   return postJson<SnapshotSummary>('/api/v1/snapshots/capture', {
     confirm_read_only: options.confirmReadOnly,
@@ -293,7 +385,6 @@ export async function captureLiveSnapshot(options: {
     source_system: options.sourceSystem,
     dataflow_direction: options.dataflowDirection,
     dataflow_levels: options.dataflowLevels,
-    xref_direction: options.xrefDirection,
   });
 }
 

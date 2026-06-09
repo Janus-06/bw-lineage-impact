@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -46,11 +47,17 @@ from bwli.live import (
     run_live_smoke,
 )
 from bwli.redact import redact_text
+from bwli.repository import (
+    normalize_repository_path,
+    parse_repository_contents_xml,
+)
 from bwli.store import (
+    CaptureScopeRecord,
     CatalogEdgeRecord,
     CatalogObjectRecord,
     CatalogSnapshotRecord,
     CatalogStore,
+    GlossaryTermRecord,
     catalog_path_for,
     ingest_fixture_payload,
     ingest_manifest,
@@ -63,6 +70,7 @@ LineageFormat = Literal["json", "mermaid", "md"]
 ImpactFormat = Literal["json", "md"]
 EvidenceFormat = Literal["json", "md"]
 RuntimeConfigSource = Literal["env", "ui", "unset"]
+ConnectionStatus = Literal["unconfigured", "untested", "ok", "failed", "stale"]
 
 
 class HealthResponse(BaseModel):
@@ -137,6 +145,7 @@ class RuntimeConfigState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     storage: str = "process-memory"
+    connection_status: ConnectionStatus = "unconfigured"
     bw: RuntimeBwConfigState = Field(default_factory=RuntimeBwConfigState)
     llm: RuntimeLlmConfigState = Field(default_factory=RuntimeLlmConfigState)
 
@@ -165,6 +174,7 @@ class RuntimeConfigState(BaseModel):
     def redacted_v1(self) -> V1RuntimeConfigResponse:
         return V1RuntimeConfigResponse(
             storage=self.storage,
+            connection_status=self.connection_status,
             bw=V1RuntimeBwConfigPublic(
                 source=self.bw.source,
                 configured=self.bw.configured,
@@ -224,6 +234,7 @@ class V1RuntimeLlmConfigPublic(RuntimeLlmConfigPublic):
 
 class V1RuntimeConfigResponse(BaseModel):
     storage: str
+    connection_status: ConnectionStatus
     bw: V1RuntimeBwConfigPublic
     llm: V1RuntimeLlmConfigPublic
 
@@ -351,6 +362,32 @@ class V1ObjectListResponse(BaseModel):
     limit: int
 
 
+class V1RepositoryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    source: Literal["live", "cache", "empty"]
+    count: int
+    items: list[dict[str, object]]
+    action_required: str | None = None
+
+
+class V1CaptureScopeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: str
+    items: list[dict[str, object]]
+
+
+class V1GlossaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: str
+    query: str | None = None
+    count: int
+    items: list[dict[str, object]]
+
+
 class V1LineageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -438,12 +475,13 @@ def create_app(
     """Create the local read-only API and optional static frontend server."""
 
     root = (project_root or Path.cwd()).resolve()
+    runtime_env = _merged_runtime_env(root)
     app = FastAPI(
         title="BW Lineage Impact Local API",
         version=__version__,
         summary="Local-first read-only BW lineage and change-impact analyzer API.",
     )
-    runtime_config = _initial_runtime_config()
+    runtime_config = _initial_runtime_config(runtime_env)
     catalog_store = CatalogStore(catalog_path_for(root))
 
     @app.exception_handler(RequestValidationError)
@@ -491,27 +529,30 @@ def create_app(
 
     @app.delete("/api/v1/runtime-config", response_model=V1RuntimeConfigResponse)
     def clear_runtime_config_v1() -> V1RuntimeConfigResponse:
-        _reset_runtime_config(runtime_config)
+        _reset_runtime_config(runtime_config, runtime_env)
         return runtime_config.redacted_v1()
 
     @app.post("/api/v1/connection/test", response_model=LiveSmokeResult)
     def connection_test_v1(request: V1ConnectionTestRequest) -> LiveSmokeResult:
         state = _ensure_live_ready(runtime_config, request.confirm_read_only)
         try:
-            return run_live_smoke(
+            result = run_live_smoke(
                 client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
                 search_term=request.search_term,
                 secret_values=_runtime_secret_values(state),
                 secret_urls=_runtime_secret_urls(state),
             )
+            runtime_config.connection_status = "failed" if result.status == "error" else "ok"
+            return result
         except Exception as exc:
+            runtime_config.connection_status = "failed"
             raise _live_http_error(exc, state=state) from exc
 
     @app.post("/api/v1/snapshots/capture")
     def capture_snapshot_v1(request: V1SnapshotCaptureRequest) -> dict[str, object]:
         live_state = runtime_config.bw if runtime_config.bw.configured else None
         try:
-            snapshot, capture_meta = _capture_v1_snapshot(
+            snapshot, capture_meta, capture_scope = _capture_v1_snapshot(
                 root=root,
                 store=catalog_store,
                 runtime_config=runtime_config,
@@ -523,7 +564,26 @@ def create_app(
         payload = snapshot.model_dump(mode="json")
         if capture_meta is not None:
             payload["capture"] = capture_meta
+        payload["capture_scope"] = [entry.model_dump(mode="json") for entry in capture_scope]
         return payload
+
+    @app.get("/api/v1/repository", response_model=V1RepositoryResponse)
+    def repository_v1(
+        path: str | None = None,
+        refresh: bool = False,
+        confirm_read_only: bool = False,
+    ) -> V1RepositoryResponse:
+        try:
+            return _repository_payload(
+                store=catalog_store,
+                runtime_config=runtime_config,
+                path=path,
+                refresh=refresh,
+                confirm_read_only=confirm_read_only,
+                bw_client_factory=bw_client_factory,
+            )
+        except Exception as exc:
+            raise _live_http_error(exc, state=runtime_config.bw) from exc
 
     @app.get("/api/v1/snapshots", response_model=V1SnapshotListResponse)
     def list_snapshots_v1() -> V1SnapshotListResponse:
@@ -538,7 +598,42 @@ def create_app(
         snapshot = catalog_store.get_snapshot(snapshot_id)
         if snapshot is None:
             raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
-        return snapshot.model_dump(mode="json")
+        payload = snapshot.model_dump(mode="json")
+        payload["capture_scope"] = [
+            entry.model_dump(mode="json") for entry in catalog_store.list_capture_scope(snapshot_id)
+        ]
+        return payload
+
+    @app.get(
+        "/api/v1/snapshots/{snapshot_id}/capture-scope",
+        response_model=V1CaptureScopeResponse,
+    )
+    def get_snapshot_capture_scope_v1(snapshot_id: str) -> V1CaptureScopeResponse:
+        if catalog_store.get_snapshot(snapshot_id) is None:
+            raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
+        return V1CaptureScopeResponse(
+            snapshot_id=snapshot_id,
+            items=[
+                entry.model_dump(mode="json")
+                for entry in catalog_store.list_capture_scope(snapshot_id)
+            ],
+        )
+
+    @app.get("/api/v1/snapshots/{snapshot_id}/glossary", response_model=V1GlossaryResponse)
+    def glossary_v1(
+        snapshot_id: str,
+        query: str | None = None,
+        limit: int = 50,
+    ) -> V1GlossaryResponse:
+        if catalog_store.get_snapshot(snapshot_id) is None:
+            raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
+        terms = catalog_store.list_glossary_terms(snapshot_id, query=query, limit=limit)
+        return V1GlossaryResponse(
+            snapshot_id=snapshot_id,
+            query=query,
+            count=len(terms),
+            items=[term.model_dump(mode="json") for term in terms],
+        )
 
     @app.get("/api/v1/snapshots/{snapshot_id}/objects", response_model=V1ObjectListResponse)
     def list_snapshot_objects_v1(
@@ -649,9 +744,14 @@ def create_app(
         try:
             _ensure_snapshot_exists(catalog_store, snapshot_id)
             result = _parse_v1_sql(root, request)
+            return _sql_explain_payload(
+                result,
+                output_format=request.format,
+                store=catalog_store,
+                snapshot_id=snapshot_id,
+            )
         except Exception as exc:
             raise _http_error(exc) from exc
-        return _sql_explain_payload(result, output_format=request.format)
 
     @app.post("/api/v1/snapshots/{snapshot_id}/sql/draft")
     def sql_draft_v1(snapshot_id: str, request: V1SqlDraftRequest) -> dict[str, object]:
@@ -747,7 +847,6 @@ def create_app(
                 client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
                 search_term=request.search_term,
                 object_name=request.object_name,
-                xref_direction=request.xref_direction,
                 dataflow_object_type=request.object_type,
                 dataflow_source_system=request.source_system,
                 dataflow_direction=request.dataflow_direction,
@@ -770,7 +869,6 @@ def create_app(
                 object_names=request.object_names,
                 include_dataflow=request.include_dataflow,
                 include_xref=request.include_xref,
-                xref_direction=request.xref_direction,
                 dataflow_object_type=request.object_type,
                 dataflow_source_system=request.source_system,
                 dataflow_direction=request.dataflow_direction,
@@ -829,46 +927,54 @@ def create_default_app() -> FastAPI:
     return create_app(project_root=project_root, static_dir=static_dir)
 
 
-def _initial_runtime_config() -> RuntimeConfigState:
+def _initial_runtime_config(env: Mapping[str, str]) -> RuntimeConfigState:
+    bw = _env_bw_state(env)
     return RuntimeConfigState(
-        bw=_env_bw_state(),
-        llm=_env_llm_state(),
+        connection_status="untested" if bw.configured else "unconfigured",
+        bw=bw,
+        llm=_env_llm_state(env),
     )
 
 
 def _clear_runtime_config(state: RuntimeConfigState) -> None:
+    state.connection_status = "unconfigured"
     state.bw = RuntimeBwConfigState()
     state.llm = RuntimeLlmConfigState()
 
 
-def _reset_runtime_config(state: RuntimeConfigState) -> None:
-    state.bw = _env_bw_state()
-    state.llm = _env_llm_state()
+def _reset_runtime_config(state: RuntimeConfigState, env: Mapping[str, str]) -> None:
+    state.bw = _env_bw_state(env)
+    state.connection_status = "untested" if state.bw.configured else "unconfigured"
+    state.llm = _env_llm_state(env)
 
 
-def _env_bw_state() -> RuntimeBwConfigState:
-    required = ("BW_URL", "BW_USER", "BW_PASSWORD", "BW_CLIENT")
-    if any(not _has_text(os.environ.get(name)) for name in required):
+def _env_bw_state(env: Mapping[str, str]) -> RuntimeBwConfigState:
+    required = ("BW_URL", "BW_USER", "BW_CLIENT")
+    if any(not _has_text(env.get(name)) for name in required):
+        return RuntimeBwConfigState()
+    if not _has_secret_text(env.get("BW_PASSWORD")):
         return RuntimeBwConfigState()
     return RuntimeBwConfigState(
         source="env",
         configured=True,
-        url=os.environ["BW_URL"].strip(),
-        user=os.environ["BW_USER"].strip(),
-        password=os.environ["BW_PASSWORD"],
-        client=os.environ["BW_CLIENT"].strip(),
-        language=os.environ.get("BW_LANGUAGE", "EN").strip() or "EN",
-        verify_ssl=_env_bool("BW_VERIFY_SSL", default=True),
-        ca_bundle=_optional_env("BW_CA_BUNDLE"),
-        trust_env=_env_bool("BW_TRUST_ENV", default=True),
+        url=env["BW_URL"].strip(),
+        user=env["BW_USER"].strip(),
+        password=env["BW_PASSWORD"],
+        client=env["BW_CLIENT"].strip(),
+        language=env.get("BW_LANGUAGE", "EN").strip() or "EN",
+        verify_ssl=_env_bool(env, "BW_VERIFY_SSL", default=True),
+        ca_bundle=_optional_env(env, "BW_CA_BUNDLE"),
+        trust_env=_env_bool(env, "BW_TRUST_ENV", default=True),
     )
 
 
-def _env_llm_state() -> RuntimeLlmConfigState:
+def _env_llm_state(env: Mapping[str, str]) -> RuntimeLlmConfigState:
     required = ("BWLI_LLM_BASE_URL", "BWLI_LLM_MODEL", "BWLI_LLM_API_KEY")
-    if any(not _has_text(os.environ.get(name)) for name in required):
+    if any(not _has_text(env.get(name)) for name in required[:-1]):
         return RuntimeLlmConfigState()
-    base_url = os.environ["BWLI_LLM_BASE_URL"].strip()
+    if not _has_secret_text(env.get("BWLI_LLM_API_KEY")):
+        return RuntimeLlmConfigState()
+    base_url = env["BWLI_LLM_BASE_URL"].strip()
     try:
         validate_local_llm_base_url(base_url)
     except ConfigError:
@@ -878,14 +984,17 @@ def _env_llm_state() -> RuntimeLlmConfigState:
         enabled=True,
         configured=True,
         base_url=base_url,
-        model=os.environ["BWLI_LLM_MODEL"].strip(),
-        api_key=os.environ["BWLI_LLM_API_KEY"],
+        model=env["BWLI_LLM_MODEL"].strip(),
+        api_key=env["BWLI_LLM_API_KEY"],
     )
 
 
 def _apply_runtime_config(state: RuntimeConfigState, request: RuntimeConfigRequest) -> None:
+    previous_bw = state.bw
+    previous_connection_status = state.connection_status
     new_bw = state.bw
     new_llm = state.llm
+    bw_requested = request.bw is not None
 
     if request.bw is not None:
         new_bw = _build_bw_state(request.bw, previous=state.bw)
@@ -895,6 +1004,46 @@ def _apply_runtime_config(state: RuntimeConfigState, request: RuntimeConfigReque
 
     state.bw = new_bw
     state.llm = new_llm
+    if bw_requested:
+        if not new_bw.configured:
+            state.connection_status = "unconfigured"
+        elif (
+            previous_connection_status == "ok"
+            and previous_bw.configured
+            and _bw_materially_changed(previous_bw, new_bw)
+        ):
+            state.connection_status = "stale"
+        elif previous_connection_status == "ok" and not _bw_materially_changed(
+            previous_bw, new_bw
+        ):
+            state.connection_status = "ok"
+        else:
+            state.connection_status = "untested"
+
+
+def _bw_materially_changed(
+    previous: RuntimeBwConfigState,
+    new: RuntimeBwConfigState,
+) -> bool:
+    return (
+        previous.url,
+        previous.user,
+        previous.password,
+        previous.client,
+        previous.language,
+        previous.verify_ssl,
+        previous.ca_bundle,
+        previous.trust_env,
+    ) != (
+        new.url,
+        new.user,
+        new.password,
+        new.client,
+        new.language,
+        new.verify_ssl,
+        new.ca_bundle,
+        new.trust_env,
+    )
 
 
 def _build_bw_state(
@@ -978,25 +1127,79 @@ def _has_text(value: str | None) -> bool:
     return value is not None and bool(value.strip())
 
 
+def _has_secret_text(value: str | None) -> bool:
+    return _has_text(value) and not _is_redacted_marker(value)
+
+
 def _coalesce_secret(candidate: str | None, previous: str | None) -> str | None:
-    if _has_text(candidate):
+    if _has_secret_text(candidate):
         assert candidate is not None
-        return candidate
-    if _has_text(previous):
+        return candidate.strip()
+    if _has_secret_text(previous):
         assert previous is not None
         return previous
     return None
 
 
-def _env_bool(name: str, *, default: bool) -> bool:
-    value = os.environ.get(name)
+def _is_redacted_marker(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().upper() in {"[REDACTED]", "[REACTED]"}
+
+
+def _merged_runtime_env(root: Path) -> dict[str, str]:
+    env = _load_project_env_file(root)
+    env.update(os.environ)
+    return env
+
+
+def _load_project_env_file(root: Path) -> dict[str, str]:
+    env_file = root / ".env"
+    if not env_file.exists() or not env_file.is_file():
+        return {}
+    return _parse_env_file(env_file)
+
+
+def _parse_env_file(env_file: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").strip()
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not _is_supported_env_key(key):
+            continue
+        values[key] = _parse_env_value(raw_value)
+    return values
+
+
+def _is_supported_env_key(key: str) -> bool:
+    return key.startswith("BW_") or key.startswith("BWLI_LLM_") or key in {"NO_PROXY", "no_proxy"}
+
+
+def _parse_env_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if value[0] == value[-1:] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def _env_bool(env: Mapping[str, str], name: str, *, default: bool) -> bool:
+    value = env.get(name)
     if value is None or not value.strip():
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _optional_env(name: str) -> str | None:
-    value = os.environ.get(name)
+def _optional_env(env: Mapping[str, str], name: str) -> str | None:
+    value = env.get(name)
     if value is None or not value.strip():
         return None
     return value.strip()
@@ -1038,6 +1241,50 @@ def _ensure_live_ready(state: RuntimeConfigState, confirm_read_only: bool) -> Ru
             detail="confirm_read_only=true is required before live BW calls",
         )
     return state.bw
+
+
+def _repository_payload(
+    *,
+    store: CatalogStore,
+    runtime_config: RuntimeConfigState,
+    path: str | None,
+    refresh: bool,
+    confirm_read_only: bool,
+    bw_client_factory: BwClientFactory | None,
+) -> V1RepositoryResponse:
+    normalized_path = normalize_repository_path(path)
+    if refresh:
+        state = _ensure_live_ready(runtime_config, confirm_read_only)
+        if runtime_config.connection_status != "ok":
+            raise ValueError("run a successful Test connection before repository refresh")
+        client = _build_runtime_bw_client(state, bw_client_factory)
+        try:
+            payload = client.fetch_repository_contents(normalized_path)
+        finally:
+            client.close()
+        if not isinstance(payload, str):
+            raise ValueError("repository refresh response is not XML text")
+        nodes = parse_repository_contents_xml(payload, parent_path=normalized_path)
+        cached = store.replace_repository_nodes(parent_path=normalized_path, nodes=nodes)
+        return V1RepositoryResponse(
+            path=normalized_path,
+            source="live",
+            count=len(cached),
+            items=[node.model_dump(mode="json") for node in cached],
+        )
+
+    cached = store.list_repository_nodes(parent_path=normalized_path)
+    return V1RepositoryResponse(
+        path=normalized_path,
+        source="cache" if cached else "empty",
+        count=len(cached),
+        items=[node.model_dump(mode="json") for node in cached],
+        action_required=(
+            None
+            if cached
+            else "refresh=true with confirm_read_only=true after Test connection"
+        ),
+    )
 
 
 def _build_runtime_bw_client(
@@ -1097,7 +1344,7 @@ def _capture_v1_snapshot(
     runtime_config: RuntimeConfigState,
     request: V1SnapshotCaptureRequest,
     bw_client_factory: BwClientFactory | None,
-) -> tuple[CatalogSnapshotRecord, dict[str, object] | None]:
+) -> tuple[CatalogSnapshotRecord, dict[str, object] | None, list[CaptureScopeRecord]]:
     if request.fixture_path:
         fixture_path = _resolve_local_path(root, request.fixture_path)
         payload = json.loads(fixture_path.read_text(encoding="utf-8"))
@@ -1106,15 +1353,18 @@ def _capture_v1_snapshot(
             mode="offline-fixture",
             source=f"fixture://{fixture_path.name}",
         )
-        return (
-            _replace_catalog_or_delete_snapshot(
-                store,
-                snapshot.id,
-                objects=ingested.objects,
-                edges=ingested.edges,
-            ),
-            None,
+        record = _replace_catalog_or_delete_snapshot(
+            store,
+            snapshot.id,
+            objects=ingested.objects,
+            edges=ingested.edges,
         )
+        scope = _replace_scope_or_delete_snapshot(
+            store,
+            snapshot.id,
+            _discovered_scope_entries(ingested.objects),
+        )
+        return (record, None, scope)
 
     if request.manifest_path:
         manifest_path = _resolve_local_manifest_path(root, request.manifest_path)
@@ -1124,17 +1374,22 @@ def _capture_v1_snapshot(
             source=f"manifest://{manifest_path.name}",
             manifest_path=_project_relative_path(root, manifest_path),
         )
-        return (
-            _replace_catalog_or_delete_snapshot(
-                store,
-                snapshot.id,
-                objects=ingested.objects,
-                edges=ingested.edges,
-            ),
-            None,
+        record = _replace_catalog_or_delete_snapshot(
+            store,
+            snapshot.id,
+            objects=ingested.objects,
+            edges=ingested.edges,
         )
+        scope = _replace_scope_or_delete_snapshot(
+            store,
+            snapshot.id,
+            _discovered_scope_entries(ingested.objects),
+        )
+        return (record, None, scope)
 
     state = _ensure_live_ready(runtime_config, request.confirm_read_only)
+    if runtime_config.connection_status != "ok":
+        raise ValueError("run a successful Test connection before live capture")
     out_dir = _resolve_local_output_dir(root, _live_snapshot_output_dir())
     if not request.search_terms and not request.object_names:
         raise ValueError("live capture requires at least one search term or object name")
@@ -1145,7 +1400,6 @@ def _capture_v1_snapshot(
         object_names=request.object_names,
         include_dataflow=request.include_dataflow,
         include_xref=request.include_xref,
-        xref_direction=request.xref_direction,
         dataflow_object_type=request.object_type,
         dataflow_source_system=request.source_system,
         dataflow_direction=request.dataflow_direction,
@@ -1171,7 +1425,18 @@ def _capture_v1_snapshot(
         "failed": result.failed,
         "operations": [op.model_dump(mode="json") for op in result.operations],
     }
-    return record, capture_meta
+    scope_entries = [
+        *_selected_scope_entries(
+            request.object_names,
+            object_type=request.object_type,
+            include_dataflow=request.include_dataflow,
+            include_xref=request.include_xref,
+            operations=result.operations,
+        ),
+        *_discovered_scope_entries(ingested.objects),
+    ]
+    capture_scope = _replace_scope_or_delete_snapshot(store, snapshot.id, scope_entries)
+    return record, capture_meta, capture_scope
 
 
 def _replace_catalog_or_delete_snapshot(
@@ -1186,6 +1451,139 @@ def _replace_catalog_or_delete_snapshot(
     except Exception:
         store.delete_snapshot(snapshot_id)
         raise
+
+
+def _replace_scope_or_delete_snapshot(
+    store: CatalogStore,
+    snapshot_id: str,
+    entries: Sequence[CaptureScopeRecord],
+) -> list[CaptureScopeRecord]:
+    try:
+        return store.replace_capture_scope(snapshot_id, entries)
+    except Exception:
+        store.delete_snapshot(snapshot_id)
+        raise
+
+
+def _selected_scope_entries(
+    object_names: Sequence[str],
+    *,
+    object_type: str,
+    include_dataflow: bool,
+    include_xref: bool,
+    operations: Sequence[object],
+) -> list[CaptureScopeRecord]:
+    entries: list[CaptureScopeRecord] = []
+    for object_name in _unique_texts(object_names):
+        if include_dataflow:
+            entries.append(
+                _scope_entry_from_operations(
+                    object_name,
+                    object_type=object_type,
+                    operation="bw_get_dataflow",
+                    operations=operations,
+                )
+            )
+        if include_xref:
+            entries.append(
+                _scope_entry_from_operations(
+                    object_name,
+                    object_type=object_type,
+                    operation="bw_xref",
+                    operations=operations,
+                )
+            )
+    return entries
+
+
+def _scope_entry_from_operations(
+    object_name: str,
+    *,
+    object_type: str,
+    operation: str,
+    operations: Sequence[object],
+) -> CaptureScopeRecord:
+    matching = [
+        op
+        for op in operations
+        if getattr(op, "name", "") == operation
+        and f"objectName={object_name}" in getattr(op, "label", "")
+    ]
+    if not matching:
+        return CaptureScopeRecord(
+            object_id=object_name,
+            object_type=object_type,
+            role="selected",
+            operation=operation,
+            status="skipped",
+        )
+    op = matching[0]
+    ok = bool(getattr(op, "ok", False))
+    return CaptureScopeRecord(
+        object_id=object_name,
+        object_type=object_type,
+        role="selected",
+        operation=operation,
+        status="ok" if ok else "error",
+        error=None if ok else _persistable_error(getattr(op, "error", None)),
+        metadata={
+            key: value
+            for key, value in {
+                "label": getattr(op, "label", None),
+                "payload_kind": getattr(op, "payload_kind", None),
+                "item_count": getattr(op, "item_count", None),
+            }.items()
+            if value is not None
+        },
+    )
+
+
+def _persistable_error(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if not text.strip():
+        return None
+    # User-visible live operation errors may contain already-redacted fragments
+    # such as ``token=[REDACTED]``. The local catalog guard intentionally rejects
+    # credential-shaped text, so collapse the credential key/value syntax before
+    # persisting capture-scope metadata. The full redacted operation text still
+    # remains in the immediate HTTP response.
+    text = re.sub(
+        r"(?i)(authorization|password|passwd|pwd|secret|token|api[_-]?key|credential)\s*[:=]\s*\[REDACTED\]",
+        "[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)Bearer\s+\[REDACTED\]", "Bearer [REDACTED]", text)
+    return text
+
+
+def _discovered_scope_entries(
+    objects: Sequence[CatalogObjectRecord],
+) -> list[CaptureScopeRecord]:
+    return [
+        CaptureScopeRecord(
+            object_id=item.id,
+            object_type=item.type,
+            role="discovered",
+            operation="catalog_ingest",
+            status="ok",
+            evidence_ids=item.evidence_ids,
+        )
+        for item in objects
+    ]
+
+
+def _unique_texts(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def _project_relative_path(root: Path, path: Path) -> str:
@@ -1358,6 +1756,7 @@ def _run_v1_impact_scenario(
         if finding.impacted_object_id not in allowed_node_ids:
             continue
         evidence_ids = sorted({*finding.evidence_node_ids, *finding.evidence_edge_ids})
+        glossary_terms = _glossary_terms_for_object(store, snapshot_id, finding.impacted_object_id)
         affected.append(
             {
                 "object_id": finding.impacted_object_id,
@@ -1369,6 +1768,7 @@ def _run_v1_impact_scenario(
                 "evidence_node_ids": finding.evidence_node_ids,
                 "evidence_edge_ids": finding.evidence_edge_ids,
                 "manual_verification": finding.manual_verification,
+                "glossary_terms": [term.model_dump(mode="json") for term in glossary_terms],
             }
         )
     affected.sort(key=lambda item: (severity_order[str(item["severity"])], str(item["object_id"])))
@@ -1472,22 +1872,84 @@ def _sql_explain_payload(
     result: SqlParseResult,
     *,
     output_format: EvidenceFormat,
+    store: CatalogStore,
+    snapshot_id: str,
 ) -> dict[str, object]:
     rendered = render_sql_view_evidence(result, output_format=output_format)
     citations = _sql_citations(result)
+    referenced_objects = _sql_referenced_objects(result)
+    referenced_fields = _sql_referenced_fields(result)
+    store.record_sql_analysis(
+        snapshot_id,
+        view_id=result.view.id,
+        reference_object_ids=referenced_objects,
+        column_names=[str(item["column_name"]) for item in referenced_fields],
+        citation_ids=citations,
+    )
     return {
         "schema_version": "1.0",
         "advisory": True,
         "execution_blocked": True,
         "execution_disabled_warning": (
-            "SQL Assistant는 parse/draft만 수행하며 database execution은 비활성입니다."
+            "SQL Analysis는 parse/reference extraction만 수행하며 "
+            "database execution은 비활성입니다."
         ),
         "target": "native_sql_view",
         "format": output_format,
         "content": rendered,
         "result": result.model_dump(mode="json"),
         "citations": citations,
+        "referenced_objects": referenced_objects,
+        "referenced_fields": referenced_fields,
+        "glossary_terms": [
+            term.model_dump(mode="json")
+            for term in store.list_glossary_terms(snapshot_id, query=None, limit=50)
+            if term.source == "sql_evidence"
+        ],
     }
+
+
+def _sql_referenced_objects(result: SqlParseResult) -> list[str]:
+    seen: set[str] = set()
+    values: list[str] = []
+    for edge in result.reference_edges:
+        object_id = edge.source_object_id.strip()
+        if not object_id or object_id in seen:
+            continue
+        seen.add(object_id)
+        values.append(object_id)
+    return values
+
+
+def _sql_referenced_fields(result: SqlParseResult) -> list[dict[str, object]]:
+    fields: list[dict[str, object]] = []
+    for column in result.columns:
+        fields.append(
+            {
+                "id": column.id,
+                "table_alias": column.table_alias,
+                "column_name": column.column_name,
+                "expression": column.expression,
+            }
+        )
+    return fields
+
+
+def _glossary_terms_for_object(
+    store: CatalogStore,
+    snapshot_id: str,
+    object_id: str,
+) -> list[GlossaryTermRecord]:
+    terms = store.list_glossary_terms(snapshot_id, query=None, object_id=object_id, limit=12)
+    priority = {"name": 0, "label": 1, "description": 2, "technical_id": 3}
+    return sorted(
+        terms,
+        key=lambda term: (
+            priority.get(str(term.metadata.get("source_field", "")), 9),
+            term.term.lower(),
+            term.id,
+        ),
+    )
 
 
 def _sql_draft_payload(

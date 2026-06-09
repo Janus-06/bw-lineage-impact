@@ -83,6 +83,191 @@ def test_v1_runtime_config_auto_seeds_env_and_clear_falls_back(
     assert "env-secret-value" not in cleared.text
 
 
+def test_v1_runtime_config_loads_project_dotenv_as_startup_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    for name in [
+        "BW_URL",
+        "BW_USER",
+        "BW_PASSWORD",
+        "BW_CLIENT",
+        "BW_LANGUAGE",
+        "BW_VERIFY_SSL",
+        "BW_TRUST_ENV",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / ".env"
+    original_env = "\n".join(
+        [
+            'BW_URL="https://dotenv.example.invalid"',
+            "BW_USER=dotenv-user",
+            "BW_PASSWORD=dotenv-secret-value",
+            "BW_CLIENT=300",
+            "BW_LANGUAGE=KO",
+            "BW_VERIFY_SSL=false",
+            "BW_TRUST_ENV=false",
+        ]
+    )
+    env_file.write_text(original_env + "\n", encoding="utf-8")
+
+    client = TestClient(create_app(project_root=tmp_path))
+    seeded = client.get("/api/v1/runtime-config")
+
+    assert seeded.status_code == 200
+    payload = seeded.json()
+    assert payload["bw"]["configured"] is True
+    assert payload["bw"]["source"] == "env"
+    assert payload["bw"]["url"] == "https://dotenv.example.invalid"
+    assert payload["bw"]["user"] == "dotenv-user"
+    assert payload["bw"]["client"] == "300"
+    assert payload["bw"]["language"] == "KO"
+    assert payload["bw"]["verify_ssl"] is False
+    assert payload["bw"]["trust_env"] is False
+    assert payload["bw"]["password"] == "[REDACTED]"
+    assert "dotenv-secret-value" not in seeded.text
+
+    overridden = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://ui.example.invalid",
+                "user": "ui-user",
+                "password": "ui-secret-value",
+                "client": "200",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert overridden.status_code == 200
+    assert overridden.json()["bw"]["source"] == "ui"
+    assert env_file.read_text(encoding="utf-8") == original_env + "\n"
+
+    cleared = client.delete("/api/v1/runtime-config")
+
+    assert cleared.status_code == 200
+    assert cleared.json()["bw"]["source"] == "env"
+    assert cleared.json()["bw"]["user"] == "dotenv-user"
+    assert env_file.read_text(encoding="utf-8") == original_env + "\n"
+
+
+@pytest.mark.parametrize("marker", ["[REDACTED]", "[REACTED]"])
+def test_v1_runtime_config_rejects_secret_placeholder_without_prior_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    client = TestClient(create_app(project_root=tmp_path))
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": marker,
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert "password" in response.text
+    assert client.get("/api/v1/runtime-config").json()["bw"]["configured"] is False
+
+
+@pytest.mark.parametrize("marker", ["[REDACTED]", "[REACTED]"])
+def test_v1_runtime_config_reuses_existing_secret_when_ui_resubmits_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    captured_passwords: list[str | None] = []
+
+    class FakeBwClient:
+        def fetch_search(
+            self,
+            search_term: str,
+            *,
+            object_type: str | None = None,
+        ) -> dict[str, object]:
+            return {"term": search_term, "objects": []}
+
+        def fetch_dataflow(
+            self,
+            object_name: str,
+            *,
+            object_type: str = "ADSO",
+            source_system: str | None = None,
+            direction: str = "downwards",
+            levels: int = 3,
+        ) -> str:
+            return "<dmod:dataFlow />"
+
+        def fetch_xref(
+            self,
+            object_name: str,
+            *,
+            object_type: str = "ADSO",
+            source_system: str | None = None,
+        ) -> dict[str, object]:
+            return {"references": []}
+
+        def close(self) -> None:
+            return None
+
+    def factory(state) -> FakeBwClient:
+        captured_passwords.append(state.password)
+        return FakeBwClient()
+
+    client = TestClient(create_app(project_root=tmp_path, bw_client_factory=factory))
+    configured = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": "actual-secret-value",
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert configured.status_code == 200
+
+    resubmitted = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user-renamed",
+                "password": marker,
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert resubmitted.status_code == 200, resubmitted.text
+    assert resubmitted.json()["bw"]["user"] == "fixture-user-renamed"
+    assert "actual-secret-value" not in resubmitted.text
+
+    connection = client.post(
+        "/api/v1/connection/test",
+        json={"confirm_read_only": True, "search_term": "Z*"},
+    )
+
+    assert connection.status_code == 200
+    assert captured_passwords == ["actual-secret-value"]
+
+
 def test_v1_snapshot_capture_indexes_fixture_objects_and_edges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -108,6 +293,32 @@ def test_v1_snapshot_capture_indexes_fixture_objects_and_edges(
     assert detail.status_code == 200
     assert detail.json()["incoming_count"] == 1
     assert detail.json()["outgoing_count"] == 1
+
+
+def test_v1_snapshot_glossary_lists_metadata_seed_terms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.get(
+        f"/api/v1/snapshots/{snapshot_id}/glossary",
+        params={"query": "sales"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["snapshot_id"] == snapshot_id
+    assert payload["query"] == "sales"
+    assert payload["count"] >= 2
+    by_term = {item["term"]: item for item in payload["items"]}
+    assert by_term["Sales Query"]["source"] == "metadata"
+    assert by_term["Sales Query"]["candidate"] is True
+    assert by_term["Sales Query"]["object_id"] == "QRY"
+    assert by_term["Sales Query"]["object_type"] == "QUERY"
+    assert by_term["Sales Query"]["field_name"] is None
+    assert by_term["Sales Query"]["evidence_ids"]
 
 
 def test_v1_manifest_capture_stores_project_relative_manifest_path(
@@ -222,6 +433,8 @@ def test_v1_scenario_impact_is_deterministic_without_changes_path(
     assert affected_ids == ["QRY", "TGT", "TR"]
     assert {item["severity"] for item in payload["affected_objects"]} == {"HIGH"}
     assert all(item["evidence_ids"] for item in payload["affected_objects"])
+    query_item = next(item for item in payload["affected_objects"] if item["object_id"] == "QRY")
+    assert query_item["glossary_terms"][0]["term"] == "Sales Query"
 
 
 def test_v1_scenario_impact_applies_lineage_caps_before_analysis(
@@ -272,6 +485,17 @@ def test_v1_sql_assistant_explains_view_and_disables_draft_without_local_llm(
     assert explain_payload["execution_blocked"] is True
     assert explain_payload["result"]["view"]["id"] == "ZSQL_VIEW"
     assert explain_payload["citations"]
+    assert explain_payload["referenced_objects"]
+    assert explain_payload["referenced_fields"]
+    assert "glossary_terms" in explain_payload
+
+    catalog = CatalogStore(tmp_path / "bwli-home" / "catalog.sqlite")
+    with catalog._connect() as con:
+        count = con.execute(
+            "SELECT count(*) FROM analysis_runs WHERE snapshot_id = ? AND kind = ?",
+            (snapshot_id, "sql_explain"),
+        ).fetchone()[0]
+    assert count == 1
 
     draft = client.post(
         f"/api/v1/snapshots/{snapshot_id}/sql/draft",
@@ -643,7 +867,11 @@ def test_v1_live_capture_named_objects_does_not_run_wildcard_search(
             """
 
         def fetch_xref(
-            self, object_name: str, *, direction: str = "downstream"
+            self,
+            object_name: str,
+            *,
+            object_type: str = "ADSO",
+            source_system: str | None = None,
         ) -> dict[str, object]:
             calls.append(("xref", object_name))
             return {"references": []}
@@ -667,6 +895,22 @@ def test_v1_live_capture_named_objects_does_not_run_wildcard_search(
         },
     )
     assert configured.status_code == 200, configured.text
+    assert configured.json()["connection_status"] == "untested"
+
+    blocked = client.post(
+        "/api/v1/snapshots/capture",
+        json={"confirm_read_only": True, "object_names": ["ZADSO"]},
+    )
+    assert blocked.status_code == 400
+    assert "Test connection" in blocked.text
+
+    connection = client.post(
+        "/api/v1/connection/test",
+        json={"confirm_read_only": True, "search_term": "Z*"},
+    )
+    assert connection.status_code == 200, connection.text
+    assert client.get("/api/v1/runtime-config").json()["connection_status"] == "ok"
+    calls.clear()
 
     response = client.post(
         "/api/v1/snapshots/capture",
@@ -675,7 +919,48 @@ def test_v1_live_capture_named_objects_does_not_run_wildcard_search(
 
     assert response.status_code == 200, response.text
     assert response.json()["object_count"] == 1
+    assert response.json()["capture_scope"][0]["object_id"] == "ZADSO"
+    assert response.json()["capture_scope"][0]["role"] == "selected"
     assert calls == [("dataflow", "ZADSO"), ("xref", "ZADSO")]
+
+    unchanged = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "user",
+                "password": "[REDACTED]",
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["connection_status"] == "ok"
+
+    changed = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "user",
+                "password": "[REDACTED]",
+                "client": "100",
+                "language": "KO",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["connection_status"] == "stale"
+
+    blocked_after_change = client.post(
+        "/api/v1/snapshots/capture",
+        json={"confirm_read_only": True, "object_names": ["ZADSO"]},
+    )
+    assert blocked_after_change.status_code == 400
+    assert "Test connection" in blocked_after_change.text
 
 
 def test_v1_failed_fixture_capture_deletes_empty_snapshot_row(

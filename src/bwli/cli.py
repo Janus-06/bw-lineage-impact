@@ -88,7 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--xref-direction",
         choices=["upstream", "downstream"],
         default="downstream",
-        help="Xref direction for live collection.",
+        help=argparse.SUPPRESS,
     )
     collect.add_argument(
         "--skip-dataflow",
@@ -276,7 +276,6 @@ def _collect(args: argparse.Namespace) -> int:
                 object_names=args.objects,
                 include_dataflow=not args.skip_dataflow,
                 include_xref=not args.skip_xref,
-                xref_direction=args.xref_direction,
                 dataflow_object_type=args.object_type,
                 dataflow_source_system=args.source_system,
                 dataflow_direction=args.dataflow_direction,

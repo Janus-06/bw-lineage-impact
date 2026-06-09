@@ -7,7 +7,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree as ET
 
@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from bwli.dataflow import parse_dataflow_xml
 from bwli.graph import BwEdge, BwGraph, BwNode
+from bwli.repository import RepositoryNodeRecord, normalize_repository_path
 from bwli.snapshot import SnapshotManifest, SnapshotReader
 from bwli.store.secret_guard import assert_no_persisted_secrets
 
@@ -49,6 +50,7 @@ class CatalogObjectRecord(BaseModel):
 class CatalogObjectDetail(CatalogObjectRecord):
     incoming_count: int = 0
     outgoing_count: int = 0
+    glossary_terms: list[dict[str, object]] = Field(default_factory=list)
 
 
 class CatalogEdgeRecord(BaseModel):
@@ -61,6 +63,34 @@ class CatalogEdgeRecord(BaseModel):
     confidence: str = "unknown"
     metadata: JsonDict = Field(default_factory=dict)
     evidence_ids: list[str] = Field(default_factory=list)
+
+
+class CaptureScopeRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object_id: str
+    object_type: str = "UNKNOWN"
+    role: Literal["selected", "discovered"] = "discovered"
+    operation: str = "catalog"
+    status: Literal["selected", "ok", "error", "skipped"] = "ok"
+    error: str | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+    metadata: JsonDict = Field(default_factory=dict)
+
+
+class GlossaryTermRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    term: str
+    normalized_term: str
+    source: str = "metadata"
+    candidate: bool = True
+    object_id: str | None = None
+    object_type: str | None = None
+    field_name: str | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+    metadata: JsonDict = Field(default_factory=dict)
 
 
 class IngestedCatalog(BaseModel):
@@ -174,6 +204,7 @@ class CatalogStore:
                 "UPDATE snapshots SET object_count = ?, edge_count = ? WHERE id = ?",
                 (len(object_records), len(edge_records), snapshot_id),
             )
+            _replace_metadata_glossary_terms(con, snapshot_id, object_records)
         snapshot = self.get_snapshot(snapshot_id)
         if snapshot is None:
             raise KeyError(f"snapshot not found after write: {snapshot_id}")
@@ -198,6 +229,121 @@ class CatalogStore:
     def delete_snapshot(self, snapshot_id: str) -> None:
         with self._connect() as con:
             con.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+
+    def replace_repository_nodes(
+        self,
+        *,
+        parent_path: str | None,
+        nodes: Sequence[RepositoryNodeRecord],
+    ) -> list[RepositoryNodeRecord]:
+        normalized_parent = normalize_repository_path(parent_path)
+        cached_at = datetime.now(UTC).isoformat()
+        assert_no_persisted_secrets(
+            {
+                "parent_path": normalized_parent,
+                "nodes": [node.model_dump(mode="json") for node in nodes],
+            }
+        )
+        with self._connect() as con:
+            con.execute("DELETE FROM repository_nodes WHERE parent_path = ?", (normalized_parent,))
+            con.executemany(
+                """
+                INSERT INTO repository_nodes(
+                    parent_path, node_id, path, name, description, object_type,
+                    object_subtype, status, has_children, self_url, fiori_only,
+                    children_path, metadata_json, cached_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        normalized_parent,
+                        item.id,
+                        item.path,
+                        item.name,
+                        item.description,
+                        item.object_type,
+                        item.object_subtype,
+                        item.status,
+                        1 if item.has_children else 0,
+                        item.self_url,
+                        1 if item.fiori_only else 0,
+                        item.children_path,
+                        _json_dumps(item.metadata),
+                        cached_at,
+                    )
+                    for item in nodes
+                ],
+            )
+        return self.list_repository_nodes(parent_path=normalized_parent)
+
+    def list_repository_nodes(self, *, parent_path: str | None) -> list[RepositoryNodeRecord]:
+        normalized_parent = normalize_repository_path(parent_path)
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT parent_path, node_id, path, name, description, object_type,
+                    object_subtype, status, has_children, self_url, fiori_only,
+                    children_path, metadata_json
+                FROM repository_nodes
+                WHERE parent_path = ?
+                ORDER BY has_children DESC, object_type, name, path
+                """,
+                (normalized_parent,),
+            ).fetchall()
+        return [_repository_node_from_row(row) for row in rows]
+
+    def replace_capture_scope(
+        self,
+        snapshot_id: str,
+        entries: Sequence[CaptureScopeRecord],
+    ) -> list[CaptureScopeRecord]:
+        assert_no_persisted_secrets(
+            {
+                "snapshot_id": snapshot_id,
+                "capture_scope": [entry.model_dump(mode="json") for entry in entries],
+            }
+        )
+        with self._connect() as con:
+            if self._get_snapshot(con, snapshot_id) is None:
+                raise KeyError(f"snapshot not found: {snapshot_id}")
+            con.execute("DELETE FROM capture_scope WHERE snapshot_id = ?", (snapshot_id,))
+            con.executemany(
+                """
+                INSERT INTO capture_scope(
+                    snapshot_id, object_id, object_type, role, operation, status, error,
+                    evidence_ids_json, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        snapshot_id,
+                        entry.object_id,
+                        entry.object_type,
+                        entry.role,
+                        entry.operation,
+                        entry.status,
+                        entry.error,
+                        _json_dumps(entry.evidence_ids),
+                        _json_dumps(entry.metadata),
+                    )
+                    for entry in entries
+                ],
+            )
+        return self.list_capture_scope(snapshot_id)
+
+    def list_capture_scope(self, snapshot_id: str) -> list[CaptureScopeRecord]:
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                SELECT object_id, object_type, role, operation, status, error,
+                    evidence_ids_json, metadata_json
+                FROM capture_scope
+                WHERE snapshot_id = ?
+                ORDER BY role DESC, object_id, operation
+                """,
+                (snapshot_id,),
+            ).fetchall()
+        return [_capture_scope_from_row(row) for row in rows]
 
     def list_objects(
         self,
@@ -267,7 +413,49 @@ class CatalogStore:
             **base.model_dump(mode="json"),
             incoming_count=incoming,
             outgoing_count=outgoing,
+            glossary_terms=[
+                item.model_dump(mode="json")
+                for item in self.list_glossary_terms(
+                    snapshot_id,
+                    query=None,
+                    object_id=object_id,
+                    limit=12,
+                )
+            ],
         )
+
+    def list_glossary_terms(
+        self,
+        snapshot_id: str,
+        *,
+        query: str | None = None,
+        object_id: str | None = None,
+        limit: int = 50,
+    ) -> list[GlossaryTermRecord]:
+        safe_limit = max(1, min(limit, 100))
+        clauses = ["snapshot_id = ?"]
+        params: list[object] = [snapshot_id]
+        if query and query.strip():
+            pattern = f"%{_normalize_term(query)}%"
+            clauses.append("(normalized_term LIKE ? OR lower(coalesce(object_id, '')) LIKE ?)")
+            params.extend([pattern, f"%{query.strip().lower()}%"])
+        if object_id:
+            clauses.append("object_id = ?")
+            params.append(object_id)
+        params.append(safe_limit)
+        with self._connect() as con:
+            rows = con.execute(
+                f"""
+                SELECT term_id, term, normalized_term, source, candidate, object_id,
+                    object_type, field_name, evidence_ids_json, metadata_json
+                FROM glossary_terms
+                WHERE {" AND ".join(clauses)}
+                ORDER BY source, lower(term), object_id, field_name
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_glossary_term_from_row(row) for row in rows]
 
     def load_graph(self, snapshot_id: str) -> BwGraph:
         if self.get_snapshot(snapshot_id) is None:
@@ -329,6 +517,44 @@ class CatalogStore:
                 ),
             )
 
+    def record_sql_analysis(
+        self,
+        snapshot_id: str,
+        *,
+        view_id: str,
+        reference_object_ids: Sequence[str],
+        column_names: Sequence[str],
+        citation_ids: Sequence[str],
+    ) -> None:
+        metadata: JsonDict = {
+            "view_id": view_id,
+            "reference_object_ids": sorted(set(reference_object_ids)),
+            "column_names": sorted(set(column_names)),
+            "citation_ids": list(citation_ids),
+        }
+        assert_no_persisted_secrets({"snapshot_id": snapshot_id, "sql_analysis": metadata})
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as con:
+            if self._get_snapshot(con, snapshot_id) is None:
+                raise KeyError(f"snapshot not found: {snapshot_id}")
+            con.execute(
+                """
+                INSERT INTO analysis_runs(snapshot_id, created_at, kind, metadata_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (snapshot_id, now, "sql_explain", _json_dumps(metadata)),
+            )
+            _insert_glossary_terms(
+                con,
+                snapshot_id,
+                _sql_glossary_terms(
+                    view_id=view_id,
+                    reference_object_ids=reference_object_ids,
+                    column_names=column_names,
+                    citation_ids=citation_ids,
+                ),
+            )
+
     def _init_schema(self) -> None:
         with self._connect() as con:
             con.executescript(
@@ -368,6 +594,57 @@ class CatalogStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(snapshot_id, source_id);
                 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(snapshot_id, target_id);
+                CREATE TABLE IF NOT EXISTS repository_nodes (
+                    parent_path TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    object_type TEXT NOT NULL,
+                    object_subtype TEXT,
+                    status TEXT,
+                    has_children INTEGER NOT NULL,
+                    self_url TEXT,
+                    fiori_only INTEGER NOT NULL,
+                    children_path TEXT,
+                    metadata_json TEXT NOT NULL,
+                    cached_at TEXT NOT NULL,
+                    PRIMARY KEY(parent_path, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_repository_nodes_parent
+                    ON repository_nodes(parent_path);
+                CREATE TABLE IF NOT EXISTS capture_scope (
+                    snapshot_id TEXT NOT NULL,
+                    object_id TEXT NOT NULL,
+                    object_type TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    evidence_ids_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, object_id, role, operation),
+                    FOREIGN KEY(snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS glossary_terms (
+                    snapshot_id TEXT NOT NULL,
+                    term_id TEXT NOT NULL,
+                    term TEXT NOT NULL,
+                    normalized_term TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    candidate INTEGER NOT NULL,
+                    object_id TEXT,
+                    object_type TEXT,
+                    field_name TEXT,
+                    evidence_ids_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_id, term_id),
+                    FOREIGN KEY(snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_glossary_terms_query
+                    ON glossary_terms(snapshot_id, normalized_term);
+                CREATE INDEX IF NOT EXISTS idx_glossary_terms_object
+                    ON glossary_terms(snapshot_id, object_id);
                 CREATE TABLE IF NOT EXISTS evidence (
                     snapshot_id TEXT NOT NULL,
                     evidence_id TEXT NOT NULL,
@@ -897,6 +1174,52 @@ def _edge_from_row(row: sqlite3.Row) -> CatalogEdgeRecord:
     )
 
 
+def _repository_node_from_row(row: sqlite3.Row) -> RepositoryNodeRecord:
+    return RepositoryNodeRecord(
+        id=_row_str(row, "node_id"),
+        parent_path=_row_str(row, "parent_path"),
+        path=_row_str(row, "path"),
+        name=_row_str(row, "name"),
+        description=_row_str(row, "description"),
+        object_type=_row_str(row, "object_type"),
+        object_subtype=_row_optional_str(row, "object_subtype"),
+        status=_row_optional_str(row, "status"),
+        has_children=bool(_row_int(row, "has_children")),
+        self_url=_row_optional_str(row, "self_url"),
+        fiori_only=bool(_row_int(row, "fiori_only")),
+        children_path=_row_optional_str(row, "children_path"),
+        metadata=_json_dict(_row_str(row, "metadata_json")),
+    )
+
+
+def _capture_scope_from_row(row: sqlite3.Row) -> CaptureScopeRecord:
+    return CaptureScopeRecord(
+        object_id=_row_str(row, "object_id"),
+        object_type=_row_str(row, "object_type"),
+        role=cast(Literal["selected", "discovered"], _row_str(row, "role")),
+        operation=_row_str(row, "operation"),
+        status=cast(Literal["selected", "ok", "error", "skipped"], _row_str(row, "status")),
+        error=_row_optional_str(row, "error"),
+        evidence_ids=_json_str_list(_row_str(row, "evidence_ids_json")),
+        metadata=_json_dict(_row_str(row, "metadata_json")),
+    )
+
+
+def _glossary_term_from_row(row: sqlite3.Row) -> GlossaryTermRecord:
+    return GlossaryTermRecord(
+        id=_row_str(row, "term_id"),
+        term=_row_str(row, "term"),
+        normalized_term=_row_str(row, "normalized_term"),
+        source=_row_str(row, "source"),
+        candidate=bool(_row_int(row, "candidate")),
+        object_id=_row_optional_str(row, "object_id"),
+        object_type=_row_optional_str(row, "object_type"),
+        field_name=_row_optional_str(row, "field_name"),
+        evidence_ids=_json_str_list(_row_str(row, "evidence_ids_json")),
+        metadata=_json_dict(_row_str(row, "metadata_json")),
+    )
+
+
 def _row_str(row: sqlite3.Row, key: str) -> str:
     value = row[key]
     if not isinstance(value, str):
@@ -934,6 +1257,152 @@ def _json_str_list(value: str) -> list[str]:
     if not isinstance(loaded, list):
         return []
     return [item for item in loaded if isinstance(item, str)]
+
+
+def _replace_metadata_glossary_terms(
+    con: sqlite3.Connection,
+    snapshot_id: str,
+    objects: Sequence[CatalogObjectRecord],
+) -> None:
+    con.execute(
+        "DELETE FROM glossary_terms WHERE snapshot_id = ? AND source = ?",
+        (snapshot_id, "metadata"),
+    )
+    _insert_glossary_terms(con, snapshot_id, _metadata_glossary_terms(objects))
+
+
+def _insert_glossary_terms(
+    con: sqlite3.Connection,
+    snapshot_id: str,
+    terms: Sequence[GlossaryTermRecord],
+) -> None:
+    if not terms:
+        return
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO glossary_terms(
+            snapshot_id, term_id, term, normalized_term, source, candidate, object_id,
+            object_type, field_name, evidence_ids_json, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                snapshot_id,
+                term.id,
+                term.term,
+                term.normalized_term,
+                term.source,
+                1 if term.candidate else 0,
+                term.object_id,
+                term.object_type,
+                term.field_name,
+                _json_dumps(term.evidence_ids),
+                _json_dumps(term.metadata),
+            )
+            for term in terms
+        ],
+    )
+
+
+def _metadata_glossary_terms(
+    objects: Sequence[CatalogObjectRecord],
+) -> list[GlossaryTermRecord]:
+    terms: dict[str, GlossaryTermRecord] = {}
+    for obj in objects:
+        candidates = [
+            (obj.id, "technical_id"),
+            (obj.name, "name"),
+            (obj.label, "label"),
+        ]
+        description = _text(obj.metadata.get("description"))
+        if description:
+            candidates.append((description, "description"))
+        for raw_term, source_field in candidates:
+            term = _text(raw_term)
+            if term is None:
+                continue
+            record = _glossary_record(
+                term=term,
+                source="metadata",
+                object_id=obj.id,
+                object_type=obj.type,
+                field_name=None,
+                evidence_ids=obj.evidence_ids,
+                metadata={"source_field": source_field},
+            )
+            terms.setdefault(record.id, record)
+    return sorted(terms.values(), key=lambda item: (item.source, item.term.lower(), item.id))
+
+
+def _sql_glossary_terms(
+    *,
+    view_id: str,
+    reference_object_ids: Sequence[str],
+    column_names: Sequence[str],
+    citation_ids: Sequence[str],
+) -> list[GlossaryTermRecord]:
+    terms: dict[str, GlossaryTermRecord] = {}
+    for object_id in reference_object_ids:
+        term = _text(object_id)
+        if term is None:
+            continue
+        record = _glossary_record(
+            term=term,
+            source="sql_evidence",
+            object_id=term,
+            object_type="SQL_REFERENCE",
+            field_name=None,
+            evidence_ids=list(citation_ids),
+            metadata={"view_id": view_id},
+        )
+        terms.setdefault(record.id, record)
+    for column_name in column_names:
+        term = _text(column_name)
+        if term is None:
+            continue
+        record = _glossary_record(
+            term=term,
+            source="sql_evidence",
+            object_id=view_id,
+            object_type="NATIVE_SQL_VIEW",
+            field_name=term,
+            evidence_ids=list(citation_ids),
+            metadata={"view_id": view_id},
+        )
+        terms.setdefault(record.id, record)
+    return sorted(terms.values(), key=lambda item: (item.source, item.term.lower(), item.id))
+
+
+def _glossary_record(
+    *,
+    term: str,
+    source: str,
+    object_id: str | None,
+    object_type: str | None,
+    field_name: str | None,
+    evidence_ids: Sequence[str],
+    metadata: JsonDict,
+) -> GlossaryTermRecord:
+    normalized = _normalize_term(term)
+    digest = hashlib.sha256(
+        "\n".join([source, normalized, object_id or "", field_name or ""]).encode("utf-8")
+    ).hexdigest()[:16]
+    return GlossaryTermRecord(
+        id=f"glossary:{source}:{digest}",
+        term=term,
+        normalized_term=normalized,
+        source=source,
+        candidate=True,
+        object_id=object_id,
+        object_type=object_type,
+        field_name=field_name,
+        evidence_ids=sorted(set(evidence_ids)),
+        metadata=metadata,
+    )
+
+
+def _normalize_term(value: str) -> str:
+    return " ".join(value.strip().lower().split())
 
 
 def _snapshot_id(*, source: str, created_at: str) -> str:

@@ -12,8 +12,6 @@ from bwli.endpoints import DataflowDirection
 from bwli.redact import redact_text
 from bwli.snapshot import SnapshotManifest, SnapshotWriter
 
-XrefDirection = Literal["upstream", "downstream"]
-
 
 class BwReadClient(Protocol):
     def fetch_search(self, search_term: str, *, object_type: str | None = None) -> Any: ...
@@ -28,7 +26,15 @@ class BwReadClient(Protocol):
         levels: int = 3,
     ) -> Any: ...
 
-    def fetch_xref(self, object_name: str, *, direction: str = "downstream") -> Any: ...
+    def fetch_xref(
+        self,
+        object_name: str,
+        *,
+        object_type: str = "ADSO",
+        source_system: str | None = None,
+    ) -> Any: ...
+
+    def fetch_repository_contents(self, path: str | None = None) -> Any: ...
 
     def close(self) -> None: ...
 
@@ -89,7 +95,6 @@ def run_live_smoke(
     client_factory: ClientFactory,
     search_term: str,
     object_name: str | None = None,
-    xref_direction: XrefDirection = "downstream",
     dataflow_object_type: str = "ADSO",
     dataflow_source_system: str | None = None,
     dataflow_direction: DataflowDirection = "downwards",
@@ -109,6 +114,11 @@ def run_live_smoke(
             )
         ]
         if object_name:
+            xref_label = _xref_label(
+                object_name,
+                object_type=dataflow_object_type,
+                source_system=dataflow_source_system,
+            )
             operations.append(
                 _run_operation(
                     name="bw_get_dataflow",
@@ -127,8 +137,12 @@ def run_live_smoke(
             operations.append(
                 _run_operation(
                     name="bw_xref",
-                    label=f"bw://bw_xref/{xref_direction}",
-                    func=lambda: client.fetch_xref(object_name, direction=xref_direction),
+                    label=xref_label,
+                    func=lambda: client.fetch_xref(
+                        object_name,
+                        object_type=dataflow_object_type,
+                        source_system=dataflow_source_system,
+                    ),
                     secret_values=secret_values,
                     secret_urls=secret_urls,
                 )
@@ -154,7 +168,6 @@ def collect_live_snapshot(
     object_names: Sequence[str] = (),
     include_dataflow: bool = True,
     include_xref: bool = True,
-    xref_direction: XrefDirection = "downstream",
     dataflow_object_type: str = "ADSO",
     dataflow_source_system: str | None = None,
     dataflow_direction: DataflowDirection = "downwards",
@@ -240,13 +253,21 @@ def collect_live_snapshot(
                         _success_summary("bw_get_dataflow", label, payload)
                     )
             if include_xref:
-                label = (
-                    f"bw://bw_xref/{xref_direction}?"
-                    f"objectName={quote(object_name, safe='')}"
+                label = _xref_label(
+                    object_name,
+                    object_type=dataflow_object_type,
+                    source_system=dataflow_source_system,
                 )
-                payload_id = f"xref-{index}-{_safe_fragment(object_name)}-{xref_direction}"
+                payload_id = (
+                    f"xref-{index}-{_safe_fragment(dataflow_object_type)}-"
+                    f"{_safe_fragment(object_name)}"
+                )
                 try:
-                    payload = client.fetch_xref(object_name, direction=xref_direction)
+                    payload = client.fetch_xref(
+                        object_name,
+                        object_type=dataflow_object_type,
+                        source_system=dataflow_source_system,
+                    )
                 except Exception as exc:
                     operations.append(
                         _failure_summary(
@@ -289,6 +310,23 @@ def collect_live_snapshot(
         succeeded=succeeded,
         failed=failed,
     )
+
+
+def _xref_label(
+    object_name: str,
+    *,
+    object_type: str,
+    source_system: str | None = None,
+) -> str:
+    """Mirror bw-modeling-mcp xref shape: objectType/objectName only, no direction."""
+
+    query = (
+        f"objectType={quote(object_type.upper(), safe='')}&"
+        f"objectName={quote(object_name.upper(), safe='')}"
+    )
+    if object_type.upper() == "RSDS" and source_system:
+        query += f"&sourceSystem={quote(source_system.upper(), safe='')}"
+    return f"bw://bw_xref?{query}"
 
 
 def _success_summary(name: str, label: str, payload: Any) -> LiveOperationSummary:

@@ -5,8 +5,10 @@ import {
   clearRuntimeConfig,
   draftSql,
   explainSql,
-  getHealth,
+  getCaptureScope,
+  getGlossary,
   getObject,
+  getRepository,
   getRuntimeConfig,
   listObjects,
   listSnapshots,
@@ -17,18 +19,21 @@ import {
   postLineageAdvice,
   putRuntimeConfig,
   type AppTab,
+  type CaptureScopeItem,
   type CatalogObject,
   type CatalogObjectDetail,
   type ChangeType,
+  type ConnectionStatus,
   type DataflowDirection,
   type Direction,
-  type XrefDirection,
-  type HealthResponse,
+  type GlossaryTerm,
   type ImpactAdviceResponse,
   type ImpactScenarioResponse,
   type LineageAdviceResponse,
   type LineageResponse,
+  type LiveCaptureSummary,
   type LiveSmokeResult,
+  type RepositoryNode,
   type RuntimeConfigResponse,
   type SnapshotSummary,
   type SqlDraftResponse,
@@ -92,7 +97,6 @@ interface SetupForm {
 }
 
 export default function App() {
-  const [health, setHealth] = useState<HealthResponse | null>(null);
   const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null);
   const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState('');
@@ -145,19 +149,32 @@ export default function App() {
   const [liveSourceSystem, setLiveSourceSystem] = useState('');
   const [liveSearchTerms, setLiveSearchTerms] = useState('');
   const [liveDataflowDirection, setLiveDataflowDirection] = useState<DataflowDirection>('downwards');
-  const [liveXrefDirection, setLiveXrefDirection] = useState<XrefDirection>('downstream');
   const [liveDataflowLevels, setLiveDataflowLevels] = useState(3);
-  const [liveReadOnlyConfirmed, setLiveReadOnlyConfirmed] = useState(false);
   const [connectionTest, setConnectionTest] = useState<LiveSmokeResult | null>(null);
   const [connectionTestSearchTerm, setConnectionTestSearchTerm] = useState('Z*');
   const [connectionTestOk, setConnectionTestOk] = useState(false);
+  const [repositoryPath, setRepositoryPath] = useState('/');
+  const [repositoryNodes, setRepositoryNodes] = useState<RepositoryNode[]>([]);
+  const [repositorySource, setRepositorySource] = useState<'live' | 'cache' | 'empty'>('empty');
+  const [repositoryActionRequired, setRepositoryActionRequired] = useState<string | null>(null);
+  const [captureScope, setCaptureScope] = useState<CaptureScopeItem[]>([]);
+  const [glossaryTerms, setGlossaryTerms] = useState<GlossaryTerm[]>([]);
 
   const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
   const selectedObject = objects.find((item) => item.id === selectedObjectId)
     ?? (allowHiddenSelection && objectDetail?.id === selectedObjectId ? objectDetail : null);
   const runtimeMissing = runtime ? !runtime.bw.configured : true;
+  const connectionReady = runtime?.connection_status === 'ok' || connectionTestOk;
   const liveObjectNameTokens = useMemo(() => parseObjectNamesText(liveObjectNames), [liveObjectNames]);
+  const liveSearchTermTokens = useMemo(() => parseObjectNamesText(liveSearchTerms), [liveSearchTerms]);
+  const liveCaptureTargetReady = liveObjectNameTokens.length > 0 || liveSearchTermTokens.length > 0;
   const snapshotPickObjects = useMemo(() => objects.slice(0, 16), [objects]);
+  const bwSavedForTesting = Boolean(runtime?.bw.configured && !bwSetupTouched);
+  const bwTestedForCapture = Boolean(connectionReady && !bwSetupTouched);
+  const selectedObjectGlossary = useMemo(
+    () => objectDetail?.glossary_terms ?? glossaryTerms.filter((term) => term.object_id === selectedObjectId).slice(0, 12),
+    [glossaryTerms, objectDetail, selectedObjectId],
+  );
 
   useEffect(() => {
     void refreshAll();
@@ -172,10 +189,13 @@ export default function App() {
   useEffect(() => {
     if (selectedSnapshotId) {
       void refreshObjects(selectedSnapshotId);
+      void refreshSnapshotContext(selectedSnapshotId);
     } else {
       setObjects([]);
       setObjectNextCursor(null);
       setSelectedObjectId('');
+      setCaptureScope([]);
+      setGlossaryTerms([]);
     }
   }, [selectedSnapshotId, catalogQuery, objectType]);
 
@@ -250,13 +270,16 @@ export default function App() {
   async function refreshAll() {
     setBusy('status');
     try {
-      const [healthResponse, runtimeResponse, snapshotResponse] = await Promise.all([
-        getHealth(),
+      const [runtimeResponse, snapshotResponse, repositoryResponse] = await Promise.all([
         getRuntimeConfig(),
         listSnapshots(),
+        getRepository({ path: repositoryPath }),
       ]);
-      setHealth(healthResponse);
       setRuntime(runtimeResponse);
+      setConnectionTestOk(runtimeResponse.connection_status === 'ok');
+      if (runtimeResponse.connection_status !== 'ok') {
+        setConnectionTest(null);
+      }
       setSetupForm((current) => ({
         ...current,
         url: current.url || runtimeResponse.bw.url || '',
@@ -271,6 +294,10 @@ export default function App() {
         llmModel: runtimeResponse.llm.model || current.llmModel,
       }));
       setSnapshots(snapshotResponse.snapshots);
+      setRepositoryPath(repositoryResponse.path);
+      setRepositoryNodes(repositoryResponse.items);
+      setRepositorySource(repositoryResponse.source);
+      setRepositoryActionRequired(repositoryResponse.action_required);
       if (runtimeResponse.bw.configured) {
         setDiagnosticsOpen(false);
       }
@@ -298,6 +325,51 @@ export default function App() {
       setError(errorText(err));
     } finally {
       setBusy('');
+    }
+  }
+
+  async function refreshSnapshotContext(snapshotId: string) {
+    try {
+      const [scopeResponse, glossaryResponse] = await Promise.all([
+        getCaptureScope(snapshotId),
+        getGlossary(snapshotId),
+      ]);
+      setCaptureScope(scopeResponse.items);
+      setGlossaryTerms(glossaryResponse.items);
+    } catch (err) {
+      setCaptureScope([]);
+      setGlossaryTerms([]);
+      setError(errorText(err));
+    }
+  }
+
+  async function loadRepository(path: string, refresh = false) {
+    setBusy(refresh ? 'repository-refresh' : 'repository');
+    try {
+      const response = await getRepository({
+        path,
+        refresh,
+        confirmReadOnly: refresh,
+      });
+      setRepositoryPath(response.path);
+      setRepositoryNodes(response.items);
+      setRepositorySource(response.source);
+      setRepositoryActionRequired(response.action_required);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  function selectRepositoryNode(node: RepositoryNode) {
+    addLiveObjectName(node.name);
+    if (node.object_type && node.object_type !== 'UNKNOWN') {
+      setLiveObjectType(node.object_type);
+    }
+    if (node.has_children) {
+      void loadRepository(node.children_path || node.path);
     }
   }
 
@@ -343,7 +415,7 @@ export default function App() {
       setBwSetupTouched(false);
       setDiagnosticsOpen(false);
       setConnectionTest(null);
-      setConnectionTestOk(false);
+      setConnectionTestOk(next.connection_status === 'ok');
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -355,11 +427,12 @@ export default function App() {
   async function clearSetup() {
     setBusy('setup');
     try {
-      setRuntime(await clearRuntimeConfig());
+      const next = await clearRuntimeConfig();
+      setRuntime(next);
       setSetupForm((current) => ({ ...current, password: '', llmApiKey: '' }));
       setBwSetupTouched(false);
       setConnectionTest(null);
-      setConnectionTestOk(false);
+      setConnectionTestOk(next.connection_status === 'ok');
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -372,7 +445,7 @@ export default function App() {
     setBusy('snapshot');
     try {
       const snapshot = await captureFixtureSnapshot(fixtureGraphPath);
-      await reloadSnapshots(snapshot.id);
+      await reloadSnapshots(snapshot.id, snapshot);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -395,16 +468,15 @@ export default function App() {
     setBusy('snapshot');
     try {
       const snapshot = await captureLiveSnapshot({
-        confirmReadOnly: liveReadOnlyConfirmed,
+        confirmReadOnly: true,
         objectNames,
         searchTerms: searchTerms.length > 0 ? searchTerms : undefined,
         objectType: liveObjectType.trim() || undefined,
         sourceSystem: liveSourceSystem.trim() || undefined,
         dataflowDirection: liveDataflowDirection,
         dataflowLevels: liveDataflowLevels,
-        xrefDirection: liveXrefDirection,
       });
-      await reloadSnapshots(snapshot.id);
+      await reloadSnapshots(snapshot.id, snapshot);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -424,9 +496,11 @@ export default function App() {
     }
     setBusy('connection-test');
     try {
-      const result = await postConnectionTest(connectionTestSearchTerm.trim() || '*');
+      const result = await postConnectionTest(connectionTestSearchTerm.trim() || 'Z*');
+      const nextRuntime = await getRuntimeConfig();
       setConnectionTest(result);
-      setConnectionTestOk(result.status !== 'error');
+      setRuntime(nextRuntime);
+      setConnectionTestOk(nextRuntime.connection_status === 'ok');
       setError('');
     } catch (err) {
       setConnectionTest(null);
@@ -437,10 +511,11 @@ export default function App() {
     }
   }
 
-  async function reloadSnapshots(preferredId?: string) {
+  async function reloadSnapshots(preferredId?: string, capturedSnapshot?: SnapshotSummary) {
     const snapshotResponse = await listSnapshots();
-    const nextSnapshotId = preferredId ?? snapshotResponse.snapshots[0]?.id ?? '';
-    setSnapshots(snapshotResponse.snapshots);
+    const nextSnapshots = mergeSnapshotCapture(snapshotResponse.snapshots, capturedSnapshot);
+    const nextSnapshotId = preferredId ?? nextSnapshots[0]?.id ?? '';
+    setSnapshots(nextSnapshots);
     chooseSnapshot(nextSnapshotId);
   }
 
@@ -571,17 +646,14 @@ export default function App() {
     <div className="appShell">
       <header className="topStatus">
         <div className="brandBlock">
-          <span className="brandMark">BW</span>
           <div>
-            <strong>BW Lineage Impact</strong>
-            <span>로컬 전용 SAP BW/4HANA Lineage analyzer</span>
+            <strong>BW Workbench</strong>
+            <span>Lineage · Impact · SQL</span>
           </div>
         </div>
         <div className="statusStrip">
-          <StatusPill label="BW" value={bwStatus(runtime)} tone={runtime?.bw.configured ? 'ok' : 'warn'} />
+          <StatusPill label="BW" value={bwStatus(runtime)} tone={runtime?.connection_status === 'ok' ? 'ok' : runtime?.bw.configured ? 'warn' : 'warn'} />
           <StatusPill label="Snapshot" value={latestSnapshotLabel} tone={selectedSnapshot ? 'info' : 'warn'} />
-          <StatusPill label="Local-only" value={health?.local_only ? '로컬 전용' : '확인 중'} tone="ok" />
-          <StatusPill label="Read-only" value={health?.read_only ? 'GET only' : '확인 중'} tone="ok" />
           <StatusPill label="LLM" value={runtime?.llm.configured ? 'local 설정됨' : 'disabled'} tone="neutral" />
         </div>
         <button className="ghostButton" onClick={() => setDiagnosticsOpen((value) => !value)}>
@@ -604,25 +676,93 @@ export default function App() {
               <div>
                 <span className="eyebrow">Settings</span>
                 <h2>실행 설정</h2>
-                <p>Secrets는 process memory에만 보관됩니다. BW capture는 읽기 전용 GET metadata 호출만 사용합니다.</p>
+                <p>Secrets는 process memory에만 보관됩니다. Capture는 GET metadata만 사용합니다.</p>
               </div>
               <button className="iconButton" onClick={() => setDiagnosticsOpen(false)} aria-label="Settings 닫기">×</button>
             </div>
 
-            <section className="drawerSection">
-              <h3>Runtime / Diagnostics</h3>
-              <p>
-                {runtime?.bw.source === 'env'
-                  ? 'BW 설정은 .env/environment에서 로드되었습니다. UI 재입력은 필요 없습니다.'
-                  : 'Live capture에는 BW_URL, BW_USER, BW_PASSWORD, BW_CLIENT가 필요합니다.'}
-              </p>
+            <div className="setupStepper" aria-label="BW setup steps">
+              <SetupStep
+                index={1}
+                title="BW 연결 정보 저장"
+                status={bwSavedForTesting ? '완료' : bwSetupTouched ? '저장 필요' : '대기'}
+                done={bwSavedForTesting}
+              />
+              <SetupStep
+                index={2}
+                title="연결 테스트 실행"
+                status={bwTestedForCapture ? '완료' : bwSavedForTesting ? '실행 필요' : '저장 후'}
+                done={bwTestedForCapture}
+              />
+              <SetupStep
+                index={3}
+                title="객체 선택/입력 후 Live GET capture"
+                status={bwTestedForCapture && liveCaptureTargetReady ? '준비됨' : '대기'}
+                done={bwTestedForCapture && liveCaptureTargetReady}
+              />
+            </div>
+
+            <section className="drawerSection primarySetupSection">
+              <h3>1. BW 연결 정보 저장</h3>
+              <p>{runtime?.bw.source === 'env' ? '.env/environment에서 로드됨' : '필수값을 저장하세요.'}</p>
               <div className="setupGrid">
-                <input placeholder="BW_URL" value={setupForm.url} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, url: event.target.value }); }} />
-                <input placeholder="BW_USER" value={setupForm.user} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, user: event.target.value }); }} />
-                <input placeholder="BW_PASSWORD" type="password" value={setupForm.password} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, password: event.target.value }); }} />
-                <input placeholder="BW_CLIENT" value={setupForm.client} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, client: event.target.value }); }} />
-                <input placeholder="BW_LANGUAGE (예: EN)" value={setupForm.language} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, language: event.target.value }); }} />
-                <input placeholder="BW_CA_BUNDLE (optional)" value={setupForm.caBundle} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, caBundle: event.target.value }); }} />
+                <label className="fieldLabel requiredField">
+                  BW_URL <span aria-hidden="true">*</span>
+                  <input
+                    aria-label="required BW_URL"
+                    placeholder="https://bw.example.invalid"
+                    required
+                    value={setupForm.url}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, url: event.target.value }); }}
+                  />
+                </label>
+                <label className="fieldLabel requiredField">
+                  BW_USER <span aria-hidden="true">*</span>
+                  <input
+                    aria-label="required BW_USER"
+                    placeholder="사용자 ID"
+                    required
+                    value={setupForm.user}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, user: event.target.value }); }}
+                  />
+                </label>
+                <label className="fieldLabel requiredField">
+                  BW_PASSWORD <span aria-hidden="true">*</span>
+                  <input
+                    aria-label="required BW_PASSWORD"
+                    placeholder={runtime?.bw.configured ? '저장됨 — 변경 시에만 입력' : 'process memory에만 저장'}
+                    type="password"
+                    required={!runtime?.bw.configured}
+                    value={setupForm.password}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, password: event.target.value }); }}
+                  />
+                </label>
+                <label className="fieldLabel requiredField">
+                  BW_CLIENT <span aria-hidden="true">*</span>
+                  <input
+                    aria-label="required BW_CLIENT"
+                    placeholder="100"
+                    required
+                    value={setupForm.client}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, client: event.target.value }); }}
+                  />
+                </label>
+                <label className="fieldLabel">
+                  BW_LANGUAGE
+                  <input
+                    placeholder="EN"
+                    value={setupForm.language}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, language: event.target.value }); }}
+                  />
+                </label>
+                <label className="fieldLabel">
+                  BW_CA_BUNDLE (선택)
+                  <input
+                    placeholder="/path/to/ca.pem"
+                    value={setupForm.caBundle}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, caBundle: event.target.value }); }}
+                  />
+                </label>
                 <label className="checkField">
                   <input
                     type="checkbox"
@@ -639,38 +779,18 @@ export default function App() {
                   />
                   Proxy env 신뢰
                 </label>
-                <label className="checkField fullSpan">
-                  <input
-                    type="checkbox"
-                    checked={setupForm.llmEnabled}
-                    onChange={(event) => setSetupForm({ ...setupForm, llmEnabled: event.target.checked })}
-                  />
-                  로컬 OpenAI-compatible LLM advisory 활성화
-                </label>
-                <input
-                  placeholder="BWLI_LLM_BASE_URL (local only)"
-                  value={setupForm.llmBaseUrl}
-                  onChange={(event) => setSetupForm({ ...setupForm, llmBaseUrl: event.target.value })}
-                />
-                <input placeholder="BWLI_LLM_MODEL" value={setupForm.llmModel} onChange={(event) => setSetupForm({ ...setupForm, llmModel: event.target.value })} />
-                <input
-                  placeholder={runtime?.llm.configured ? 'BWLI_LLM_API_KEY 설정됨' : 'BWLI_LLM_API_KEY'}
-                  type="password"
-                  value={setupForm.llmApiKey}
-                  onChange={(event) => setSetupForm({ ...setupForm, llmApiKey: event.target.value })}
-                />
-                <p className="setupHint fullSpan">LLM: {llmStatus(runtime)} · SQL/Lineage/Impact advisory only · SQL/BW write 실행 없음.</p>
+                <p className="setupHint fullSpan">저장 후 연결 테스트를 실행하세요. Secrets는 표시하지 않습니다.</p>
                 <button className="primaryButton" onClick={saveSetup} disabled={busy === 'setup'}>설정 저장</button>
                 <button className="secondaryButton" onClick={clearSetup} disabled={busy === 'setup'}>초기화 / env fallback</button>
               </div>
             </section>
 
             <section className="drawerSection">
-              <h3>Test connection</h3>
-              <p>
-                저장된 BW 설정으로 <code>bw_search</code> 한 번만 호출해 인증/TLS/프록시를 확인합니다.
-                실패 시 BW host/secret은 표시되지 않습니다.
-              </p>
+              <h3>2. 연결 테스트 실행</h3>
+              <p>저장된 BW 설정으로 인증/TLS/프록시를 확인합니다.</p>
+              {!bwSavedForTesting || bwSetupTouched ? (
+                <p className="dependencyHint">먼저 1단계 BW 설정을 저장해야 연결 테스트를 실행할 수 있습니다.</p>
+              ) : null}
               <div className="liveOptionsGrid">
                 <label>
                   검색 패턴 (search_term)
@@ -689,8 +809,8 @@ export default function App() {
                 >
                   연결 테스트 실행
                 </button>
-                <span className={`connectionBadge ${connectionTestBadge(connectionTest)}`}>
-                  {connectionTestLabel(connectionTest, runtime?.bw.configured ?? false)}
+                <span className={`connectionBadge ${connectionTestBadge(connectionTest, runtime?.connection_status)}`}>
+                  {connectionTestLabel(connectionTest, runtime)}
                 </span>
               </div>
               {connectionTest ? (
@@ -711,8 +831,11 @@ export default function App() {
             </section>
 
             <section className="drawerSection">
-              <h3>Snapshot capture</h3>
-              <p>Fixture는 로컬 샘플 검증용입니다. Live GET capture는 선택한 object names만 좁게 조회합니다.</p>
+              <h3>3. 객체 선택/입력 후 Live GET capture</h3>
+              <p>테스트 성공 후 선택한 object만 capture합니다.</p>
+              {!bwTestedForCapture ? (
+                <p className="dependencyHint">먼저 2단계 연결 테스트가 성공해야 Live GET capture가 활성화됩니다.</p>
+              ) : null}
               <label className="fieldLabel">
                 Live object names
                 <textarea
@@ -739,7 +862,7 @@ export default function App() {
                   ))}
                 </div>
               ) : (
-                <p className="livePickerHint">카탈로그에서 객체를 선택한 뒤 “선택 객체 추가”를 누르거나 직접 입력하세요.</p>
+                <p className="livePickerHint">객체를 선택하거나 직접 입력하세요.</p>
               )}
               {snapshotPickObjects.length > 0 ? (
                 <div className="snapshotPickList" aria-label="snapshot object quick picker">
@@ -758,9 +881,7 @@ export default function App() {
                   value={liveSearchTerms}
                   onChange={(event) => setLiveSearchTerms(event.target.value)}
                 />
-                <small className="livePickerHint">
-                  쉼표/줄바꿈으로 구분. 비워두면 search 호출 없이 dataflow/xref만 수행합니다.
-                </small>
+                <small className="livePickerHint">쉼표/줄바꿈으로 구분합니다.</small>
               </label>
               <div className="liveOptionsGrid">
                 <label>
@@ -789,13 +910,7 @@ export default function App() {
                     <option value="both">Both</option>
                   </select>
                 </label>
-                <label>
-                  Where-used
-                  <select value={liveXrefDirection} onChange={(event) => setLiveXrefDirection(event.target.value as XrefDirection)}>
-                    <option value="downstream">Downstream</option>
-                    <option value="upstream">Upstream</option>
-                  </select>
-                </label>
+
                 <label>
                   Levels
                   <input
@@ -807,14 +922,7 @@ export default function App() {
                   />
                 </label>
               </div>
-              <label className="checkField liveConfirm fullSpan">
-                <input
-                  type="checkbox"
-                  checked={liveReadOnlyConfirmed}
-                  onChange={(event) => setLiveReadOnlyConfirmed(event.target.checked)}
-                />
-                읽기 전용 GET metadata capture임을 확인합니다.
-              </label>
+              <p className="policyNote fullSpan">Live capture는 서버에서 GET-only metadata 요청으로 고정됩니다.</p>
               <div className="captureRow">
                 <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>
                   Fixture capture
@@ -825,23 +933,63 @@ export default function App() {
                   disabled={
                     !runtime?.bw.configured
                     || bwSetupTouched
-                    || !liveReadOnlyConfirmed
-                    || !connectionTestOk
+                    || !connectionReady
+                    || !liveCaptureTargetReady
                     || busy === 'snapshot'
                   }
-                  title={connectionTestOk ? '' : '먼저 Test connection을 실행해 성공해야 합니다.'}
+                  title={liveCaptureButtonTitle(connectionReady, liveCaptureTargetReady)}
                 >
                   Live GET capture
                 </button>
               </div>
-              {!connectionTestOk || bwSetupTouched ? (
+              {!connectionReady || bwSetupTouched || !liveCaptureTargetReady ? (
                 <p className="livePickerHint">
                   {bwSetupTouched
                     ? '변경한 BW 설정을 저장하고 Test connection을 다시 실행해야 Live GET capture가 활성화됩니다.'
-                    : 'Live GET capture는 현재 세션에서 연결 테스트가 성공한 뒤에만 활성화됩니다.'}
+                    : !connectionReady
+                      ? 'Live GET capture는 현재 세션에서 연결 테스트가 성공한 뒤에만 활성화됩니다.'
+                      : 'Live GET capture에는 object name 또는 좁은 search term이 최소 1개 필요합니다.'}
                 </p>
               ) : null}
+              <CaptureOutcomeCard snapshot={selectedSnapshot} />
             </section>
+
+            <details className="drawerSection advancedSection">
+              <summary>Advanced · LLM / diagnostics</summary>
+              <div className="setupGrid advancedGrid">
+                <label className="checkField fullSpan">
+                  <input
+                    type="checkbox"
+                    checked={setupForm.llmEnabled}
+                    onChange={(event) => setSetupForm({ ...setupForm, llmEnabled: event.target.checked })}
+                  />
+                  로컬 OpenAI-compatible LLM advisory 활성화
+                </label>
+                <label className="fieldLabel">
+                  BWLI_LLM_BASE_URL
+                  <input
+                    placeholder="http://127.0.0.1:11434/v1"
+                    value={setupForm.llmBaseUrl}
+                    onChange={(event) => setSetupForm({ ...setupForm, llmBaseUrl: event.target.value })}
+                  />
+                </label>
+                <label className="fieldLabel">
+                  BWLI_LLM_MODEL
+                  <input value={setupForm.llmModel} onChange={(event) => setSetupForm({ ...setupForm, llmModel: event.target.value })} />
+                </label>
+                <label className="fieldLabel fullSpan">
+                  BWLI_LLM_API_KEY
+                  <input
+                    placeholder={runtime?.llm.configured ? '설정됨 — 변경 시에만 입력' : '선택'}
+                    type="password"
+                    value={setupForm.llmApiKey}
+                    onChange={(event) => setSetupForm({ ...setupForm, llmApiKey: event.target.value })}
+                  />
+                </label>
+                <p className="setupHint fullSpan">LLM: {llmStatus(runtime)} · advisory only</p>
+                <button className="secondaryButton" onClick={saveSetup} disabled={busy === 'setup'}>고급 설정 저장</button>
+              </div>
+            </details>
           </aside>
         </div>
       ) : null}
@@ -850,11 +998,23 @@ export default function App() {
         <aside className="catalogPane">
           <div className="paneHeader">
             <div>
-              <span className="eyebrow">Object Catalog</span>
-              <h2>객체 카탈로그</h2>
+              <span className="eyebrow">Objects</span>
+              <h2>Snapshot</h2>
             </div>
             <button className="iconButton" onClick={() => void refreshAll()} disabled={busy === 'status'}>↻</button>
           </div>
+
+          <RepositoryPicker
+            path={repositoryPath}
+            nodes={repositoryNodes}
+            source={repositorySource}
+            actionRequired={repositoryActionRequired}
+            connectionReady={connectionReady && !bwSetupTouched}
+            busy={busy}
+            onOpenPath={(path) => void loadRepository(path)}
+            onRefresh={() => void loadRepository(repositoryPath, true)}
+            onSelect={selectRepositoryNode}
+          />
 
           <label className="fieldLabel">
             Snapshot
@@ -868,16 +1028,52 @@ export default function App() {
             </select>
           </label>
 
-          <div className="catalogActionCard">
-            <strong>Capture 설정</strong>
-            <p>Fixture / Live GET capture와 object names 선택은 Settings 패널로 이동했습니다.</p>
-            <button className="secondaryButton wide" onClick={() => setDiagnosticsOpen(true)}>Settings 열기</button>
-            {liveObjectNameTokens.length > 0 ? <small>{liveObjectNameTokens.length}개 live capture 대상 선택됨</small> : null}
+          <div className="catalogActionCard pickerBasket">
+            <div className="basketHeader">
+              <strong>Capture basket</strong>
+              <span>{liveObjectNameTokens.length} selected</span>
+            </div>
+            <button className="secondaryButton wide" onClick={() => addLiveObjectName(selectedObjectId)} disabled={!selectedObjectId}>
+              Add selected object
+            </button>
+            {liveObjectNameTokens.length > 0 ? (
+              <div className="selectedLiveObjects frontBasket" aria-label="selected live capture objects">
+                {liveObjectNameTokens.map((name) => (
+                  <button key={name} className="selectedObjectChip" onClick={() => removeLiveObjectName(name)} title="Capture 대상에서 제거">
+                    {name} ×
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <small>No selected object</small>
+            )}
+            <div className="captureRow">
+              <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>Fixture</button>
+              <button
+                className="primaryButton"
+                onClick={captureLive}
+                disabled={!connectionReady || bwSetupTouched || !liveCaptureTargetReady || busy === 'snapshot'}
+                title={liveCaptureButtonTitle(connectionReady, liveCaptureTargetReady)}
+              >
+                Capture
+              </button>
+            </div>
+            <button className="ghostButton wide" onClick={() => setDiagnosticsOpen(true)}>Settings</button>
           </div>
+          <CaptureOutcomeCard snapshot={selectedSnapshot} compact />
+
+          {captureScope.length > 0 ? (
+            <div className="scopeMini" aria-label="snapshot capture scope">
+              <strong>Scope</strong>
+              <span>{captureScope.filter((item) => item.role === 'selected').length} selected · {captureScope.filter((item) => item.role === 'discovered').length} discovered</span>
+            </div>
+          ) : null}
+
+          <TermsOverview terms={glossaryTerms} />
 
           <input
             className="catalogSearch"
-            placeholder="object 이름 검색"
+            placeholder="object 검색"
             value={catalogQuery}
             onChange={(event) => {
               setAllowHiddenSelection(false);
@@ -901,7 +1097,7 @@ export default function App() {
 
           <div className="objectList" aria-busy={busy === 'catalog'}>
             {objects.length === 0 ? (
-              <div className="emptyState">객체가 없습니다. 먼저 snapshot을 capture하세요.</div>
+              <div className="emptyState">Snapshot을 capture하세요.</div>
             ) : (
               objects.map((item) => (
                 <button
@@ -938,7 +1134,7 @@ export default function App() {
           <nav className="tabBar">
             <TabButton id="lineage" active={activeTab} onClick={setActiveTab} label="Lineage" />
             <TabButton id="impact" active={activeTab} onClick={setActiveTab} label="Impact" />
-            <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Assistant" />
+            <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Analysis" />
           </nav>
 
           {activeTab === 'lineage' ? (
@@ -947,6 +1143,7 @@ export default function App() {
               objectDetail={objectDetail}
               lineage={lineage}
               lineageAdvice={lineageAdvice}
+              objectGlossary={selectedObjectGlossary}
               graphStats={graphStats}
               direction={direction}
               setDirection={setDirection}
@@ -979,7 +1176,6 @@ export default function App() {
 
           {activeTab === 'impact' ? (
             <ImpactTab
-              runtime={runtime}
               selectedObject={selectedObject}
               changeType={changeType}
               setChangeType={setChangeType}
@@ -1025,6 +1221,7 @@ function LineageTab(props: {
   objectDetail: CatalogObjectDetail | null;
   lineage: LineageResponse | null;
   lineageAdvice: LineageAdviceResponse | null;
+  objectGlossary: GlossaryTerm[];
   graphStats: string;
   direction: Direction;
   setDirection: (value: Direction) => void;
@@ -1045,7 +1242,7 @@ function LineageTab(props: {
     <div className="workspaceGrid">
       <section className="controlCard">
         <div className="sectionTitle">
-          <span className="eyebrow">Bounded graph</span>
+          <span className="eyebrow">Lineage</span>
           <h1>{props.selectedObject?.id ?? '객체 선택'}</h1>
           <p>{props.graphStats}</p>
         </div>
@@ -1065,7 +1262,7 @@ function LineageTab(props: {
           Lineage 실행
         </button>
         <button className="secondaryButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
-          로컬 LLM graph notes
+          LLM notes
         </button>
         {props.lineage ? (
           <div className="metaGrid">
@@ -1079,7 +1276,7 @@ function LineageTab(props: {
         <LineageGraph lineage={props.lineage} onSelect={props.onSelect} selectedId={props.objectDetail?.id ?? null} />
       </section>
       <aside className="detailsDrawer">
-        <span className="eyebrow">Node details</span>
+        <span className="eyebrow">Details</span>
         <h2>{props.objectDetail?.id ?? '선택된 node 없음'}</h2>
         {props.objectDetail ? (
           <>
@@ -1090,14 +1287,15 @@ function LineageTab(props: {
               <span>Outgoing</span><strong>{props.objectDetail.outgoing_count}</strong>
               <span>Evidence</span><strong>{props.objectDetail.evidence_ids.length}</strong>
             </div>
+            <GlossaryList terms={props.objectGlossary} title="Terms" emptyText="Terms 없음" />
             <button className="secondaryButton wide" onClick={() => props.onExpand(props.objectDetail!.id)}>
-              이 node에서 확장
+              Expand from node
             </button>
           </>
         ) : <p>카탈로그 또는 graph node를 선택하세요.</p>}
         {props.lineageAdvice ? (
           <div className={`llmAdviceBox ${props.lineageAdvice.status}`}>
-            <h3>Lineage LLM advisory</h3>
+            <h3>LLM notes</h3>
             <p>{props.lineageAdvice.message}</p>
             {props.lineageAdvice.advice ? <pre>{props.lineageAdvice.advice}</pre> : null}
             <small>Citations: {props.lineageAdvice.citations.join(', ') || 'none'}</small>
@@ -1109,7 +1307,6 @@ function LineageTab(props: {
 }
 
 function ImpactTab(props: {
-  runtime: RuntimeConfigResponse | null;
   selectedObject: CatalogObject | null;
   changeType: ChangeType;
   setChangeType: (value: ChangeType) => void;
@@ -1129,8 +1326,8 @@ function ImpactTab(props: {
   return (
     <div className="impactLayout">
       <section className="controlCard">
-        <span className="eyebrow">Scenario form</span>
-        <h1>Impact / 변경 영향</h1>
+        <span className="eyebrow">Impact</span>
+        <h1>변경 영향</h1>
         <div className="scenarioObject">선택 object: <strong>{props.selectedObject?.id ?? '없음'}</strong></div>
         <label>Change type
           <select value={props.changeType} onChange={(event) => props.setChangeType(event.target.value as ChangeType)}>
@@ -1145,20 +1342,17 @@ function ImpactTab(props: {
         </label>
         <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
         <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
-          deterministic Impact 실행
+          Impact 실행
         </button>
         <button className="secondaryButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
-          로컬 LLM review notes
+          LLM notes
         </button>
-        <p className="mutedSmall">
-          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : '로컬 endpoint 설정 전 disabled'}
-        </p>
       </section>
       <section className="resultCard">
-        <span className="eyebrow">Affected objects</span>
+        <span className="eyebrow">Affected</span>
         {props.impactAdvice ? (
           <div className={`llmAdviceBox ${props.impactAdvice.status}`}>
-            <h3>LLM advisory review</h3>
+            <h3>LLM notes</h3>
             <p>{props.impactAdvice.message}</p>
             {props.impactAdvice.advice ? <pre>{props.impactAdvice.advice}</pre> : null}
             <small>Citations: {props.impactAdvice.citations.join(', ') || 'none'}</small>
@@ -1174,12 +1368,17 @@ function ImpactTab(props: {
                 </div>
                 <b>{item.severity}</b>
                 <p>{item.reason}</p>
+                {item.glossary_terms && item.glossary_terms.length > 0 ? (
+                  <div className="inlineTerms">
+                    {item.glossary_terms.slice(0, 4).map((term) => <span key={term.id} title={term.evidence_ids.join(', ')}>{term.term}</span>)}
+                  </div>
+                ) : null}
                 <small>Evidence IDs: {item.evidence_ids.join(', ') || '—'}</small>
               </article>
             ))}
-            {props.impact.affected_objects.length === 0 ? <div className="emptyState">Downstream Impact가 없습니다.</div> : null}
+            {props.impact.affected_objects.length === 0 ? <div className="emptyState">Impact 없음</div> : null}
           </div>
-        ) : <div className="emptyState">시나리오를 실행하세요. changes_path는 필요 없습니다.</div>}
+        ) : <div className="emptyState">시나리오를 실행하세요.</div>}
       </section>
     </div>
   );
@@ -1202,42 +1401,64 @@ function SqlTab(props: {
   return (
     <div className="sqlLayout">
       <section className="controlCard">
-        <span className="eyebrow">SQL Assistant</span>
-        <h1>Native SQL View</h1>
-        <p className="warningText">Advisory only · execution_disabled=true · SQL은 실행하지 않습니다.</p>
+        <span className="eyebrow">SQL Analysis</span>
+        <h1>Reference extraction</h1>
+        <p className="warningText">Parse only · DB execution disabled</p>
         <label>View ID
           <input value={props.viewId} onChange={(event) => props.setViewId(event.target.value)} />
         </label>
         <label>SQL file
           <input value={props.sqlFile} onChange={(event) => props.setSqlFile(event.target.value)} />
         </label>
-        <button className="secondaryButton wide" onClick={props.onExplain} disabled={props.busy === 'sql-explain'}>
-          deterministic view 설명
+        <button className="primaryButton wide" onClick={props.onExplain} disabled={props.busy === 'sql-explain'}>
+          SQL references 분석
         </button>
-        <label>NL-to-SQL advisory prompt
-          <textarea value={props.question} onChange={(event) => props.setQuestion(event.target.value)} rows={4} />
-        </label>
-        <button className="primaryButton wide" onClick={props.onDraft} disabled={props.busy === 'sql-draft'}>
-          advisory SQL 초안
-        </button>
-        <p className="mutedSmall">
-          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : '로컬 endpoint 설정 전 disabled'}
-        </p>
+        <details className="advancedSection sqlAdvanced">
+          <summary>Advanced · LLM draft</summary>
+          <label>Prompt
+            <textarea value={props.question} onChange={(event) => props.setQuestion(event.target.value)} rows={4} />
+          </label>
+          <button className="secondaryButton wide" onClick={props.onDraft} disabled={props.busy === 'sql-draft'}>
+            Draft 생성
+          </button>
+          <p className="mutedSmall">
+            LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : 'disabled'}
+          </p>
+        </details>
       </section>
       <section className="resultCard">
-        <span className="eyebrow">Citations / 실행 차단</span>
+        <span className="eyebrow">Evidence</span>
         {props.explain ? (
           <div className="sqlEvidence">
             <h2>{props.explain.result.view.id}</h2>
             <p>{props.explain.execution_disabled_warning}</p>
             <div className="metaGrid">
               <Metric label="Parser" value={props.explain.result.parser} />
-              <Metric label="Refs" value={String(props.explain.result.reference_edges.length)} />
-              <Metric label="Citations" value={String(props.explain.citations.length)} />
+              <Metric label="Objects" value={String(props.explain.referenced_objects.length)} />
+              <Metric label="Fields" value={String(props.explain.referenced_fields.length)} />
             </div>
+            <div className="sqlAnalysisGrid">
+              <div>
+                <h3>Referenced objects</h3>
+                <ul className="plainList">
+                  {props.explain.referenced_objects.map((objectId) => <li key={objectId}><code>{objectId}</code></li>)}
+                  {props.explain.referenced_objects.length === 0 ? <li>—</li> : null}
+                </ul>
+              </div>
+              <div>
+                <h3>Referenced fields</h3>
+                <ul className="plainList">
+                  {props.explain.referenced_fields.slice(0, 18).map((field) => (
+                    <li key={field.id}><code>{field.table_alias ? `${field.table_alias}.` : ''}{field.column_name}</code></li>
+                  ))}
+                  {props.explain.referenced_fields.length === 0 ? <li>—</li> : null}
+                </ul>
+              </div>
+            </div>
+            <GlossaryList terms={props.explain.glossary_terms} title="Terms" emptyText="Terms 없음" />
             <pre>{JSON.stringify(props.explain.result.reference_edges, null, 2)}</pre>
           </div>
-        ) : <div className="emptyState">로컬 SQL file을 설명하면 citation evidence가 표시됩니다.</div>}
+        ) : <div className="emptyState">SQL file을 분석하세요.</div>}
         {props.draft ? (
           <div className="draftBox">
             <h3>Draft 상태: {props.draft.status}</h3>
@@ -1250,9 +1471,111 @@ function SqlTab(props: {
   );
 }
 
+function RepositoryPicker(props: {
+  path: string;
+  nodes: RepositoryNode[];
+  source: 'live' | 'cache' | 'empty';
+  actionRequired: string | null;
+  connectionReady: boolean;
+  busy: string;
+  onOpenPath: (path: string) => void;
+  onRefresh: () => void;
+  onSelect: (node: RepositoryNode) => void;
+}) {
+  const canGoUp = props.path !== '/';
+  const parentPath = canGoUp ? props.path.split('/').slice(0, -1).join('/') || '/' : '/';
+  return (
+    <section className="repositoryPicker" aria-label="BW repository object picker">
+      <div className="repoHeader">
+        <div>
+          <strong>Repository</strong>
+          <span>{props.source} · {props.path}</span>
+        </div>
+        <button className="iconButton" onClick={props.onRefresh} disabled={!props.connectionReady || props.busy === 'repository-refresh'} title="Live repository refresh">
+          ⟳
+        </button>
+      </div>
+      <div className="repoPathRow">
+        <button className="ghostButton" onClick={() => props.onOpenPath(parentPath)} disabled={!canGoUp}>Up</button>
+        <button className="ghostButton" onClick={() => props.onOpenPath('/')}>Root</button>
+      </div>
+      {props.nodes.length > 0 ? (
+        <div className="repoNodeList">
+          {props.nodes.slice(0, 40).map((node) => (
+            <button key={node.id} className="repoNode" onClick={() => props.onSelect(node)} title={node.description || node.name}>
+              <span className="repoType">{node.object_type}</span>
+              <strong>{node.name}</strong>
+              <small>{node.description || node.path}</small>
+              {node.has_children ? <b>›</b> : null}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <p className="repoEmpty">{repositoryActionText(props.actionRequired)}</p>
+      )}
+    </section>
+  );
+}
+
+function repositoryActionText(actionRequired: string | null): string {
+  if (!actionRequired) return 'Repository cache 없음';
+  if (actionRequired.includes('confirm_read_only')) return 'Test connection 후 repository refresh를 실행하세요.';
+  return actionRequired;
+}
+
+function GlossaryList(props: { terms: GlossaryTerm[]; title: string; emptyText: string }) {
+  return (
+    <div className="glossaryBox">
+      <h3>{props.title}</h3>
+      {props.terms.length > 0 ? (
+        <div className="glossaryTerms">
+          {props.terms.slice(0, 10).map((term) => {
+            const qualifier = glossaryQualifier(term);
+            return (
+              <span key={term.id} title={term.evidence_ids.join(', ')}>
+                {term.term}{qualifier ? <small>{qualifier}</small> : null}
+              </span>
+            );
+          })}
+        </div>
+      ) : <p>{props.emptyText}</p>}
+    </div>
+  );
+}
+
+function glossaryQualifier(term: GlossaryTerm): string {
+  const candidates = [term.field_name, term.object_type, term.source];
+  const normalizedTerm = term.term.trim().toLowerCase();
+  const value = candidates.find((candidate) => candidate && candidate.trim().toLowerCase() !== normalizedTerm);
+  return value ?? '';
+}
+
+function TermsOverview(props: { terms: GlossaryTerm[] }) {
+  const visibleTerms = props.terms.slice(0, 8);
+  return (
+    <section className="termsOverview" aria-label="snapshot glossary terms">
+      <div className="termsOverviewHeader">
+        <strong>Terms</strong>
+        <span>{props.terms.length}</span>
+      </div>
+      {visibleTerms.length > 0 ? (
+        <div className="termsOverviewList">
+          {visibleTerms.map((term) => (
+            <span key={term.id} title={`${term.term} · ${term.source}`}>
+              {term.term}
+            </span>
+          ))}
+        </div>
+      ) : (
+        <small>Snapshot capture 후 metadata/SQL 용어가 표시됩니다.</small>
+      )}
+    </section>
+  );
+}
+
 function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: string) => void; selectedId: string | null }) {
   if (!props.lineage) {
-    return <div className="emptyState graphEmpty">Lineage를 실행하면 bounded graph가 표시됩니다.</div>;
+    return <div className="emptyState graphEmpty">Lineage를 실행하세요.</div>;
   }
   const levelValues = Object.values(props.lineage.levels);
   const minLevel = Math.min(0, ...levelValues);
@@ -1267,15 +1590,15 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
       }, new Map<number, number>()).values(),
     ),
   );
-  const width = Math.max(860, (maxLevel - minLevel + 1) * 260 + 120);
-  const height = Math.max(520, maxRows * 110 + 150);
+  const width = Math.max(900, (maxLevel - minLevel + 1) * 220 + 188);
+  const height = Math.max(340, maxRows * 84 + 124);
   const nodeTypes = Array.from(new Set(props.lineage.nodes.map((node) => node.type))).slice(0, 8);
   return (
     <div className="graphSurface">
       <div className="graphToolbar">
         <div>
-          <strong>Layered Lineage graph</strong>
-          <span>Level, object type, edge direction, truncation 표시</span>
+          <strong>Lineage graph</strong>
+          <span>{props.lineage.nodes.length} nodes · {props.lineage.edges.length} edges</span>
         </div>
         <div className="legendList">
           {nodeTypes.map((type) => <span key={type} className={`legendPill ${nodeTypeClass(type)}`}>{type}</span>)}
@@ -1294,7 +1617,7 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
             </marker>
           </defs>
           {Array.from(new Set(Object.values(props.lineage.levels))).sort((a, b) => a - b).map((level) => {
-            const x = 140 + (level - minLevel) * 260;
+            const x = 112 + (level - minLevel) * 220;
             return (
               <g key={`level-${level}`}>
                 <line x1={x} y1="64" x2={x} y2={height - 38} className="levelGuide" />
@@ -1307,8 +1630,8 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
             const target = positions[edge.target];
             if (!source || !target) return null;
             const goesRight = source.x <= target.x;
-            const startX = source.x + (goesRight ? 104 : -104);
-            const targetX = target.x + (goesRight ? -104 : 104);
+            const startX = source.x + (goesRight ? 88 : -88);
+            const targetX = target.x + (goesRight ? -88 : 88);
             const curve = Math.max(70, Math.abs(targetX - startX) / 2);
             const c1 = goesRight ? startX + curve : startX - curve;
             const c2 = goesRight ? targetX - curve : targetX + curve;
@@ -1317,7 +1640,7 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
             return (
               <g key={edge.id} className={`edgeGroup ${edgeTypeClass(edge.type)}`}>
                 <path d={`M ${startX} ${source.y} C ${c1} ${source.y}, ${c2} ${target.y}, ${targetX} ${target.y}`} className="edgeLine" markerEnd="url(#arrow)" />
-                <text x={labelX} y={labelY} className="edgeLabel">{edge.type}</text>
+                <text x={labelX} y={labelY} className="edgeLabel">{shortLabel(edge.type, 18)}</text>
               </g>
             );
           })}
@@ -1327,14 +1650,16 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
             return (
               <g
                 key={node.id}
-                transform={`translate(${point.x - 102}, ${point.y - 34})`}
+                transform={`translate(${point.x - 88}, ${point.y - 25})`}
                 onClick={() => props.onSelect(node.id)}
                 className={`nodeGroup ${nodeTypeClass(node.type)} ${node.id === props.lineage?.start_id ? 'start' : ''} ${node.id === props.selectedId ? 'selected' : ''}`}
               >
-                <rect width="204" height="68" rx="16" />
-                <text x="14" y="24" className="nodeId">{shortLabel(node.id, 24)}</text>
-                <text x="14" y="46" className="nodeType">{node.type}</text>
-                {omitted > 0 ? <text x="154" y="46" className="nodeBadge">+{omitted}</text> : null}
+                <title>{node.id} · {node.type}</title>
+                <rect className="nodeCard" width="176" height="50" rx="6" />
+                <rect className="nodeAccent" width="3" height="50" rx="1.5" />
+                <text x="12" y="19" className="nodeId">{shortLabel(node.id, 24)}</text>
+                <text x="12" y="36" className="nodeType">{shortLabel(node.type, 20)}</text>
+                {omitted > 0 ? <text x="138" y="36" className="nodeBadge">+{omitted}</text> : null}
               </g>
             );
           })}
@@ -1352,7 +1677,7 @@ function layoutPositions(lineage: LineageResponse, minLevel = 0): Record<string,
   const positions: Record<string, { x: number; y: number }> = {};
   byLevel.forEach((ids, level) => {
     ids.sort().forEach((id, index) => {
-      positions[id] = { x: 140 + (level - minLevel) * 260, y: 104 + index * 112 };
+      positions[id] = { x: 112 + (level - minLevel) * 220, y: 84 + index * 84 };
     });
   });
   return positions;
@@ -1396,11 +1721,66 @@ function TabButton(props: { id: AppTab; active: AppTab; label: string; onClick: 
   return <button className={props.id === props.active ? 'tabButton active' : 'tabButton'} onClick={() => props.onClick(props.id)}>{props.label}</button>;
 }
 
+function SetupStep(props: { index: number; title: string; status: string; done: boolean }) {
+  return (
+    <div className={props.done ? 'setupStep done' : 'setupStep'}>
+      <span>{props.index}</span>
+      <strong>{props.title}</strong>
+      <small>{props.status}</small>
+    </div>
+  );
+}
+
+function CaptureOutcomeCard(props: { snapshot: SnapshotSummary | null; compact?: boolean }) {
+  const capture = props.snapshot?.capture;
+  if (!capture) {
+    return (
+      <section className={props.compact ? 'captureOutcome compact empty' : 'captureOutcome empty'}>
+        <strong>Capture 없음</strong>
+      </section>
+    );
+  }
+  const hasFailures = capture.failed > 0;
+  const className = props.compact
+    ? `captureOutcome compact ${hasFailures ? 'warn' : 'ok'}`
+    : `captureOutcome ${hasFailures ? 'warn' : 'ok'}`;
+  return (
+    <section className={className} aria-label="selected snapshot capture outcome">
+      <div className="captureOutcomeHeader">
+        <div>
+          <span className="eyebrow">Capture</span>
+          <strong>{hasFailures ? '부분 완료 · 확인 필요' : '완료'}</strong>
+        </div>
+        <div className="captureCounts">
+          <Metric label="성공" value={String(capture.succeeded)} />
+          <Metric label="실패" value={String(capture.failed)} />
+        </div>
+      </div>
+      <ul className="captureOps" aria-label="capture operations">
+        {capture.operations.map((op, index) => (
+          <li key={`${op.name}-${op.label}-${index}`} className={op.ok ? 'opOk' : 'opError'}>
+            <span>{op.name}</span>
+            <small>{op.label}</small>
+            {op.ok ? (
+              <b>{op.payload_kind ?? 'ok'}{op.item_count != null ? ` · ${op.item_count}` : ''}</b>
+            ) : (
+              <code>{op.error ?? 'redacted error'}</code>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className={hasFailures ? 'nextAction warn' : 'nextAction'}>{captureNextAction(capture)}</p>
+    </section>
+  );
+}
+
 function bwStatus(runtime: RuntimeConfigResponse | null): string {
   if (!runtime) return '확인 중';
   if (!runtime.bw.configured) return '미설정';
-  if (runtime.bw.source === 'env') return '.env 설정';
-  return 'UI 설정';
+  if (runtime.connection_status === 'ok') return '연결 성공';
+  if (runtime.connection_status === 'failed') return '실패';
+  if (runtime.connection_status === 'stale') return '재테스트';
+  return '미테스트';
 }
 
 function llmStatus(runtime: RuntimeConfigResponse | null): string {
@@ -1420,17 +1800,60 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function connectionTestBadge(test: LiveSmokeResult | null): string {
-  if (!test) return 'idle';
-  if (test.status === 'ok') return 'ok';
-  if (test.status === 'partial') return 'warn';
-  return 'error';
+function connectionTestBadge(test: LiveSmokeResult | null, status?: ConnectionStatus): string {
+  if (test) {
+    if (test.status === 'ok') return 'ok';
+    if (test.status === 'partial') return 'warn';
+    return 'error';
+  }
+  if (status === 'ok') return 'ok';
+  if (status === 'failed') return 'error';
+  if (status === 'untested' || status === 'stale') return 'warn';
+  return 'idle';
 }
 
-function connectionTestLabel(test: LiveSmokeResult | null, configured: boolean): string {
-  if (!configured) return 'BW 설정 필요';
-  if (!test) return '미실행';
-  if (test.status === 'ok') return '연결 성공';
-  if (test.status === 'partial') return '부분 성공';
-  return '실패';
+function connectionTestLabel(test: LiveSmokeResult | null, runtime: RuntimeConfigResponse | null): string {
+  if (!runtime?.bw.configured) return 'BW 설정 필요';
+  if (test) {
+    if (test.status === 'ok') return '연결 성공';
+    if (test.status === 'partial') return '부분 성공';
+    return '실패';
+  }
+  if (runtime.connection_status === 'ok') return '연결 성공';
+  if (runtime.connection_status === 'failed') return '실패';
+  if (runtime.connection_status === 'stale') return '재테스트 필요';
+  return '미실행';
+}
+
+function captureNextAction(capture: LiveCaptureSummary): string {
+  if (capture.failed === 0) {
+    return 'Lineage/Impact를 실행하세요.';
+  }
+  if (capture.succeeded > 0) {
+    return '실패 항목을 확인하세요.';
+  }
+  return '설정/연결 테스트를 확인하세요.';
+}
+
+function liveCaptureButtonTitle(
+  connectionReady: boolean,
+  liveCaptureTargetReady: boolean,
+): string {
+  if (!connectionReady) return '먼저 Test connection을 실행해 성공해야 합니다.';
+  if (!liveCaptureTargetReady) return 'object name 또는 좁은 search term을 입력하세요.';
+  return '';
+}
+
+function mergeSnapshotCapture(
+  snapshots: SnapshotSummary[],
+  capturedSnapshot?: SnapshotSummary,
+): SnapshotSummary[] {
+  if (!capturedSnapshot?.capture) return snapshots;
+  let found = false;
+  const merged = snapshots.map((snapshot) => {
+    if (snapshot.id !== capturedSnapshot.id) return snapshot;
+    found = true;
+    return { ...snapshot, ...capturedSnapshot, capture: capturedSnapshot.capture };
+  });
+  return found ? merged : [capturedSnapshot, ...merged];
 }

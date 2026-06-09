@@ -22,6 +22,9 @@ BW connection values are supplied by the user at runtime. The project supports t
 - optional `BW_VERIFY_SSL`
 - optional `BW_CA_BUNDLE` for a corporate CA PEM file when internal TLS inspection is used
 - optional `BW_TRUST_ENV` to let HTTPX honor proxy/`NO_PROXY` environment settings
+- optional `NO_PROXY`; when `BW_TRUST_ENV=true`, the runtime client appends the
+  `BW_URL` hostname to process-local `NO_PROXY` before live BW calls so corporate
+  HTTP(S) proxies are bypassed for the SAP BW host
 
 Optional local LLM values are also supplied by the user at runtime:
 
@@ -95,9 +98,16 @@ BW_USER=<user-supplied> \
 BW_PASSWORD=<user-supplied> \
 BW_CLIENT=<user-supplied> \
 BW_CA_BUNDLE=<optional-corporate-ca-pem-path> \
-NO_PROXY=<optional-bw-host> \
+NO_PROXY=<optional-bw-host-or-let-runtime-append-bw-host> \
 uv run bwli collect --live --confirm-read-only --search-term Z* --out .tmp/live-snapshot
 ```
+
+The BW Modeling API client uses an Eclipse ADT-compatible `User-Agent` and ADT
+diagnostic headers based on the `bw-modeling-mcp` calling pattern. If your shell
+or corporate endpoint sets `HTTP_PROXY`/`HTTPS_PROXY`, keep `BW_TRUST_ENV=true`
+and either pre-set `NO_PROXY=<bw-host>` or let the runtime append the hostname
+parsed from `BW_URL`. This mutation is process-local; it is not written back to
+`.env` or Git.
 
 ### Live read-only smoke and snapshot collection
 
@@ -133,7 +143,7 @@ BW_CLIENT=<user-supplied> \
 BW_LANGUAGE=EN \
 BW_VERIFY_SSL=true \
 BW_CA_BUNDLE=<optional-corporate-ca-pem-path> \
-NO_PROXY=<optional-bw-host> \
+NO_PROXY=<optional-bw-host-or-let-runtime-append-bw-host> \
 uv run bwli collect --live --confirm-read-only --search-term Z* --object ZCUBE --object-type ADSO --dataflow-direction downwards --dataflow-levels 3 --out .tmp/live-snapshot
 ```
 

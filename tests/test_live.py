@@ -33,8 +33,18 @@ class RecordingLiveClient:
             "levels": levels,
         }
 
-    def fetch_xref(self, object_name: str, *, direction: str = "downstream") -> dict[str, Any]:
-        return {"object": object_name, "direction": direction}
+    def fetch_xref(
+        self,
+        object_name: str,
+        *,
+        object_type: str = "ADSO",
+        source_system: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "object": object_name,
+            "object_type": object_type,
+            "source_system": source_system,
+        }
 
     def close(self) -> None:
         self.closed = True

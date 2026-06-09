@@ -42,8 +42,14 @@ class FakeLiveBwClient:
 </dmod:dataFlow>
 """.strip()
 
-    def fetch_xref(self, object_name: str, *, direction: str = "downstream") -> dict[str, Any]:
-        self.calls.append(("xref", object_name, direction))
+    def fetch_xref(
+        self,
+        object_name: str,
+        *,
+        object_type: str = "ADSO",
+        source_system: str | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(("xref", object_name, object_type, source_system))
         return {"references": [{"from": object_name, "to": "ZQUERY"}]}
 
     def close(self) -> None:
@@ -438,7 +444,7 @@ def test_legacy_runtime_config_clear_ignores_env_fallback(monkeypatch: pytest.Mo
     assert response.json()["bw"]["configured"] is False
 
 
-def _put_runtime_bw_config(client: TestClient, *, password: str = "[REDACTED]") -> None:
+def _put_runtime_bw_config(client: TestClient, *, password: str = "fixture-secret-value") -> None:
     response = client.put(
         "/api/runtime-config",
         json={
@@ -505,10 +511,11 @@ def test_live_smoke_uses_runtime_config_and_returns_safe_operation_summaries() -
         "bw_xref",
     ]
     assert payload["operations"][0]["item_count"] == 2
+    assert payload["operations"][2]["label"] == "bw://bw_xref?objectType=ADSO&objectName=ZCUBE"
     assert fake.calls == [
         ("search", "Z", None),
         ("dataflow", "ZCUBE", "ADSO", None, "downwards", 3),
-        ("xref", "ZCUBE", "upstream"),
+        ("xref", "ZCUBE", "ADSO", None),
     ]
     assert fake.closed is True
 
@@ -567,10 +574,12 @@ def test_live_collect_writes_local_snapshot_manifest_without_secrets(tmp_path: P
     manifest_text = manifest_path.read_text(encoding="utf-8")
     assert "fixture-user" not in manifest_text
     assert "bw://bw_search" in manifest_text
+    assert "bw://bw_xref?objectType=ADSO&objectName=ZCUBE" in manifest_text
+    assert "bw://bw_xref/downstream" not in manifest_text
     assert fake.calls == [
         ("search", "Z", None),
         ("dataflow", "ZCUBE", "ADSO", None, "downwards", 3),
-        ("xref", "ZCUBE", "downstream"),
+        ("xref", "ZCUBE", "ADSO", None),
     ]
 
 
@@ -634,6 +643,7 @@ def test_connection_test_endpoint_returns_live_smoke_result() -> None:
     assert payload["status"] == "ok"
     assert [op["name"] for op in payload["operations"]] == ["bw_search"]
     assert "fixture-user" not in response.text
+    assert client.get("/api/v1/runtime-config").json()["connection_status"] == "ok"
 
 
 class HostLeakingSearchClient(FakeLiveBwClient):
@@ -681,6 +691,7 @@ def test_connection_test_redacts_bw_host_and_secret_in_error_detail() -> None:
     assert search_op["ok"] is False
     assert "[BW_HOST]" in search_op["error"] or "[BW_URL]" in search_op["error"]
     assert "[REDACTED]" in search_op["error"]
+    assert client.get("/api/v1/runtime-config").json()["connection_status"] == "failed"
 
 
 def test_capture_snapshot_partial_success_preserves_succeeded_payloads(tmp_path: Path) -> None:
@@ -712,6 +723,11 @@ def test_capture_snapshot_partial_success_preserves_succeeded_payloads(tmp_path:
         create_app(project_root=tmp_path, bw_client_factory=lambda _state: partial)
     )
     _put_runtime_bw_config(client, password="mock-leaked-bw-password")
+    ready = client.post(
+        "/api/v1/connection/test",
+        json={"confirm_read_only": True, "search_term": "Z"},
+    )
+    assert ready.status_code == 200, ready.text
 
     response = client.post(
         "/api/v1/snapshots/capture",
@@ -738,6 +754,20 @@ def test_capture_snapshot_partial_success_preserves_succeeded_payloads(tmp_path:
     assert "bw.example.invalid" not in failing[0]["error"]
     assert capture["operations"]
     assert op_status  # spot-check shape
+    scope = payload["capture_scope"]
+    selected_scope = {
+        (entry["object_id"], entry["operation"]): entry
+        for entry in scope
+        if entry["role"] == "selected"
+    }
+    assert selected_scope[("ZOK", "bw_get_dataflow")]["status"] == "ok"
+    assert selected_scope[("ZBAD", "bw_get_dataflow")]["status"] == "error"
+    assert "mock-leaked-bw-password" not in selected_scope[("ZBAD", "bw_get_dataflow")]["error"]
+    assert "bw.example.invalid" not in selected_scope[("ZBAD", "bw_get_dataflow")]["error"]
+
+    scope_response = client.get(f"/api/v1/snapshots/{payload['id']}/capture-scope")
+    assert scope_response.status_code == 200
+    assert scope_response.json()["items"] == scope
 
 
 def test_capture_snapshot_returns_error_when_every_live_call_fails(tmp_path: Path) -> None:
@@ -758,6 +788,11 @@ def test_capture_snapshot_returns_error_when_every_live_call_fails(tmp_path: Pat
         create_app(project_root=tmp_path, bw_client_factory=lambda _state: failing)
     )
     _put_runtime_bw_config(client, password="mock-leaked-bw-password")
+    ready = client.post(
+        "/api/v1/connection/test",
+        json={"confirm_read_only": True, "search_term": "Z"},
+    )
+    assert ready.status_code == 200, ready.text
 
     response = client.post(
         "/api/v1/snapshots/capture",
