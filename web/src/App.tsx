@@ -13,6 +13,7 @@ import {
   postImpactAdvice,
   postImpactScenario,
   postLineage,
+  postLineageAdvice,
   putRuntimeConfig,
   type AppTab,
   type CatalogObject,
@@ -24,6 +25,7 @@ import {
   type HealthResponse,
   type ImpactAdviceResponse,
   type ImpactScenarioResponse,
+  type LineageAdviceResponse,
   type LineageResponse,
   type RuntimeConfigResponse,
   type SnapshotSummary,
@@ -95,6 +97,7 @@ export default function App() {
   const [sqlFile, setSqlFile] = useState(fixtureSqlPath);
   const [sqlQuestion, setSqlQuestion] = useState('이 뷰의 주요 소스와 집계 로직을 설명하는 조회 초안');
   const [lineage, setLineage] = useState<LineageResponse | null>(null);
+  const [lineageAdvice, setLineageAdvice] = useState<LineageAdviceResponse | null>(null);
   const [impact, setImpact] = useState<ImpactScenarioResponse | null>(null);
   const [impactAdvice, setImpactAdvice] = useState<ImpactAdviceResponse | null>(null);
   const [sqlExplain, setSqlExplain] = useState<SqlExplainResponse | null>(null);
@@ -130,7 +133,6 @@ export default function App() {
   const selectedObject = objects.find((item) => item.id === selectedObjectId)
     ?? (allowHiddenSelection && objectDetail?.id === selectedObjectId ? objectDetail : null);
   const runtimeMissing = runtime ? !runtime.bw.configured : true;
-  const showDiagnostics = diagnosticsOpen || runtimeMissing;
   const liveObjectNameTokens = useMemo(() => parseObjectNamesText(liveObjectNames), [liveObjectNames]);
   const snapshotPickObjects = useMemo(() => objects.slice(0, 16), [objects]);
 
@@ -162,6 +164,7 @@ export default function App() {
     if (selectedObjectId && !objects.some((item) => item.id === selectedObjectId) && !allowHiddenSelection) {
       setSelectedObjectId(objects[0]?.id ?? '');
       setLineage(null);
+      setLineageAdvice(null);
       setImpact(null);
       setImpactAdvice(null);
     }
@@ -177,16 +180,17 @@ export default function App() {
 
   const latestSnapshotLabel = selectedSnapshot
     ? compactDate(selectedSnapshot.created_at)
-    : 'No snapshot / 스냅샷 없음';
+    : '스냅샷 없음';
 
   const graphStats = useMemo(() => {
-    if (!lineage) return 'Run lineage';
-    const capText = lineage.truncated ? `truncated ${lineage.truncation.omitted_neighbor_total}` : 'complete';
+    if (!lineage) return 'Lineage 미실행';
+    const capText = lineage.truncated ? `일부 생략 ${lineage.truncation.omitted_neighbor_total}` : '전체 표시';
     return `${lineage.nodes.length} nodes · ${lineage.edges.length} edges · ${capText}`;
   }, [lineage]);
 
   function clearAnalysisState() {
     setLineage(null);
+    setLineageAdvice(null);
     setImpact(null);
     setImpactAdvice(null);
     setSqlExplain(null);
@@ -353,7 +357,7 @@ export default function App() {
   async function captureLive() {
     const objectNames = parseLiveObjectNames();
     if (objectNames.length === 0) {
-      setError('Live capture requires at least one object name so dataflow/xref edges can be collected.');
+      setError('Live capture에는 dataflow/xref edge 수집 대상 object name이 최소 1개 필요합니다.');
       return;
     }
     setBusy('snapshot');
@@ -395,7 +399,29 @@ export default function App() {
         edge_cap: edgeCap,
       });
       setLineage(response);
+      setLineageAdvice(null);
       setSelectedObjectId(startId);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runLineageAdvice() {
+    if (!selectedSnapshotId || !selectedObjectId) return;
+    setBusy('lineage-advice');
+    try {
+      const response = await postLineageAdvice(selectedSnapshotId, {
+        object_id: selectedObjectId,
+        direction,
+        depth,
+        node_cap: nodeCap,
+        edge_cap: edgeCap,
+      });
+      setLineage(response.lineage);
+      setLineageAdvice(response);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -491,80 +517,194 @@ export default function App() {
           <span className="brandMark">BW</span>
           <div>
             <strong>BW Lineage Impact</strong>
-            <span>local-first SAP BW/4HANA lineage analyzer</span>
+            <span>로컬 전용 SAP BW/4HANA Lineage analyzer</span>
           </div>
         </div>
         <div className="statusStrip">
           <StatusPill label="BW" value={bwStatus(runtime)} tone={runtime?.bw.configured ? 'ok' : 'warn'} />
           <StatusPill label="Snapshot" value={latestSnapshotLabel} tone={selectedSnapshot ? 'info' : 'warn'} />
-          <StatusPill label="Local-only" value={health?.local_only ? '로컬 전용' : 'checking'} tone="ok" />
-          <StatusPill label="Read-only" value={health?.read_only ? 'GET only' : 'checking'} tone="ok" />
-          <StatusPill label="LLM" value={runtime?.llm.configured ? 'local configured' : 'disabled'} tone="neutral" />
+          <StatusPill label="Local-only" value={health?.local_only ? '로컬 전용' : '확인 중'} tone="ok" />
+          <StatusPill label="Read-only" value={health?.read_only ? 'GET only' : '확인 중'} tone="ok" />
+          <StatusPill label="LLM" value={runtime?.llm.configured ? 'local 설정됨' : 'disabled'} tone="neutral" />
         </div>
         <button className="ghostButton" onClick={() => setDiagnosticsOpen((value) => !value)}>
-          Diagnostics / 설정
+          Settings
         </button>
       </header>
 
       {error ? <div className="errorBar">{error}</div> : null}
 
-      {showDiagnostics ? (
-        <section className="diagnosticsPanel">
-          <div>
-            <h2>Setup / Diagnostics</h2>
-            <p>
-              {runtime?.bw.source === 'env'
-                ? 'BW is configured from .env/environment; duplicate UI setup is not required.'
-                : 'BW 환경 설정이 없으면 live capture는 비활성입니다. Secrets stay in process memory only.'}
-            </p>
-          </div>
-          <div className="setupGrid">
-            <input placeholder="BW_URL" value={setupForm.url} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, url: event.target.value }); }} />
-            <input placeholder="BW_USER" value={setupForm.user} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, user: event.target.value }); }} />
-            <input placeholder="BW_PASSWORD" type="password" value={setupForm.password} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, password: event.target.value }); }} />
-            <input placeholder="BW_CLIENT" value={setupForm.client} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, client: event.target.value }); }} />
-            <input placeholder="BW_CA_BUNDLE (optional)" value={setupForm.caBundle} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, caBundle: event.target.value }); }} />
-            <label className="checkField">
-              <input
-                type="checkbox"
-                checked={setupForm.verifySsl}
-                onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, verifySsl: event.target.checked }); }}
-              />
-              Verify SSL
-            </label>
-            <label className="checkField">
-              <input
-                type="checkbox"
-                checked={setupForm.trustEnv}
-                onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, trustEnv: event.target.checked }); }}
-              />
-              Trust proxy env
-            </label>
-            <label className="checkField">
-              <input
-                type="checkbox"
-                checked={setupForm.llmEnabled}
-                onChange={(event) => setSetupForm({ ...setupForm, llmEnabled: event.target.checked })}
-              />
-              Enable local OpenAI-compatible SQL drafts
-            </label>
-            <input
-              placeholder="BWLI_LLM_BASE_URL (local only)"
-              value={setupForm.llmBaseUrl}
-              onChange={(event) => setSetupForm({ ...setupForm, llmBaseUrl: event.target.value })}
-            />
-            <input placeholder="BWLI_LLM_MODEL" value={setupForm.llmModel} onChange={(event) => setSetupForm({ ...setupForm, llmModel: event.target.value })} />
-            <input
-              placeholder={runtime?.llm.configured ? 'BWLI_LLM_API_KEY already configured' : 'BWLI_LLM_API_KEY'}
-              type="password"
-              value={setupForm.llmApiKey}
-              onChange={(event) => setSetupForm({ ...setupForm, llmApiKey: event.target.value })}
-            />
-            <p className="setupHint">LLM: {llmStatus(runtime)} · SQL Assistant never executes SQL.</p>
-            <button className="primaryButton" onClick={saveSetup} disabled={busy === 'setup'}>Save runtime</button>
-            <button className="secondaryButton" onClick={clearSetup} disabled={busy === 'setup'}>Clear / env fallback</button>
-          </div>
-        </section>
+      {runtimeMissing && !diagnosticsOpen ? (
+        <div className="setupPrompt">
+          BW runtime 설정이 없어 Live GET capture는 비활성입니다. <button onClick={() => setDiagnosticsOpen(true)}>Settings 열기</button>
+        </div>
+      ) : null}
+
+      {diagnosticsOpen ? (
+        <div className="settingsOverlay" onClick={() => setDiagnosticsOpen(false)}>
+          <aside className="settingsDrawer" role="dialog" aria-modal="true" aria-label="Settings" onClick={(event) => event.stopPropagation()}>
+            <div className="drawerHeader">
+              <div>
+                <span className="eyebrow">Settings</span>
+                <h2>실행 설정</h2>
+                <p>Secrets는 process memory에만 보관됩니다. BW capture는 읽기 전용 GET metadata 호출만 사용합니다.</p>
+              </div>
+              <button className="iconButton" onClick={() => setDiagnosticsOpen(false)} aria-label="Settings 닫기">×</button>
+            </div>
+
+            <section className="drawerSection">
+              <h3>Runtime / Diagnostics</h3>
+              <p>
+                {runtime?.bw.source === 'env'
+                  ? 'BW 설정은 .env/environment에서 로드되었습니다. UI 재입력은 필요 없습니다.'
+                  : 'Live capture에는 BW_URL, BW_USER, BW_PASSWORD, BW_CLIENT가 필요합니다.'}
+              </p>
+              <div className="setupGrid">
+                <input placeholder="BW_URL" value={setupForm.url} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, url: event.target.value }); }} />
+                <input placeholder="BW_USER" value={setupForm.user} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, user: event.target.value }); }} />
+                <input placeholder="BW_PASSWORD" type="password" value={setupForm.password} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, password: event.target.value }); }} />
+                <input placeholder="BW_CLIENT" value={setupForm.client} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, client: event.target.value }); }} />
+                <input placeholder="BW_LANGUAGE (예: EN)" value={setupForm.language} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, language: event.target.value }); }} />
+                <input placeholder="BW_CA_BUNDLE (optional)" value={setupForm.caBundle} onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, caBundle: event.target.value }); }} />
+                <label className="checkField">
+                  <input
+                    type="checkbox"
+                    checked={setupForm.verifySsl}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, verifySsl: event.target.checked }); }}
+                  />
+                  TLS/SSL 검증
+                </label>
+                <label className="checkField">
+                  <input
+                    type="checkbox"
+                    checked={setupForm.trustEnv}
+                    onChange={(event) => { setBwSetupTouched(true); setSetupForm({ ...setupForm, trustEnv: event.target.checked }); }}
+                  />
+                  Proxy env 신뢰
+                </label>
+                <label className="checkField fullSpan">
+                  <input
+                    type="checkbox"
+                    checked={setupForm.llmEnabled}
+                    onChange={(event) => setSetupForm({ ...setupForm, llmEnabled: event.target.checked })}
+                  />
+                  로컬 OpenAI-compatible LLM advisory 활성화
+                </label>
+                <input
+                  placeholder="BWLI_LLM_BASE_URL (local only)"
+                  value={setupForm.llmBaseUrl}
+                  onChange={(event) => setSetupForm({ ...setupForm, llmBaseUrl: event.target.value })}
+                />
+                <input placeholder="BWLI_LLM_MODEL" value={setupForm.llmModel} onChange={(event) => setSetupForm({ ...setupForm, llmModel: event.target.value })} />
+                <input
+                  placeholder={runtime?.llm.configured ? 'BWLI_LLM_API_KEY 설정됨' : 'BWLI_LLM_API_KEY'}
+                  type="password"
+                  value={setupForm.llmApiKey}
+                  onChange={(event) => setSetupForm({ ...setupForm, llmApiKey: event.target.value })}
+                />
+                <p className="setupHint fullSpan">LLM: {llmStatus(runtime)} · SQL/Lineage/Impact advisory only · SQL/BW write 실행 없음.</p>
+                <button className="primaryButton" onClick={saveSetup} disabled={busy === 'setup'}>설정 저장</button>
+                <button className="secondaryButton" onClick={clearSetup} disabled={busy === 'setup'}>초기화 / env fallback</button>
+              </div>
+            </section>
+
+            <section className="drawerSection">
+              <h3>Snapshot capture</h3>
+              <p>Fixture는 로컬 샘플 검증용입니다. Live GET capture는 선택한 object names만 좁게 조회합니다.</p>
+              <label className="fieldLabel">
+                Live object names
+                <textarea
+                  className="liveObjectInput"
+                  placeholder="ZADSO_SALES, ZTRFN_MARGIN — dataflow/xref edge 수집 대상"
+                  value={liveObjectNames}
+                  onChange={(event) => setLiveObjectNames(event.target.value)}
+                />
+              </label>
+              <div className="liveObjectTools">
+                <button className="secondaryButton" onClick={() => addLiveObjectName(selectedObjectId)} disabled={!selectedObjectId}>
+                  선택 객체 추가
+                </button>
+                <button className="secondaryButton" onClick={clearLiveObjectNames} disabled={liveObjectNameTokens.length === 0}>
+                  선택 비우기
+                </button>
+              </div>
+              {liveObjectNameTokens.length > 0 ? (
+                <div className="selectedLiveObjects" aria-label="selected live capture objects">
+                  {liveObjectNameTokens.map((name) => (
+                    <button key={name} className="selectedObjectChip" onClick={() => removeLiveObjectName(name)} title="Live capture 대상에서 제거">
+                      {name} ×
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="livePickerHint">카탈로그에서 객체를 선택한 뒤 “선택 객체 추가”를 누르거나 직접 입력하세요.</p>
+              )}
+              {snapshotPickObjects.length > 0 ? (
+                <div className="snapshotPickList" aria-label="snapshot object quick picker">
+                  {snapshotPickObjects.map((item) => (
+                    <button key={item.id} className="snapshotPickButton" onClick={() => addLiveObjectName(item.id)}>
+                      <span>{item.type}</span>{item.id}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <div className="liveOptionsGrid">
+                <label>
+                  Object type
+                  <input value={liveObjectType} onChange={(event) => setLiveObjectType(event.target.value)} />
+                </label>
+                <label>
+                  Source system
+                  <input placeholder="optional for RSDS" value={liveSourceSystem} onChange={(event) => setLiveSourceSystem(event.target.value)} />
+                </label>
+                <label>
+                  Dataflow
+                  <select
+                    value={liveDataflowDirection}
+                    onChange={(event) => setLiveDataflowDirection(event.target.value as DataflowDirection)}
+                  >
+                    <option value="downwards">Downwards</option>
+                    <option value="upwards">Upwards</option>
+                    <option value="both">Both</option>
+                  </select>
+                </label>
+                <label>
+                  Where-used
+                  <select value={liveXrefDirection} onChange={(event) => setLiveXrefDirection(event.target.value as XrefDirection)}>
+                    <option value="downstream">Downstream</option>
+                    <option value="upstream">Upstream</option>
+                  </select>
+                </label>
+                <label>
+                  Levels
+                  <input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={liveDataflowLevels}
+                    onChange={(event) => setLiveDataflowLevels(Number(event.target.value) || 0)}
+                  />
+                </label>
+              </div>
+              <label className="checkField liveConfirm fullSpan">
+                <input
+                  type="checkbox"
+                  checked={liveReadOnlyConfirmed}
+                  onChange={(event) => setLiveReadOnlyConfirmed(event.target.checked)}
+                />
+                읽기 전용 GET metadata capture임을 확인합니다.
+              </label>
+              <div className="captureRow">
+                <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>
+                  Fixture capture
+                </button>
+                <button className="primaryButton" onClick={captureLive} disabled={!runtime?.bw.configured || !liveReadOnlyConfirmed || busy === 'snapshot'}>
+                  Live GET capture
+                </button>
+              </div>
+            </section>
+          </aside>
+        </div>
       ) : null}
 
       <main className="appFrame">
@@ -580,7 +720,7 @@ export default function App() {
           <label className="fieldLabel">
             Snapshot
             <select value={selectedSnapshotId} onChange={(event) => chooseSnapshot(event.target.value)}>
-              <option value="">No snapshot</option>
+              <option value="">스냅샷 없음</option>
               {snapshots.map((snapshot) => (
                 <option key={snapshot.id} value={snapshot.id}>
                   {compactDate(snapshot.created_at)} · {snapshot.object_count} objects
@@ -589,104 +729,16 @@ export default function App() {
             </select>
           </label>
 
-          <label className="fieldLabel">
-            Live object names
-            <textarea
-              className="liveObjectInput"
-              placeholder="ZADSO_SALES, ZTRFN_MARGIN — required for live dataflow/xref edges"
-              value={liveObjectNames}
-              onChange={(event) => setLiveObjectNames(event.target.value)}
-            />
-          </label>
-          <div className="liveObjectTools">
-            <button className="secondaryButton" onClick={() => addLiveObjectName(selectedObjectId)} disabled={!selectedObjectId}>
-              Add selected object
-            </button>
-            <button className="secondaryButton" onClick={clearLiveObjectNames} disabled={liveObjectNameTokens.length === 0}>
-              Clear picks
-            </button>
-          </div>
-          {liveObjectNameTokens.length > 0 ? (
-            <div className="selectedLiveObjects" aria-label="selected live capture objects">
-              {liveObjectNameTokens.map((name) => (
-                <button key={name} className="selectedObjectChip" onClick={() => removeLiveObjectName(name)} title="Remove object from live capture">
-                  {name} ×
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p className="livePickerHint">스냅샷 객체를 선택하면 입력 없이도 해당 객체로 live capture를 실행할 수 있습니다.</p>
-          )}
-          {snapshotPickObjects.length > 0 ? (
-            <div className="snapshotPickList" aria-label="snapshot object quick picker">
-              {snapshotPickObjects.map((item) => (
-                <button key={item.id} className="snapshotPickButton" onClick={() => addLiveObjectName(item.id)}>
-                  <span>{item.type}</span>{item.id}
-                </button>
-              ))}
-            </div>
-          ) : null}
-
-          <div className="liveOptionsGrid">
-            <label>
-              Object type
-              <input value={liveObjectType} onChange={(event) => setLiveObjectType(event.target.value)} />
-            </label>
-            <label>
-              Source system
-              <input placeholder="optional for RSDS" value={liveSourceSystem} onChange={(event) => setLiveSourceSystem(event.target.value)} />
-            </label>
-            <label>
-              Dataflow
-              <select
-                value={liveDataflowDirection}
-                onChange={(event) => setLiveDataflowDirection(event.target.value as DataflowDirection)}
-              >
-                <option value="downwards">Downwards</option>
-                <option value="upwards">Upwards</option>
-                <option value="both">Both</option>
-              </select>
-            </label>
-            <label>
-              Where-used
-              <select value={liveXrefDirection} onChange={(event) => setLiveXrefDirection(event.target.value as XrefDirection)}>
-                <option value="downstream">Downstream</option>
-                <option value="upstream">Upstream</option>
-              </select>
-            </label>
-            <label>
-              Levels
-              <input
-                type="number"
-                min={0}
-                max={10}
-                value={liveDataflowLevels}
-                onChange={(event) => setLiveDataflowLevels(Number(event.target.value) || 0)}
-              />
-            </label>
-          </div>
-
-          <label className="checkField liveConfirm">
-            <input
-              type="checkbox"
-              checked={liveReadOnlyConfirmed}
-              onChange={(event) => setLiveReadOnlyConfirmed(event.target.checked)}
-            />
-            I confirm read-only GET metadata capture / 읽기 전용 메타데이터 조회를 확인합니다.
-          </label>
-
-          <div className="captureRow">
-            <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>
-              Fixture capture
-            </button>
-            <button className="secondaryButton" onClick={captureLive} disabled={!runtime?.bw.configured || !liveReadOnlyConfirmed || busy === 'snapshot'}>
-              Live GET capture
-            </button>
+          <div className="catalogActionCard">
+            <strong>Capture 설정</strong>
+            <p>Fixture / Live GET capture와 object names 선택은 Settings 패널로 이동했습니다.</p>
+            <button className="secondaryButton wide" onClick={() => setDiagnosticsOpen(true)}>Settings 열기</button>
+            {liveObjectNameTokens.length > 0 ? <small>{liveObjectNameTokens.length}개 live capture 대상 선택됨</small> : null}
           </div>
 
           <input
             className="catalogSearch"
-            placeholder="Search object / 이름 검색"
+            placeholder="object 이름 검색"
             value={catalogQuery}
             onChange={(event) => {
               setAllowHiddenSelection(false);
@@ -703,14 +755,14 @@ export default function App() {
                   setObjectType(filter);
                 }}
               >
-                {filter || 'All'}
+                {filter || '전체'}
               </button>
             ))}
           </div>
 
           <div className="objectList" aria-busy={busy === 'catalog'}>
             {objects.length === 0 ? (
-              <div className="emptyState">No objects. Capture a snapshot first.</div>
+              <div className="emptyState">객체가 없습니다. 먼저 snapshot을 capture하세요.</div>
             ) : (
               objects.map((item) => (
                 <button
@@ -720,6 +772,7 @@ export default function App() {
                     setAllowHiddenSelection(false);
                     setSelectedObjectId(item.id);
                     setLineage(null);
+                    setLineageAdvice(null);
                     setImpact(null);
                     setImpactAdvice(null);
                   }}
@@ -737,7 +790,7 @@ export default function App() {
                 disabled={busy === 'catalog'}
                 onClick={() => void refreshObjects(selectedSnapshotId, objectNextCursor)}
               >
-                Load more objects
+                objects 더 보기
               </button>
             ) : null}
         </aside>
@@ -754,6 +807,7 @@ export default function App() {
               selectedObject={selectedObject}
               objectDetail={objectDetail}
               lineage={lineage}
+              lineageAdvice={lineageAdvice}
               graphStats={graphStats}
               direction={direction}
               setDirection={setDirection}
@@ -764,19 +818,23 @@ export default function App() {
               edgeCap={edgeCap}
               setEdgeCap={setEdgeCap}
               onRun={() => void runLineage()}
+              onAdvice={() => void runLineageAdvice()}
               onSelect={(id) => {
                 setAllowHiddenSelection(true);
                 setSelectedObjectId(id);
+                setLineageAdvice(null);
                 setImpact(null);
                 setImpactAdvice(null);
               }}
               onExpand={(id) => {
                 setAllowHiddenSelection(true);
+                setLineageAdvice(null);
                 setImpact(null);
                 setImpactAdvice(null);
                 void runLineage(id);
               }}
               busy={busy === 'lineage'}
+              adviceBusy={busy === 'lineage-advice'}
             />
           ) : null}
 
@@ -827,6 +885,7 @@ function LineageTab(props: {
   selectedObject: CatalogObject | null;
   objectDetail: CatalogObjectDetail | null;
   lineage: LineageResponse | null;
+  lineageAdvice: LineageAdviceResponse | null;
   graphStats: string;
   direction: Direction;
   setDirection: (value: Direction) => void;
@@ -837,32 +896,37 @@ function LineageTab(props: {
   edgeCap: number;
   setEdgeCap: (value: number) => void;
   onRun: () => void;
+  onAdvice: () => void;
   onSelect: (id: string) => void;
   onExpand: (id: string) => void;
   busy: boolean;
+  adviceBusy: boolean;
 }) {
   return (
     <div className="workspaceGrid">
       <section className="controlCard">
         <div className="sectionTitle">
           <span className="eyebrow">Bounded graph</span>
-          <h1>{props.selectedObject?.id ?? 'Select object'}</h1>
+          <h1>{props.selectedObject?.id ?? '객체 선택'}</h1>
           <p>{props.graphStats}</p>
         </div>
         <div className="compactForm three">
           <label>Direction
             <select value={props.direction} onChange={(event) => props.setDirection(event.target.value as Direction)}>
-              <option value="downstream">downstream</option>
-              <option value="upstream">upstream</option>
-              <option value="both">both</option>
+              <option value="downstream">Downstream</option>
+              <option value="upstream">Upstream</option>
+              <option value="both">Both</option>
             </select>
           </label>
           <NumberField label="Depth" value={props.depth} min={0} max={20} onChange={props.setDepth} />
           <NumberField label="Node cap" value={props.nodeCap} min={1} max={500} onChange={props.setNodeCap} />
           <NumberField label="Edge cap" value={props.edgeCap} min={0} max={1000} onChange={props.setEdgeCap} />
         </div>
-        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy}>
-          Run lineage / 영향 경로 보기
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
+          Lineage 실행
+        </button>
+        <button className="secondaryButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
+          로컬 LLM graph notes
         </button>
         {props.lineage ? (
           <div className="metaGrid">
@@ -873,14 +937,14 @@ function LineageTab(props: {
         ) : null}
       </section>
       <section className="graphCard">
-        <LineageGraph lineage={props.lineage} onSelect={props.onSelect} />
+        <LineageGraph lineage={props.lineage} onSelect={props.onSelect} selectedId={props.objectDetail?.id ?? null} />
       </section>
       <aside className="detailsDrawer">
         <span className="eyebrow">Node details</span>
-        <h2>{props.objectDetail?.id ?? 'No node selected'}</h2>
+        <h2>{props.objectDetail?.id ?? '선택된 node 없음'}</h2>
         {props.objectDetail ? (
           <>
-            <p>{props.objectDetail.name || props.objectDetail.label || 'No description'}</p>
+            <p>{props.objectDetail.name || props.objectDetail.label || '설명 없음'}</p>
             <div className="detailRows">
               <span>Type</span><strong>{props.objectDetail.type}</strong>
               <span>Incoming</span><strong>{props.objectDetail.incoming_count}</strong>
@@ -888,10 +952,18 @@ function LineageTab(props: {
               <span>Evidence</span><strong>{props.objectDetail.evidence_ids.length}</strong>
             </div>
             <button className="secondaryButton wide" onClick={() => props.onExpand(props.objectDetail!.id)}>
-              Expand from node
+              이 node에서 확장
             </button>
           </>
-        ) : <p>카탈로그에서 객체를 선택하세요.</p>}
+        ) : <p>카탈로그 또는 graph node를 선택하세요.</p>}
+        {props.lineageAdvice ? (
+          <div className={`llmAdviceBox ${props.lineageAdvice.status}`}>
+            <h3>Lineage LLM advisory</h3>
+            <p>{props.lineageAdvice.message}</p>
+            {props.lineageAdvice.advice ? <pre>{props.lineageAdvice.advice}</pre> : null}
+            <small>Citations: {props.lineageAdvice.citations.join(', ') || 'none'}</small>
+          </div>
+        ) : null}
       </aside>
     </div>
   );
@@ -920,7 +992,7 @@ function ImpactTab(props: {
       <section className="controlCard">
         <span className="eyebrow">Scenario form</span>
         <h1>Impact / 변경 영향</h1>
-        <div className="scenarioObject">Selected: <strong>{props.selectedObject?.id ?? 'none'}</strong></div>
+        <div className="scenarioObject">선택 object: <strong>{props.selectedObject?.id ?? '없음'}</strong></div>
         <label>Change type
           <select value={props.changeType} onChange={(event) => props.setChangeType(event.target.value as ChangeType)}>
             {changeTypes.map((item) => <option key={item} value={item}>{item}</option>)}
@@ -929,18 +1001,18 @@ function ImpactTab(props: {
         <label>Field / 필드
           <input value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)} />
         </label>
-        <label>Description / 설명
+        <label>설명
           <textarea value={props.description} onChange={(event) => props.setDescription(event.target.value)} rows={4} />
         </label>
         <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
         <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
-          Run deterministic impact
+          deterministic Impact 실행
         </button>
         <button className="secondaryButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
-          Draft LLM review notes
+          로컬 LLM review notes
         </button>
         <p className="mutedSmall">
-          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : 'disabled until local endpoint configured'}
+          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : '로컬 endpoint 설정 전 disabled'}
         </p>
       </section>
       <section className="resultCard">
@@ -966,9 +1038,9 @@ function ImpactTab(props: {
                 <small>Evidence IDs: {item.evidence_ids.join(', ') || '—'}</small>
               </article>
             ))}
-            {props.impact.affected_objects.length === 0 ? <div className="emptyState">No downstream impacts.</div> : null}
+            {props.impact.affected_objects.length === 0 ? <div className="emptyState">Downstream Impact가 없습니다.</div> : null}
           </div>
-        ) : <div className="emptyState">Run a scenario. No changes_path required.</div>}
+        ) : <div className="emptyState">시나리오를 실행하세요. changes_path는 필요 없습니다.</div>}
       </section>
     </div>
   );
@@ -1001,16 +1073,16 @@ function SqlTab(props: {
           <input value={props.sqlFile} onChange={(event) => props.setSqlFile(event.target.value)} />
         </label>
         <button className="secondaryButton wide" onClick={props.onExplain} disabled={props.busy === 'sql-explain'}>
-          Explain deterministic view
+          deterministic view 설명
         </button>
         <label>NL-to-SQL advisory prompt
           <textarea value={props.question} onChange={(event) => props.setQuestion(event.target.value)} rows={4} />
         </label>
         <button className="primaryButton wide" onClick={props.onDraft} disabled={props.busy === 'sql-draft'}>
-          Draft advisory SQL
+          advisory SQL 초안
         </button>
         <p className="mutedSmall">
-          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : 'disabled until local endpoint configured'}
+          LLM: {props.runtime?.llm.configured ? `${props.runtime.llm.source} · ${props.runtime.llm.model}` : '로컬 endpoint 설정 전 disabled'}
         </p>
       </section>
       <section className="resultCard">
@@ -1026,10 +1098,10 @@ function SqlTab(props: {
             </div>
             <pre>{JSON.stringify(props.explain.result.reference_edges, null, 2)}</pre>
           </div>
-        ) : <div className="emptyState">Explain a local SQL file to see cited evidence.</div>}
+        ) : <div className="emptyState">로컬 SQL file을 설명하면 citation evidence가 표시됩니다.</div>}
         {props.draft ? (
           <div className="draftBox">
-            <h3>Draft status: {props.draft.status}</h3>
+            <h3>Draft 상태: {props.draft.status}</h3>
             <pre>{props.draft.draft_sql || props.draft.message}</pre>
             <small>Citations: {props.draft.citations.join(', ') || 'none'}</small>
           </div>
@@ -1039,46 +1111,101 @@ function SqlTab(props: {
   );
 }
 
-function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: string) => void }) {
+function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: string) => void; selectedId: string | null }) {
   if (!props.lineage) {
-    return <div className="emptyState graphEmpty">Run lineage to render a bounded graph.</div>;
+    return <div className="emptyState graphEmpty">Lineage를 실행하면 bounded graph가 표시됩니다.</div>;
   }
-  const positions = layoutPositions(props.lineage);
-  const width = Math.max(720, (Math.max(...Object.values(props.lineage.levels)) + 1) * 210);
-  const height = Math.max(420, props.lineage.nodes.length * 74);
+  const levelValues = Object.values(props.lineage.levels);
+  const minLevel = Math.min(0, ...levelValues);
+  const maxLevel = Math.max(0, ...levelValues);
+  const positions = layoutPositions(props.lineage, minLevel);
+  const maxRows = Math.max(
+    1,
+    ...Array.from(
+      Object.values(props.lineage.levels).reduce((counts, level) => {
+        counts.set(level, (counts.get(level) ?? 0) + 1);
+        return counts;
+      }, new Map<number, number>()).values(),
+    ),
+  );
+  const width = Math.max(860, (maxLevel - minLevel + 1) * 260 + 120);
+  const height = Math.max(520, maxRows * 110 + 150);
+  const nodeTypes = Array.from(new Set(props.lineage.nodes.map((node) => node.type))).slice(0, 8);
   return (
-    <svg className="lineageSvg" viewBox={`0 0 ${width} ${height}`} role="img">
-      <defs>
-        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-          <path d="M 0 0 L 10 5 L 0 10 z" />
-        </marker>
-      </defs>
-      {props.lineage.edges.map((edge) => {
-        const source = positions[edge.source];
-        const target = positions[edge.target];
-        if (!source || !target) return null;
-        return (
-          <g key={edge.id}>
-            <line x1={source.x + 72} y1={source.y} x2={target.x - 72} y2={target.y} className="edgeLine" markerEnd="url(#arrow)" />
-            <text x={(source.x + target.x) / 2} y={(source.y + target.y) / 2 - 8} className="edgeLabel">{edge.type}</text>
-          </g>
-        );
-      })}
-      {props.lineage.nodes.map((node) => {
-        const point = positions[node.id];
-        return (
-          <g key={node.id} transform={`translate(${point.x - 70}, ${point.y - 28})`} onClick={() => props.onSelect(node.id)} className="nodeGroup">
-            <rect width="140" height="56" rx="12" />
-            <text x="12" y="22" className="nodeId">{node.id}</text>
-            <text x="12" y="40" className="nodeType">{node.type}</text>
-          </g>
-        );
-      })}
-    </svg>
+    <div className="graphSurface">
+      <div className="graphToolbar">
+        <div>
+          <strong>Layered Lineage graph</strong>
+          <span>Level, object type, edge direction, truncation 표시</span>
+        </div>
+        <div className="legendList">
+          {nodeTypes.map((type) => <span key={type} className={`legendPill ${nodeTypeClass(type)}`}>{type}</span>)}
+        </div>
+      </div>
+      {props.lineage.truncated ? (
+        <div className="graphWarning">
+          일부 neighbor가 cap/depth 제한으로 생략되었습니다. omitted={props.lineage.truncation.omitted_neighbor_total}
+        </div>
+      ) : null}
+      <div className="graphCanvas">
+        <svg className="lineageSvg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="SAP BW Lineage graph">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" />
+            </marker>
+          </defs>
+          {Array.from(new Set(Object.values(props.lineage.levels))).sort((a, b) => a - b).map((level) => {
+            const x = 140 + (level - minLevel) * 260;
+            return (
+              <g key={`level-${level}`}>
+                <line x1={x} y1="64" x2={x} y2={height - 38} className="levelGuide" />
+                <text x={x - 30} y="38" className="levelLabel">Level {level}</text>
+              </g>
+            );
+          })}
+          {props.lineage.edges.map((edge) => {
+            const source = positions[edge.source];
+            const target = positions[edge.target];
+            if (!source || !target) return null;
+            const goesRight = source.x <= target.x;
+            const startX = source.x + (goesRight ? 104 : -104);
+            const targetX = target.x + (goesRight ? -104 : 104);
+            const curve = Math.max(70, Math.abs(targetX - startX) / 2);
+            const c1 = goesRight ? startX + curve : startX - curve;
+            const c2 = goesRight ? targetX - curve : targetX + curve;
+            const labelX = (source.x + target.x) / 2;
+            const labelY = (source.y + target.y) / 2 - 10;
+            return (
+              <g key={edge.id} className={`edgeGroup ${edgeTypeClass(edge.type)}`}>
+                <path d={`M ${startX} ${source.y} C ${c1} ${source.y}, ${c2} ${target.y}, ${targetX} ${target.y}`} className="edgeLine" markerEnd="url(#arrow)" />
+                <text x={labelX} y={labelY} className="edgeLabel">{edge.type}</text>
+              </g>
+            );
+          })}
+          {props.lineage.nodes.map((node) => {
+            const point = positions[node.id];
+            const omitted = props.lineage?.omitted_neighbor_counts[node.id] ?? 0;
+            return (
+              <g
+                key={node.id}
+                transform={`translate(${point.x - 102}, ${point.y - 34})`}
+                onClick={() => props.onSelect(node.id)}
+                className={`nodeGroup ${nodeTypeClass(node.type)} ${node.id === props.lineage?.start_id ? 'start' : ''} ${node.id === props.selectedId ? 'selected' : ''}`}
+              >
+                <rect width="204" height="68" rx="16" />
+                <text x="14" y="24" className="nodeId">{shortLabel(node.id, 24)}</text>
+                <text x="14" y="46" className="nodeType">{node.type}</text>
+                {omitted > 0 ? <text x="154" y="46" className="nodeBadge">+{omitted}</text> : null}
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+    </div>
   );
 }
 
-function layoutPositions(lineage: LineageResponse): Record<string, { x: number; y: number }> {
+function layoutPositions(lineage: LineageResponse, minLevel = 0): Record<string, { x: number; y: number }> {
   const byLevel = new Map<number, string[]>();
   Object.entries(lineage.levels).forEach(([id, level]) => {
     byLevel.set(level, [...(byLevel.get(level) ?? []), id]);
@@ -1086,10 +1213,22 @@ function layoutPositions(lineage: LineageResponse): Record<string, { x: number; 
   const positions: Record<string, { x: number; y: number }> = {};
   byLevel.forEach((ids, level) => {
     ids.sort().forEach((id, index) => {
-      positions[id] = { x: 110 + level * 210, y: 90 + index * 86 };
+      positions[id] = { x: 140 + (level - minLevel) * 260, y: 104 + index * 112 };
     });
   });
   return positions;
+}
+
+function shortLabel(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
+}
+
+function nodeTypeClass(type: string): string {
+  return `type-${type.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+}
+
+function edgeTypeClass(type: string): string {
+  return `edge-${type.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 }
 
 function NumberField(props: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) {
@@ -1119,17 +1258,17 @@ function TabButton(props: { id: AppTab; active: AppTab; label: string; onClick: 
 }
 
 function bwStatus(runtime: RuntimeConfigResponse | null): string {
-  if (!runtime) return 'checking';
-  if (!runtime.bw.configured) return 'unset';
-  if (runtime.bw.source === 'env') return 'configured from .env';
-  return 'configured in UI';
+  if (!runtime) return '확인 중';
+  if (!runtime.bw.configured) return '미설정';
+  if (runtime.bw.source === 'env') return '.env 설정';
+  return 'UI 설정';
 }
 
 function llmStatus(runtime: RuntimeConfigResponse | null): string {
-  if (!runtime) return 'checking';
+  if (!runtime) return '확인 중';
   if (!runtime.llm.enabled || !runtime.llm.configured) return 'disabled';
-  if (runtime.llm.source === 'env') return `configured from .env (${runtime.llm.model ?? 'model set'})`;
-  return `configured in UI (${runtime.llm.model ?? 'model set'})`;
+  if (runtime.llm.source === 'env') return `.env 설정 (${runtime.llm.model ?? 'model set'})`;
+  return `UI 설정 (${runtime.llm.model ?? 'model set'})`;
 }
 
 function compactDate(value: string): string {

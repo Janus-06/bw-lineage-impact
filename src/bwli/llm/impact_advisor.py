@@ -4,7 +4,7 @@ import json
 from typing import cast
 
 from bwli.config import LlmRuntimeConfig
-from bwli.llm.explainer import _validate_completion_citations
+from bwli.llm.explainer import _validate_completion_citations, _validate_completion_safety
 from bwli.llm.openai_compatible import ChatMessage, LlmChatRequest, OpenAICompatibleClient
 from bwli.llm.sanitizer import sanitize_llm_evidence
 
@@ -61,6 +61,7 @@ def create_impact_advice(
 
     chat_request = build_impact_advice_request(impact_payload)
     completion = OpenAICompatibleClient(runtime=runtime).chat(chat_request)
+    _validate_completion_safety(completion)
     _validate_completion_citations(completion, chat_request.citation_ids)
     completion = completion.model_copy(
         update={

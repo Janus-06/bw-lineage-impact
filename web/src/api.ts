@@ -134,6 +134,18 @@ export interface LineageResponse {
   evidence_ids: string[];
 }
 
+export interface LineageAdviceResponse {
+  schema_version: string;
+  status: 'ok' | 'disabled';
+  advisory: boolean;
+  config_required: boolean;
+  message: string;
+  advice: string;
+  citations: string[];
+  llm_audit?: Record<string, unknown>;
+  lineage: LineageResponse;
+}
+
 export interface ImpactScenarioResponse {
   schema_version: string;
   snapshot_id: string;
@@ -294,6 +306,22 @@ export async function postLineage(
   },
 ): Promise<LineageResponse> {
   return postJson<LineageResponse>(`/api/v1/snapshots/${encodeURIComponent(snapshotId)}/lineage`, body);
+}
+
+export async function postLineageAdvice(
+  snapshotId: string,
+  body: {
+    object_id: string;
+    direction: Direction;
+    depth: number;
+    node_cap: number;
+    edge_cap: number;
+  },
+): Promise<LineageAdviceResponse> {
+  return postJson<LineageAdviceResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/lineage/advice`,
+    body,
+  );
 }
 
 export async function postImpactScenario(

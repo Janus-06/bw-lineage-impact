@@ -416,6 +416,104 @@ def test_v1_impact_advice_returns_deterministic_impact_when_llm_disabled(
     assert [item["object_id"] for item in payload["impact"]["affected_objects"]]
 
 
+def test_v1_lineage_advice_returns_deterministic_lineage_when_llm_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ["BWLI_LLM_BASE_URL", "BWLI_LLM_MODEL", "BWLI_LLM_API_KEY"]:
+        monkeypatch.delenv(name, raising=False)
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/lineage/advice",
+        json={
+            "object_id": "SRC",
+            "direction": "downstream",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "disabled"
+    assert payload["config_required"] is True
+    assert payload["advisory"] is True
+    assert payload["advice"] == ""
+    assert payload["lineage"]["start_id"] == "SRC"
+    assert [node["id"] for node in payload["lineage"]["nodes"]]
+    assert [edge["id"] for edge in payload["lineage"]["edges"]]
+
+
+def test_v1_lineage_advice_uses_local_llm_with_citation_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    configured = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "llm": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "local-fixture-model",
+                "api_key": "fixture-api-key",
+            }
+        },
+    )
+    assert configured.status_code == 200, configured.text
+
+    class CitedLineageAdviceClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def chat(self, request: object) -> LlmCompletion:
+            citation_ids = request.citation_ids  # type: ignore[attr-defined]
+            return LlmCompletion(
+                content=(
+                    f"Lineage 시작 객체를 먼저 확인하세요 [{citation_ids[0]}].\n"
+                    f"첫 번째 edge는 BWMT에서 재확인하세요 [{citation_ids[-1]}]."
+                ),
+                audit=LlmAuditMetadata(
+                    model="local-fixture-model",
+                    prompt_sha256="lineage-prompt-sha",
+                    sanitized_input_sha256="lineage-input-sha",
+                    request_citation_ids=list(citation_ids),
+                    response_timestamp="2026-06-08T00:00:00+00:00",
+                ),
+            )
+
+    monkeypatch.setattr(
+        "bwli.llm.lineage_advisor.OpenAICompatibleClient",
+        CitedLineageAdviceClient,
+    )
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/lineage/advice",
+        json={
+            "object_id": "SRC",
+            "direction": "downstream",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["config_required"] is False
+    assert "fixture-api-key" not in response.text
+    assert payload["llm_audit"]["citation_validation"] == "passed"
+    assert "[node:1]" in payload["advice"]
+    assert payload["citations"][0] == "node:1"
+    assert payload["lineage"]["start_id"] == "SRC"
+
+
 def test_v1_impact_advice_uses_local_llm_with_citation_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

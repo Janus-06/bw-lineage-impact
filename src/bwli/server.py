@@ -419,6 +419,15 @@ class ImpactAdviceFactory(Protocol):
     ) -> dict[str, object]: ...
 
 
+class LineageAdviceFactory(Protocol):
+    def __call__(
+        self,
+        lineage_payload: dict[str, object],
+        *,
+        runtime: LlmRuntimeConfig,
+    ) -> dict[str, object]: ...
+
+
 def create_app(
     *,
     project_root: Path | None = None,
@@ -562,15 +571,19 @@ def create_app(
     )
     def lineage_v1(snapshot_id: str, request: V1LineageRequest) -> BoundedLineageResult:
         try:
-            graph = catalog_store.load_graph(snapshot_id)
-            return bounded_lineage(
-                graph,
-                snapshot_id=snapshot_id,
-                start_id=request.object_id,
-                direction=request.direction,
-                depth=request.depth,
-                node_cap=request.node_cap,
-                edge_cap=request.edge_cap,
+            return _run_v1_lineage(catalog_store, snapshot_id, request)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/lineage/advice")
+    def lineage_advice_v1(snapshot_id: str, request: V1LineageRequest) -> dict[str, object]:
+        try:
+            lineage_payload = _run_v1_lineage(catalog_store, snapshot_id, request).model_dump(
+                mode="json"
+            )
+            return _lineage_advice_payload(
+                runtime_config=runtime_config,
+                lineage_payload=lineage_payload,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -1177,6 +1190,80 @@ def _ensure_snapshot_exists(store: CatalogStore, snapshot_id: str) -> None:
         raise FileNotFoundError(f"snapshot not found: {snapshot_id}")
 
 
+def _run_v1_lineage(
+    store: CatalogStore,
+    snapshot_id: str,
+    request: V1LineageRequest,
+) -> BoundedLineageResult:
+    assert_no_persisted_secrets(request.model_dump(mode="json"))
+    graph = store.load_graph(snapshot_id)
+    return bounded_lineage(
+        graph,
+        snapshot_id=snapshot_id,
+        start_id=request.object_id,
+        direction=request.direction,
+        depth=request.depth,
+        node_cap=request.node_cap,
+        edge_cap=request.edge_cap,
+    )
+
+
+def _lineage_advice_payload(
+    *,
+    runtime_config: RuntimeConfigState,
+    lineage_payload: dict[str, object],
+) -> dict[str, object]:
+    if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        return {
+            "schema_version": "1.0",
+            "status": "disabled",
+            "advisory": True,
+            "config_required": True,
+            "message": (
+                "로컬 OpenAI-compatible LLM endpoint를 설정하면 Lineage advisory notes를 "
+                "생성할 수 있습니다."
+            ),
+            "advice": "",
+            "citations": [],
+            "lineage": lineage_payload,
+        }
+    if (
+        not runtime_config.llm.base_url
+        or not runtime_config.llm.model
+        or not runtime_config.llm.api_key
+    ):
+        raise ConfigError("LLM runtime config is incomplete")
+    advice_result = _create_llm_lineage_advice(
+        lineage_payload,
+        runtime=LlmRuntimeConfig(
+            base_url=runtime_config.llm.base_url,
+            model=runtime_config.llm.model,
+            api_key=SecretStr(runtime_config.llm.api_key),
+        ),
+    )
+    advice = str(advice_result["advice"]).strip()
+    if not advice:
+        raise ValueError("LLM returned empty lineage advice")
+    assert_no_persisted_secrets({"llm_advice": advice})
+    raw_citations = advice_result.get("citations", [])
+    citations = (
+        [item for item in raw_citations if isinstance(item, str)]
+        if isinstance(raw_citations, list)
+        else []
+    )
+    return {
+        "schema_version": "1.0",
+        "status": "ok",
+        "advisory": True,
+        "config_required": False,
+        "message": "Deterministic snapshot evidence 기반 Lineage advisory review를 생성했습니다.",
+        "advice": advice,
+        "citations": citations,
+        "llm_audit": advice_result["llm_audit"],
+        "lineage": lineage_payload,
+    }
+
+
 def _run_v1_impact_scenario(
     store: CatalogStore,
     snapshot_id: str,
@@ -1287,8 +1374,8 @@ def _impact_advice_payload(
             "advisory": True,
             "config_required": True,
             "message": (
-                "Configure a local OpenAI-compatible LLM endpoint to create advisory impact "
-                "review notes."
+                "로컬 OpenAI-compatible LLM endpoint를 설정하면 Impact advisory notes를 "
+                "생성할 수 있습니다."
             ),
             "advice": "",
             "citations": [],
@@ -1323,7 +1410,7 @@ def _impact_advice_payload(
         "status": "ok",
         "advisory": True,
         "config_required": False,
-        "message": "Advisory impact review generated from deterministic snapshot evidence.",
+        "message": "Deterministic snapshot evidence 기반 Impact advisory review를 생성했습니다.",
         "advice": advice,
         "citations": citations,
         "llm_audit": advice_result["llm_audit"],
@@ -1356,7 +1443,7 @@ def _sql_explain_payload(
         "advisory": True,
         "execution_blocked": True,
         "execution_disabled_warning": (
-            "SQL Assistant parses and drafts only; database execution is disabled."
+            "SQL Assistant는 parse/draft만 수행하며 database execution은 비활성입니다."
         ),
         "target": "native_sql_view",
         "format": output_format,
@@ -1383,7 +1470,8 @@ def _sql_draft_payload(
             "execution_blocked": True,
             "config_required": True,
             "message": (
-                "Configure a local OpenAI-compatible LLM endpoint to create advisory SQL drafts."
+                "로컬 OpenAI-compatible LLM endpoint를 설정하면 advisory SQL draft를 "
+                "생성할 수 있습니다."
             ),
             "target_dialect": request.target_dialect,
             "draft_sql": "",
@@ -1469,6 +1557,16 @@ def _create_llm_impact_advice(
     module = import_module("bwli.llm.impact_advisor")
     create_impact_advice = cast(ImpactAdviceFactory, module.create_impact_advice)
     return create_impact_advice(impact_payload, runtime=runtime)
+
+
+def _create_llm_lineage_advice(
+    lineage_payload: dict[str, object],
+    *,
+    runtime: LlmRuntimeConfig,
+) -> dict[str, object]:
+    module = import_module("bwli.llm.lineage_advisor")
+    create_lineage_advice = cast(LineageAdviceFactory, module.create_lineage_advice)
+    return create_lineage_advice(lineage_payload, runtime=runtime)
 
 
 def _frontend_static_dir(root: Path, static_dir: Path | None) -> Path | None:

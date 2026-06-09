@@ -16,7 +16,12 @@ from bwli.llm.explainer import (
     explain_sql_with_llm,
 )
 from bwli.llm.impact_advisor import build_impact_advice_request
-from bwli.llm.openai_compatible import OpenAICompatibleClient, write_llm_audit_log
+from bwli.llm.openai_compatible import (
+    LlmAuditMetadata,
+    LlmCompletion,
+    OpenAICompatibleClient,
+    write_llm_audit_log,
+)
 from bwli.llm.sanitizer import REDACTED, sanitize_llm_evidence, sanitize_text
 from bwli.llm.sql_assistant import build_sql_draft_request
 
@@ -938,3 +943,246 @@ def test_build_impact_advice_request_uses_sanitized_deterministic_evidence_only(
     assert long_reason not in prompt
     assert "…(truncated)" in prompt
     assert "[affected:1]" in prompt
+
+
+def test_build_lineage_advice_request_uses_sanitized_bounded_graph_evidence_only() -> None:
+    from bwli.llm.lineage_advisor import build_lineage_advice_request
+
+    long_label = "safe lineage edge detail " * 80
+    lineage_payload: dict[str, object] = {
+        "snapshot_id": "snap-fixture",
+        "start_id": "SRC",
+        "direction": "downstream",
+        "depth": 3,
+        "nodes": [
+            {
+                "id": "SRC",
+                "type": "ADSO",
+                "name": "Source sales ADSO",
+                "label": "Source",
+                "metadata": {"host": "sapbw.internal", "password": "must-not-reach-prompt"},
+                "evidence_ids": [f"node:SRC:{index}" for index in range(12)],
+            },
+            {
+                "id": "TGT",
+                "type": "HCPR",
+                "name": "Target CompositeProvider",
+                "label": long_label,
+                "metadata": {"owner_email": "person@example.invalid"},
+                "evidence_ids": ["node:TGT"],
+            },
+        ],
+        "edges": [
+            {
+                "id": "edge:SRC:TGT",
+                "source": "SRC",
+                "target": "TGT",
+                "type": "dataflow",
+                "confidence": "direct",
+                "metadata": {"client": "100"},
+                "evidence_ids": ["edge:SRC:TGT"],
+            }
+        ],
+        "levels": {"SRC": 0, "TGT": 1},
+        "truncated": True,
+        "truncation": {"node_cap_reached": False, "edge_cap_reached": False},
+        "omitted_neighbor_counts": {"sapbw.internal": 2},
+        "raw_snapshot": {"payload": "must not reach prompt"},
+    }
+
+    request = build_lineage_advice_request(lineage_payload)
+    prompt = "\n".join(message.content for message in request.messages)
+
+    assert request.metadata == {"task": "lineage_advice"}
+    assert request.citation_ids == ["node:1", "node:2", "edge:1"]
+    assert "must not reach prompt" not in prompt
+    assert "must-not-reach-prompt" not in prompt
+    assert "node:SRC:8" not in prompt
+    assert "evidence_ids_truncated" in prompt
+    assert "sapbw.internal" not in prompt
+    assert "person@example.invalid" not in prompt
+    assert '"client"' not in prompt
+    assert "omitted_neighbor_counts" not in prompt
+    assert "omitted_neighbor_object_count" in prompt
+    assert "omitted_neighbor_total" in prompt
+    assert long_label not in prompt
+    assert "…(truncated)" in prompt
+    assert "[node:1]" in prompt
+    assert "[edge:1]" in prompt
+
+
+def test_build_lineage_advice_request_caps_serialized_prompt_evidence() -> None:
+    from bwli.llm.lineage_advisor import (
+        _MAX_LLM_EVIDENCE_JSON_CHARS,
+        build_lineage_advice_request,
+    )
+
+    long_text = "safe lineage detail " * 200
+    nodes = [
+        {
+            "id": f"N{index}",
+            "type": "ADSO",
+            "name": f"Object {index}",
+            "label": long_text,
+            "evidence_ids": [f"node:{index}:{evidence}" for evidence in range(20)],
+        }
+        for index in range(100)
+    ]
+    edges = [
+        {
+            "id": f"edge:{index}",
+            "source": f"N{index}",
+            "target": f"N{index + 1}",
+            "type": "dataflow",
+            "confidence": "direct",
+            "evidence_ids": [f"edge:{index}:{evidence}" for evidence in range(20)],
+        }
+        for index in range(99)
+    ]
+
+    request = build_lineage_advice_request(
+        {
+            "snapshot_id": "snap-fixture",
+            "start_id": "N0",
+            "direction": "downstream",
+            "depth": 5,
+            "nodes": nodes,
+            "edges": edges,
+            "levels": {f"N{index}": index for index in range(100)},
+        }
+    )
+    prompt = "\n".join(message.content for message in request.messages)
+
+    assert "evidence_json_truncation" in prompt
+    assert len(prompt) <= _MAX_LLM_EVIDENCE_JSON_CHARS + 1_500
+    assert "node:0:8" not in prompt
+    assert request.citation_ids
+    assert all(citation in prompt for citation in request.citation_ids)
+
+
+def test_create_lineage_advice_rejects_sensitive_completion_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bwli.llm.lineage_advisor import create_lineage_advice
+
+    class LeakyLineageAdviceClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def chat(self, request: object) -> LlmCompletion:
+            citation_ids = request.citation_ids  # type: ignore[attr-defined]
+            return LlmCompletion(
+                content=f"내부 host sapbw.internal 값을 확인하세요 [{citation_ids[0]}].",
+                audit=LlmAuditMetadata(
+                    model="local-fixture-model",
+                    prompt_sha256="lineage-prompt-sha",
+                    sanitized_input_sha256="lineage-input-sha",
+                    request_citation_ids=list(citation_ids),
+                    response_timestamp="2026-06-08T00:00:00+00:00",
+                ),
+            )
+
+    monkeypatch.setattr(
+        "bwli.llm.lineage_advisor.OpenAICompatibleClient",
+        LeakyLineageAdviceClient,
+    )
+
+    with pytest.raises(LlmEvidenceError, match="sensitive or internal"):
+        create_lineage_advice(
+            {
+                "snapshot_id": "snap-fixture",
+                "start_id": "SRC",
+                "direction": "downstream",
+                "depth": 1,
+                "nodes": [{"id": "SRC", "type": "ADSO"}],
+                "edges": [],
+                "levels": {"SRC": 0},
+            },
+            runtime=LlmRuntimeConfig(
+                base_url="http://127.0.0.1:11434/v1",
+                model="local-fixture-model",
+                api_key=SecretStr("fixture-api-key"),
+            ),
+        )
+
+
+def test_create_impact_advice_rejects_sensitive_completion_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bwli.llm.impact_advisor import create_impact_advice
+
+    class LeakyImpactAdviceClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def chat(self, request: object) -> LlmCompletion:
+            citation_ids = request.citation_ids  # type: ignore[attr-defined]
+            return LlmCompletion(
+                content=f"내부 host sapbw.internal 값을 확인하세요 [{citation_ids[0]}].",
+                audit=LlmAuditMetadata(
+                    model="local-fixture-model",
+                    prompt_sha256="impact-prompt-sha",
+                    sanitized_input_sha256="impact-input-sha",
+                    request_citation_ids=list(citation_ids),
+                    response_timestamp="2026-06-08T00:00:00+00:00",
+                ),
+            )
+
+    monkeypatch.setattr("bwli.llm.impact_advisor.OpenAICompatibleClient", LeakyImpactAdviceClient)
+
+    with pytest.raises(LlmEvidenceError, match="sensitive or internal"):
+        create_impact_advice(
+            {
+                "scenario": {
+                    "object_id": "SRC",
+                    "object_type": "ADSO",
+                    "change_type": "field_removed",
+                },
+                "affected_objects": [
+                    {"object_id": "TGT", "object_type": "ADSO", "reason": "direct downstream"}
+                ],
+                "lineage_bounds": {"depth": 1},
+            },
+            runtime=LlmRuntimeConfig(
+                base_url="http://127.0.0.1:11434/v1",
+                model="local-fixture-model",
+                api_key=SecretStr("fixture-api-key"),
+            ),
+        )
+
+
+def test_create_sql_draft_rejects_sensitive_completion_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bwli.llm.sql_assistant import create_sql_draft
+
+    class LeakySqlDraftClient:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def chat(self, request: object) -> LlmCompletion:
+            citation_ids = request.citation_ids  # type: ignore[attr-defined]
+            return LlmCompletion(
+                content=f"내부 IP 10.0.0.8 값을 확인하세요 [{citation_ids[0]}].",
+                audit=LlmAuditMetadata(
+                    model="local-fixture-model",
+                    prompt_sha256="sql-prompt-sha",
+                    sanitized_input_sha256="sql-input-sha",
+                    request_citation_ids=list(citation_ids),
+                    response_timestamp="2026-06-08T00:00:00+00:00",
+                ),
+            )
+
+    monkeypatch.setattr("bwli.llm.sql_assistant.OpenAICompatibleClient", LeakySqlDraftClient)
+
+    with pytest.raises(LlmEvidenceError, match="sensitive or internal"):
+        create_sql_draft(
+            _sample_sql_result(),
+            question="검토 SQL 초안",
+            target_dialect="SAP HANA SQL",
+            runtime=LlmRuntimeConfig(
+                base_url="http://127.0.0.1:11434/v1",
+                model="local-fixture-model",
+                api_key=SecretStr("fixture-api-key"),
+            ),
+        )

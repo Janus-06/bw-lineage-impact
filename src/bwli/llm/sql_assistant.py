@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from bwli.config import LlmRuntimeConfig
 from bwli.field_lineage import SqlParseResult
-from bwli.llm.explainer import _validate_completion_citations, build_sql_explainer_request
+from bwli.llm.explainer import (
+    _validate_completion_citations,
+    _validate_completion_safety,
+    build_sql_explainer_request,
+)
 from bwli.llm.openai_compatible import ChatMessage, LlmChatRequest, OpenAICompatibleClient
 from bwli.llm.sanitizer import sanitize_text
 
@@ -72,6 +76,7 @@ def create_sql_draft(
     )
     citations = chat_request.citation_ids
     completion = OpenAICompatibleClient(runtime=runtime).chat(chat_request)
+    _validate_completion_safety(completion)
     _validate_completion_citations(completion, citations)
     completion = completion.model_copy(
         update={

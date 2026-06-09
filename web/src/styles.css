@@ -70,14 +70,22 @@ pre { overflow: auto; max-height: 300px; margin: 12px 0 0; padding: 12px; border
 .statusPill.neutral { background: #f6f8fb; }
 
 .errorBar { margin: 12px 0; padding: 10px 12px; border: 1px solid #fecaca; border-radius: 12px; color: #991b1b; background: #fff1f2; }
-.diagnosticsPanel { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; margin: 12px 0; padding: 16px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel); box-shadow: var(--shadow); }
-.diagnosticsPanel h2 { margin: 0 0 6px; font-size: 18px; }
-.diagnosticsPanel p { margin: 0; color: var(--muted); line-height: 1.5; }
+.setupPrompt { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 0; padding: 10px 12px; border: 1px solid #f0d49a; border-radius: 12px; color: #7c4a03; background: #fff8e7; font-weight: 750; }
+.setupPrompt button { min-height: 30px; padding: 0 10px; border: 1px solid #f0d49a; border-radius: 9px; color: #7c4a03; background: #fff; font-weight: 850; }
+.settingsOverlay { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(15, 23, 42, .28); backdrop-filter: blur(4px); }
+.settingsDrawer { width: min(620px, calc(100vw - 32px)); height: 100%; overflow: auto; padding: 18px; border-left: 1px solid var(--border); background: var(--panel); box-shadow: -24px 0 54px rgba(15, 23, 42, .18); }
+.drawerHeader { display: flex; align-items: start; justify-content: space-between; gap: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+.drawerHeader h2 { margin: 4px 0 6px; font-size: 22px; }
+.drawerHeader p, .drawerSection p { margin: 0; color: var(--muted); line-height: 1.5; }
+.drawerSection { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel-soft); }
+.drawerSection h3 { margin: 0 0 8px; font-size: 16px; }
 .setupGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; align-items: center; }
+.settingsDrawer .setupGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 12px; }
 .checkField, .setupHint { grid-column: span 2; }
 .checkField { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
 .checkField input { width: auto; min-height: auto; }
 .setupHint { font-size: 12px; }
+.fullSpan { grid-column: 1 / -1; }
 .liveObjectInput { min-height: 64px; margin-bottom: 8px; }
 .liveObjectTools { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
 .selectedLiveObjects, .snapshotPickList { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
@@ -89,7 +97,7 @@ pre { overflow: auto; max-height: 300px; margin: 12px 0 0; padding: 12px; border
 .liveOptionsGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 8px 0 10px; }
 .liveOptionsGrid label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
 
-.appFrame { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 14px; margin-top: 14px; }
+.appFrame { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 14px; margin-top: 14px; }
 .catalogPane, .workspacePane, .controlCard, .graphCard, .detailsDrawer, .resultCard {
   border: 1px solid var(--border);
   border-radius: 16px;
@@ -107,7 +115,10 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.02em; }
 .filterChips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .chip { min-height: 28px; padding: 0 9px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: #fff; font-size: 12px; font-weight: 750; }
 .chip.active { border-color: var(--blue); color: var(--blue); background: var(--blue-soft); }
-.objectList { display: flex; flex-direction: column; gap: 7px; height: calc(100vh - 430px); min-height: 180px; overflow: auto; padding-right: 3px; }
+.catalogActionCard { display: grid; gap: 6px; margin: 12px 0; padding: 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-soft); }
+.catalogActionCard strong { font-size: 13px; }
+.catalogActionCard p, .catalogActionCard small { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.objectList { display: flex; flex-direction: column; gap: 7px; height: calc(100vh - 320px); min-height: 280px; overflow: auto; padding-right: 3px; }
 .objectItem { display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 4px 8px; width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 12px; color: var(--text); text-align: left; background: #fff; }
 .objectItem:hover, .objectItem.active { border-color: var(--blue); background: #f0f5ff; }
 .objectType { grid-row: span 2; align-self: center; padding: 4px 6px; border-radius: 8px; color: #1d4ed8; background: #dbeafe; font-size: 10px; font-weight: 850; text-align: center; }
@@ -118,7 +129,7 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.02em; }
 .tabBar { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-soft); }
 .tabButton { min-height: 34px; padding: 0 14px; border-radius: 9px; color: var(--muted); background: transparent; font-weight: 800; }
 .tabButton.active { color: #fff; background: var(--blue); }
-.workspaceGrid { display: grid; grid-template-columns: 310px minmax(0, 1fr) 260px; gap: 12px; margin-top: 12px; align-items: start; }
+.workspaceGrid { display: grid; grid-template-columns: 260px minmax(0, 1fr) 280px; gap: 12px; margin-top: 12px; align-items: start; }
 .impactLayout, .sqlLayout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 12px; margin-top: 12px; align-items: start; }
 .controlCard, .graphCard, .detailsDrawer, .resultCard { padding: 14px; }
 .sectionTitle p, .controlCard p, .detailsDrawer p { color: var(--muted); line-height: 1.45; }
@@ -135,16 +146,36 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.02em; }
 .metric span { display: block; color: var(--faint); font-size: 10px; font-weight: 850; text-transform: uppercase; }
 .metric strong { display: block; margin-top: 5px; color: var(--text); font-size: 15px; }
 
-.graphCard { overflow: auto; min-height: 520px; }
-.lineageSvg { width: 100%; min-width: 720px; height: 520px; }
-.edgeLine { stroke: #8fa7c6; stroke-width: 1.6; }
-.edgeLabel { fill: #64748b; font-size: 11px; }
+.graphCard { overflow: hidden; min-height: 580px; padding: 0; }
+.graphSurface { min-height: 580px; background: linear-gradient(180deg, #ffffff, #f8fbff); }
+.graphToolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.graphToolbar strong { display: block; color: var(--text); font-size: 14px; }
+.graphToolbar span { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
+.legendList { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.legendPill { display: inline-flex; align-items: center; min-height: 24px; padding: 0 8px; border: 1px solid var(--border); border-radius: 999px; background: #fff; color: var(--muted); font-size: 10px; font-weight: 850; }
+.graphWarning { margin: 12px 16px 0; padding: 9px 10px; border: 1px solid #fde68a; border-radius: 10px; color: #92400e; background: #fffbeb; font-size: 12px; font-weight: 750; }
+.graphCanvas { overflow: auto; min-height: 520px; }
+.lineageSvg { display: block; width: max(100%, 860px); min-height: 520px; }
+.levelGuide { stroke: #e2e8f0; stroke-width: 1; stroke-dasharray: 4 7; }
+.levelLabel { fill: #94a3b8; font-size: 11px; font-weight: 850; }
+.edgeLine { fill: none; stroke: #8fa7c6; stroke-width: 1.8; }
+.edgeGroup.edge-field .edgeLine, .edgeGroup.edge-field-mapping .edgeLine { stroke: #16a34a; }
+.edgeGroup.edge-transformation .edgeLine { stroke: #7c3aed; }
+.edgeLabel { fill: #475569; paint-order: stroke; stroke: #fff; stroke-width: 4px; font-size: 11px; font-weight: 800; }
 #arrow path { fill: #8fa7c6; }
 .nodeGroup { cursor: pointer; }
-.nodeGroup rect { fill: #fff; stroke: #b9c8db; stroke-width: 1.2; filter: drop-shadow(0 6px 10px rgba(30, 41, 59, .08)); }
-.nodeGroup:hover rect { stroke: var(--blue); fill: #eef4ff; }
+.nodeGroup rect { fill: #fff; stroke: #b9c8db; stroke-width: 1.2; filter: drop-shadow(0 8px 14px rgba(30, 41, 59, .10)); }
+.nodeGroup:hover rect, .nodeGroup.selected rect { stroke: var(--blue); stroke-width: 2.2; fill: #eef4ff; }
+.nodeGroup.start rect { stroke: #f59e0b; stroke-width: 2.2; }
+.nodeGroup.type-adso rect { fill: #ecfdf6; stroke: #10b981; }
+.nodeGroup.type-hcpr rect, .nodeGroup.type-compositeprovider rect { fill: #eef4ff; stroke: #3b82f6; }
+.nodeGroup.type-trfn rect, .nodeGroup.type-transformation rect { fill: #f5f3ff; stroke: #8b5cf6; }
+.nodeGroup.type-query rect { fill: #fff8e7; stroke: #f59e0b; }
+.nodeGroup.type-native-sql-view rect { fill: #f0fdfa; stroke: #14b8a6; }
+.nodeGroup.type-infoobject rect { fill: #fdf2f8; stroke: #ec4899; }
 .nodeId { fill: #172033; font-size: 12px; font-weight: 850; }
 .nodeType { fill: #2457d6; font-size: 11px; font-weight: 800; }
+.nodeBadge { fill: #c2410c; font-size: 11px; font-weight: 900; }
 .detailsDrawer { position: sticky; top: 82px; }
 .detailRows { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 14px 0; padding: 10px; border-radius: 12px; background: var(--panel-soft); }
 .detailRows span { color: var(--muted); }

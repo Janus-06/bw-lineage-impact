@@ -17,6 +17,18 @@ from bwli.llm.openai_compatible import (
 from bwli.llm.sanitizer import REDACTED, sanitize_llm_evidence, sanitize_text
 
 _CITATION_TOKEN_RE = re.compile(r"\[([^\[\]]+)\]")
+_SENSITIVE_COMPLETION_TEXT_RE = re.compile(
+    r"(?ix)("
+    r"\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?[A-Za-z0-9._~+/=-]+|"
+    r"\bbearer\s+[A-Za-z0-9._~+/=-]+|"
+    r"(?:https?|ftp)://[^\s/:@]+:[^\s/@]+@|"
+    r"\b[A-Za-z0-9-]+\.(?:corp|internal|lan|local)\b|"
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b|"
+    r"\bsk-[A-Za-z0-9_-]+\b|"
+    r"\b(?:password|passwd|secret|token|api[_-]?key|authorization|credential)\s*[:=]\s*\S+"
+    r")"
+)
 _MAX_LLM_EVIDENCE_ITEMS = 80
 _MAX_LLM_EVIDENCE_TEXT_CHARS = 600
 
@@ -89,12 +101,18 @@ def explain_sql_with_llm(
     request = build_sql_explainer_request(result)
     client = OpenAICompatibleClient(runtime=runtime, transport=transport)
     completion = client.chat(request)
+    _validate_completion_safety(completion)
     _validate_completion_citations(completion, request.citation_ids)
     return completion.model_copy(
         update={
             "audit": completion.audit.model_copy(update={"citation_validation": "passed"})
         }
     )
+
+
+def _validate_completion_safety(completion: LlmCompletion) -> None:
+    if _SENSITIVE_COMPLETION_TEXT_RE.search(completion.content):
+        raise LlmEvidenceError("LLM completion contained sensitive or internal text")
 
 
 def _validate_completion_citations(completion: LlmCompletion, citation_ids: list[str]) -> None:
