@@ -617,3 +617,160 @@ def test_live_collect_rejects_output_path_escape(tmp_path: Path) -> None:
     assert response.status_code == 400
     assert "outside project root" in response.text
     assert fake.calls == []
+
+
+def test_connection_test_endpoint_returns_live_smoke_result() -> None:
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: fake))
+    _put_runtime_bw_config(client)
+
+    response = client.post(
+        "/api/v1/connection/test",
+        json={"confirm_read_only": True, "search_term": "Z"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert [op["name"] for op in payload["operations"]] == ["bw_search"]
+    assert "fixture-user" not in response.text
+
+
+class HostLeakingSearchClient(FakeLiveBwClient):
+    def __init__(self, host_url: str) -> None:
+        super().__init__()
+        self._host_url = host_url
+
+    def fetch_search(self, search_term: str, *, object_type: str | None = None) -> dict[str, Any]:
+        raise RuntimeError(f"HTTP 401 from {self._host_url}/sap/bw/modeling?sap-client=100")
+
+
+def test_connection_test_redacts_bw_host_and_secret_in_error_detail() -> None:
+    leaking = HostLeakingSearchClient(host_url="https://bw.example.invalid")
+    client = TestClient(
+        create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: leaking)
+    )
+    _put_runtime_bw_config(client, password="mock-leaked-bw-password")
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": "mock-leaked-bw-password",
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert response.status_code == 200
+
+    response = client.post(
+        "/api/v1/connection/test",
+        json={"confirm_read_only": True, "search_term": "Z"},
+    )
+
+    assert response.status_code == 200
+    assert "mock-leaked-bw-password" not in response.text
+    assert "bw.example.invalid" not in response.text
+    assert "sap-client=100" not in response.text
+    payload = response.json()
+    search_op = next(op for op in payload["operations"] if op["name"] == "bw_search")
+    assert search_op["ok"] is False
+    assert "[BW_HOST]" in search_op["error"] or "[BW_URL]" in search_op["error"]
+    assert "[REDACTED]" in search_op["error"]
+
+
+def test_capture_snapshot_partial_success_preserves_succeeded_payloads(tmp_path: Path) -> None:
+    class PartialFailureClient(FakeLiveBwClient):
+        def fetch_dataflow(
+            self,
+            object_name: str,
+            *,
+            object_type: str = "ADSO",
+            source_system: str | None = None,
+            direction: str = "downwards",
+            levels: int = 3,
+        ) -> str:
+            if object_name == "ZBAD":
+                raise RuntimeError(
+                    "401 unauthorized https://bw.example.invalid/sap/bw "
+                    "token=mock-leaked-bw-password"
+                )
+            return super().fetch_dataflow(
+                object_name,
+                object_type=object_type,
+                source_system=source_system,
+                direction=direction,
+                levels=levels,
+            )
+
+    partial = PartialFailureClient()
+    client = TestClient(
+        create_app(project_root=tmp_path, bw_client_factory=lambda _state: partial)
+    )
+    _put_runtime_bw_config(client, password="mock-leaked-bw-password")
+
+    response = client.post(
+        "/api/v1/snapshots/capture",
+        json={
+            "confirm_read_only": True,
+            "object_names": ["ZOK", "ZBAD"],
+            "include_dataflow": True,
+            "include_xref": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "mock-leaked-bw-password" not in response.text
+    assert "bw.example.invalid" not in response.text
+    payload = response.json()
+    capture = payload["capture"]
+    assert capture["mode"] == "live-read-only"
+    assert capture["succeeded"] == 1
+    assert capture["failed"] == 1
+    op_status = {op["name"] + ":" + op["label"]: op for op in capture["operations"]}
+    failing = [op for op in capture["operations"] if op["ok"] is False]
+    assert len(failing) == 1
+    assert "mock-leaked-bw-password" not in failing[0]["error"]
+    assert "bw.example.invalid" not in failing[0]["error"]
+    assert capture["operations"]
+    assert op_status  # spot-check shape
+
+
+def test_capture_snapshot_returns_error_when_every_live_call_fails(tmp_path: Path) -> None:
+    class FailingClient(FakeLiveBwClient):
+        def fetch_dataflow(
+            self,
+            object_name: str,
+            *,
+            object_type: str = "ADSO",
+            source_system: str | None = None,
+            direction: str = "downwards",
+            levels: int = 3,
+        ) -> str:
+            raise RuntimeError("HTTP 500 from https://bw.example.invalid/sap/bw")
+
+    failing = FailingClient()
+    client = TestClient(
+        create_app(project_root=tmp_path, bw_client_factory=lambda _state: failing)
+    )
+    _put_runtime_bw_config(client, password="mock-leaked-bw-password")
+
+    response = client.post(
+        "/api/v1/snapshots/capture",
+        json={
+            "confirm_read_only": True,
+            "object_names": ["ZBAD"],
+            "include_dataflow": True,
+            "include_xref": False,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "no payloads collected" in response.text
+    assert "bw_get_dataflow" in response.text
+    assert "mock-leaked-bw-password" not in response.text
+    assert "bw.example.invalid" not in response.text

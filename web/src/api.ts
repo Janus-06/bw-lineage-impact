@@ -63,6 +63,23 @@ export interface RuntimeConfigRequest {
   };
 }
 
+export interface LiveOperationSummary {
+  name: string;
+  label: string;
+  ok: boolean;
+  status: 'ok' | 'error';
+  payload_kind: string | null;
+  item_count: number | null;
+  error: string | null;
+}
+
+export interface LiveSmokeResult {
+  mode: string;
+  read_only: boolean;
+  status: 'ok' | 'partial' | 'error';
+  operations: LiveOperationSummary[];
+}
+
 export interface SnapshotSummary {
   id: string;
   created_at: string;
@@ -71,6 +88,12 @@ export interface SnapshotSummary {
   manifest_path: string | null;
   object_count: number;
   edge_count: number;
+  capture?: {
+    mode: string;
+    succeeded: number;
+    failed: number;
+    operations: LiveOperationSummary[];
+  };
 }
 
 export interface SnapshotListResponse {
@@ -271,6 +294,13 @@ export async function captureLiveSnapshot(options: {
     dataflow_direction: options.dataflowDirection,
     dataflow_levels: options.dataflowLevels,
     xref_direction: options.xrefDirection,
+  });
+}
+
+export async function postConnectionTest(searchTerm: string = 'Z*'): Promise<LiveSmokeResult> {
+  return postJson<LiveSmokeResult>('/api/v1/connection/test', {
+    confirm_read_only: true,
+    search_term: searchTerm || 'Z*',
   });
 }
 

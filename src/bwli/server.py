@@ -45,6 +45,7 @@ from bwli.live import (
     collect_live_snapshot,
     run_live_smoke,
 )
+from bwli.redact import redact_text
 from bwli.store import (
     CatalogEdgeRecord,
     CatalogObjectRecord,
@@ -316,7 +317,7 @@ class V1ConnectionTestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     confirm_read_only: bool = False
-    search_term: str = "*"
+    search_term: str = "Z*"
 
 
 class V1SnapshotCaptureRequest(BaseModel):
@@ -496,16 +497,21 @@ def create_app(
     @app.post("/api/v1/connection/test", response_model=LiveSmokeResult)
     def connection_test_v1(request: V1ConnectionTestRequest) -> LiveSmokeResult:
         state = _ensure_live_ready(runtime_config, request.confirm_read_only)
-        return run_live_smoke(
-            client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
-            search_term=request.search_term,
-            secret_values=_runtime_secret_values(state),
-        )
+        try:
+            return run_live_smoke(
+                client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
+                search_term=request.search_term,
+                secret_values=_runtime_secret_values(state),
+                secret_urls=_runtime_secret_urls(state),
+            )
+        except Exception as exc:
+            raise _live_http_error(exc, state=state) from exc
 
     @app.post("/api/v1/snapshots/capture")
     def capture_snapshot_v1(request: V1SnapshotCaptureRequest) -> dict[str, object]:
+        live_state = runtime_config.bw if runtime_config.bw.configured else None
         try:
-            snapshot = _capture_v1_snapshot(
+            snapshot, capture_meta = _capture_v1_snapshot(
                 root=root,
                 store=catalog_store,
                 runtime_config=runtime_config,
@@ -513,8 +519,11 @@ def create_app(
                 bw_client_factory=bw_client_factory,
             )
         except Exception as exc:
-            raise _http_error(exc) from exc
-        return snapshot.model_dump(mode="json")
+            raise _live_http_error(exc, state=live_state) from exc
+        payload = snapshot.model_dump(mode="json")
+        if capture_meta is not None:
+            payload["capture"] = capture_meta
+        return payload
 
     @app.get("/api/v1/snapshots", response_model=V1SnapshotListResponse)
     def list_snapshots_v1() -> V1SnapshotListResponse:
@@ -733,24 +742,28 @@ def create_app(
     @app.post("/api/live/smoke", response_model=LiveSmokeResult)
     def live_smoke(request: LiveSmokeRequest) -> LiveSmokeResult:
         state = _ensure_live_ready(runtime_config, request.confirm_read_only)
-        return run_live_smoke(
-            client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
-            search_term=request.search_term,
-            object_name=request.object_name,
-            xref_direction=request.xref_direction,
-            dataflow_object_type=request.object_type,
-            dataflow_source_system=request.source_system,
-            dataflow_direction=request.dataflow_direction,
-            dataflow_levels=request.dataflow_levels,
-            secret_values=_runtime_secret_values(state),
-        )
+        try:
+            return run_live_smoke(
+                client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
+                search_term=request.search_term,
+                object_name=request.object_name,
+                xref_direction=request.xref_direction,
+                dataflow_object_type=request.object_type,
+                dataflow_source_system=request.source_system,
+                dataflow_direction=request.dataflow_direction,
+                dataflow_levels=request.dataflow_levels,
+                secret_values=_runtime_secret_values(state),
+                secret_urls=_runtime_secret_urls(state),
+            )
+        except Exception as exc:
+            raise _live_http_error(exc, state=state) from exc
 
     @app.post("/api/collect/live", response_model=LiveCollectionResponse)
     def live_collect(request: LiveCollectRequest) -> LiveCollectionResponse:
         state = _ensure_live_ready(runtime_config, request.confirm_read_only)
         try:
             out_dir = _resolve_local_output_dir(root, request.out_dir)
-            manifest = collect_live_snapshot(
+            result = collect_live_snapshot(
                 out_dir=out_dir,
                 client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
                 search_terms=request.search_terms,
@@ -762,12 +775,17 @@ def create_app(
                 dataflow_source_system=request.source_system,
                 dataflow_direction=request.dataflow_direction,
                 dataflow_levels=request.dataflow_levels,
+                secret_values=_runtime_secret_values(state),
+                secret_urls=_runtime_secret_urls(state),
             )
         except Exception as exc:
-            raise _http_error(exc) from exc
+            raise _live_http_error(exc, state=state) from exc
         return LiveCollectionResponse(
             manifest_path=str(out_dir / "manifest.json"),
-            manifest=manifest,
+            manifest=result.manifest,
+            operations=result.operations,
+            succeeded=result.succeeded,
+            failed=result.failed,
         )
 
     @app.post("/api/live/dataflow", response_model=RenderedResponse)
@@ -786,7 +804,7 @@ def create_app(
                 raise ValueError("live dataflow response is not XML text")
             content = render_dataflow(payload, output_format=request.format)
         except Exception as exc:
-            raise _http_error(exc) from exc
+            raise _live_http_error(exc, state=state) from exc
         finally:
             client.close()
         return RenderedResponse(format=request.format, content=content)
@@ -1045,6 +1063,10 @@ def _runtime_secret_values(state: RuntimeBwConfigState) -> list[str]:
     return [state.password] if state.password else []
 
 
+def _runtime_secret_urls(state: RuntimeBwConfigState) -> list[str]:
+    return [state.url] if state.url else []
+
+
 def _resolve_local_output_dir(root: Path, user_path: str) -> Path:
     path = Path(user_path)
     resolved = path if path.is_absolute() else root / path
@@ -1075,7 +1097,7 @@ def _capture_v1_snapshot(
     runtime_config: RuntimeConfigState,
     request: V1SnapshotCaptureRequest,
     bw_client_factory: BwClientFactory | None,
-) -> CatalogSnapshotRecord:
+) -> tuple[CatalogSnapshotRecord, dict[str, object] | None]:
     if request.fixture_path:
         fixture_path = _resolve_local_path(root, request.fixture_path)
         payload = json.loads(fixture_path.read_text(encoding="utf-8"))
@@ -1084,11 +1106,14 @@ def _capture_v1_snapshot(
             mode="offline-fixture",
             source=f"fixture://{fixture_path.name}",
         )
-        return _replace_catalog_or_delete_snapshot(
-            store,
-            snapshot.id,
-            objects=ingested.objects,
-            edges=ingested.edges,
+        return (
+            _replace_catalog_or_delete_snapshot(
+                store,
+                snapshot.id,
+                objects=ingested.objects,
+                edges=ingested.edges,
+            ),
+            None,
         )
 
     if request.manifest_path:
@@ -1099,18 +1124,21 @@ def _capture_v1_snapshot(
             source=f"manifest://{manifest_path.name}",
             manifest_path=_project_relative_path(root, manifest_path),
         )
-        return _replace_catalog_or_delete_snapshot(
-            store,
-            snapshot.id,
-            objects=ingested.objects,
-            edges=ingested.edges,
+        return (
+            _replace_catalog_or_delete_snapshot(
+                store,
+                snapshot.id,
+                objects=ingested.objects,
+                edges=ingested.edges,
+            ),
+            None,
         )
 
     state = _ensure_live_ready(runtime_config, request.confirm_read_only)
     out_dir = _resolve_local_output_dir(root, _live_snapshot_output_dir())
     if not request.search_terms and not request.object_names:
         raise ValueError("live capture requires at least one search term or object name")
-    manifest = collect_live_snapshot(
+    result = collect_live_snapshot(
         out_dir=out_dir,
         client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
         search_terms=request.search_terms,
@@ -1122,19 +1150,28 @@ def _capture_v1_snapshot(
         dataflow_source_system=request.source_system,
         dataflow_direction=request.dataflow_direction,
         dataflow_levels=request.dataflow_levels,
+        secret_values=_runtime_secret_values(state),
+        secret_urls=_runtime_secret_urls(state),
     )
     _, ingested = ingest_manifest(out_dir / "manifest.json")
     snapshot = store.create_snapshot(
-        mode=manifest.mode,
+        mode=result.manifest.mode,
         source="live-read-only",
         manifest_path=_project_relative_path(root, out_dir / "manifest.json"),
     )
-    return _replace_catalog_or_delete_snapshot(
+    record = _replace_catalog_or_delete_snapshot(
         store,
         snapshot.id,
         objects=ingested.objects,
         edges=ingested.edges,
     )
+    capture_meta: dict[str, object] = {
+        "mode": result.manifest.mode,
+        "succeeded": result.succeeded,
+        "failed": result.failed,
+        "operations": [op.model_dump(mode="json") for op in result.operations],
+    }
+    return record, capture_meta
 
 
 def _replace_catalog_or_delete_snapshot(
@@ -1593,3 +1630,21 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ValueError):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=500, detail=type(exc).__name__)
+
+
+def _live_http_error(
+    exc: Exception,
+    *,
+    state: RuntimeBwConfigState | None,
+) -> HTTPException:
+    """Run _http_error then scrub BW password/URL/host from user-visible detail."""
+    error = _http_error(exc)
+    if isinstance(error.detail, str) and state is not None:
+        scrubbed = redact_text(
+            error.detail,
+            secret_values=_runtime_secret_values(state),
+            urls=_runtime_secret_urls(state),
+        )
+        if scrubbed != error.detail:
+            error = HTTPException(status_code=error.status_code, detail=scrubbed)
+    return error

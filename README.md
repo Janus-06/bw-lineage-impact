@@ -101,14 +101,26 @@ uv run bwli collect --live --confirm-read-only --search-term Z* --out .tmp/live-
 
 ### Live read-only smoke and snapshot collection
 
-The web UI includes a **Live BW Smoke** tab. It uses the BW runtime settings stored in the
-local backend process memory and requires an explicit read-only confirmation checkbox before
-making SAP BW metadata calls. API responses include operation summaries and local manifest
-metadata only; BW passwords and LLM API keys are never returned.
+The web UI's **Settings** drawer drives the read-only live flow in three steps:
 
-The same tab can render BW Dataflow XML into Mermaid/Markdown/JSON using the read-only
-`/api/live/dataflow` endpoint. Use object types such as `ADSO`, `HCPR`, or `RSDS`; for `RSDS`,
-also provide the source system so the 30-character-padded object name can be built correctly.
+1. **Settings → Runtime / Diagnostics → 설정 저장** — store BW URL/USER/PASSWORD/CLIENT in
+   the backend process memory only (never persisted to disk).
+2. **Settings → Test connection → 연결 테스트 실행** — calls `POST /api/v1/connection/test`,
+   which runs a single read-only `bw_search` probe. Per-operation status, item counts, and
+   redacted error messages are shown inline (BW host, query string, and password are scrubbed
+   from any visible error).
+3. **Settings → Snapshot capture → Live GET capture** — disabled until the current session
+   has at least one successful Test connection. Use the *Object type* select (ADSO/HCPR/RSDS/
+   DSO/IOBJ/MPRO/CPRO/BCT/TRFN/QUERY/NATIVE_SQL_VIEW) and, if desired, a narrow *Search terms*
+   prefix (e.g. `ZADSO_`). Broad `*` searches are not auto-run.
+
+Backend snapshot capture survives per-object failures: when one object's dataflow/xref call
+fails, the successful payloads are still persisted and the response includes a `capture`
+field with `succeeded`, `failed`, and redacted `operations[]` summaries.
+
+The read-only `/api/live/dataflow` endpoint renders BW Dataflow XML into Mermaid/Markdown/JSON.
+For `RSDS`, also provide the source system so the 30-character-padded object name can be
+built correctly.
 
 CLI live collection remains gated by `BWLI_LIVE=1` and runtime environment variables:
 

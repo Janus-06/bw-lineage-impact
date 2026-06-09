@@ -40,9 +40,16 @@ class SnapshotWriter:
         payload: Any,
     ) -> PayloadMetadata:
         safe_id = _safe_payload_id(payload_id)
-        relative_path = f"payloads/{safe_id}.json"
+        if isinstance(payload, str):
+            extension = "xml"
+            encoded = payload.encode("utf-8")
+        else:
+            extension = "json"
+            encoded = json.dumps(
+                payload, ensure_ascii=False, indent=2, sort_keys=True
+            ).encode("utf-8")
+        relative_path = f"payloads/{safe_id}.{extension}"
         path = self.out_dir / relative_path
-        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         path.write_bytes(encoded)
         return PayloadMetadata(
             payload_id=safe_id,
@@ -70,6 +77,9 @@ class SnapshotReader:
 
     def read_payload(self, metadata: PayloadMetadata) -> Any:
         payload_path = _resolve_snapshot_relative_path(self.out_dir, metadata.relative_path)
+        suffix = payload_path.suffix.lower()
+        if suffix == ".xml":
+            return payload_path.read_text(encoding="utf-8")
         return json.loads(payload_path.read_text(encoding="utf-8"))
 
 

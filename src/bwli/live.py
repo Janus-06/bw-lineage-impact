@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -10,6 +9,7 @@ from urllib.parse import quote
 from pydantic import BaseModel, ConfigDict
 
 from bwli.endpoints import DataflowDirection
+from bwli.redact import redact_text
 from bwli.snapshot import SnapshotManifest, SnapshotWriter
 
 XrefDirection = Literal["upstream", "downstream"]
@@ -57,6 +57,17 @@ class LiveSmokeResult(BaseModel):
     operations: list[LiveOperationSummary]
 
 
+class LiveCollectionResult(BaseModel):
+    """Internal result of a live snapshot collection run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest: SnapshotManifest
+    operations: list[LiveOperationSummary]
+    succeeded: int
+    failed: int
+
+
 class LiveCollectionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -64,6 +75,13 @@ class LiveCollectionResponse(BaseModel):
     read_only: bool = True
     manifest_path: str
     manifest: SnapshotManifest
+    operations: list[LiveOperationSummary] = []
+    succeeded: int = 0
+    failed: int = 0
+
+
+class LiveCollectionError(ValueError):
+    """Raised when a live collection run has no successful read-only payloads."""
 
 
 def run_live_smoke(
@@ -77,6 +95,7 @@ def run_live_smoke(
     dataflow_direction: DataflowDirection = "downwards",
     dataflow_levels: int = 3,
     secret_values: Sequence[str] = (),
+    secret_urls: Sequence[str] = (),
 ) -> LiveSmokeResult:
     client = client_factory()
     try:
@@ -86,6 +105,7 @@ def run_live_smoke(
                 label="bw://bw_search",
                 func=lambda: client.fetch_search(search_term),
                 secret_values=secret_values,
+                secret_urls=secret_urls,
             )
         ]
         if object_name:
@@ -101,6 +121,7 @@ def run_live_smoke(
                         levels=dataflow_levels,
                     ),
                     secret_values=secret_values,
+                    secret_urls=secret_urls,
                 )
             )
             operations.append(
@@ -109,6 +130,7 @@ def run_live_smoke(
                     label=f"bw://bw_xref/{xref_direction}",
                     func=lambda: client.fetch_xref(object_name, direction=xref_direction),
                     secret_values=secret_values,
+                    secret_urls=secret_urls,
                 )
             )
     finally:
@@ -137,73 +159,139 @@ def collect_live_snapshot(
     dataflow_source_system: str | None = None,
     dataflow_direction: DataflowDirection = "downwards",
     dataflow_levels: int = 3,
-) -> SnapshotManifest:
+    secret_values: Sequence[str] = (),
+    secret_urls: Sequence[str] = (),
+) -> LiveCollectionResult:
+    """Capture a live BW snapshot, surviving per-object fetch failures.
+
+    Each fetch is wrapped: successful payloads are persisted, failed ones are
+    recorded as redacted operation summaries. Raises only when nothing succeeded.
+    """
     if not search_terms and not object_names:
         raise ValueError("at least one search term or object name is required for live collection")
 
     writer = SnapshotWriter(out_dir)
     payloads = []
+    operations: list[LiveOperationSummary] = []
     client = client_factory()
     try:
         for index, term in enumerate(search_terms):
+            payload_id = f"search-{index}-{_safe_fragment(term)}"
+            label = f"bw://bw_search?term={quote(term, safe='')}"
+            try:
+                payload = client.fetch_search(term)
+            except Exception as exc:
+                operations.append(
+                    _failure_summary(
+                        name="bw_search",
+                        label=label,
+                        exc=exc,
+                        secret_values=secret_values,
+                        secret_urls=secret_urls,
+                    )
+                )
+                continue
             payloads.append(
                 writer.write_payload(
-                    payload_id=f"search-{index}-{_safe_fragment(term)}",
+                    payload_id=payload_id,
                     kind="bw_search",
-                    source="bw://bw_search",
-                    payload=client.fetch_search(term),
+                    source=label,
+                    payload=payload,
                 )
             )
+            operations.append(_success_summary("bw_search", label, payload))
+
         for index, object_name in enumerate(object_names):
             if include_dataflow:
-                payloads.append(
-                    writer.write_payload(
-                        payload_id=f"dataflow-{index}-{_safe_fragment(object_name)}",
-                        kind="bw_get_dataflow",
-                        source="bw://bw_get_dataflow",
-                        payload=client.fetch_dataflow(
-                            object_name,
-                            object_type=dataflow_object_type,
-                            source_system=dataflow_source_system,
-                            direction=dataflow_direction,
-                            levels=dataflow_levels,
-                        ),
-                    )
+                label = (
+                    "bw://bw_get_dataflow?"
+                    f"objectName={quote(object_name, safe='')}&"
+                    f"objectType={quote(dataflow_object_type, safe='')}"
                 )
+                payload_id = f"dataflow-{index}-{_safe_fragment(object_name)}"
+                try:
+                    payload = client.fetch_dataflow(
+                        object_name,
+                        object_type=dataflow_object_type,
+                        source_system=dataflow_source_system,
+                        direction=dataflow_direction,
+                        levels=dataflow_levels,
+                    )
+                except Exception as exc:
+                    operations.append(
+                        _failure_summary(
+                            name="bw_get_dataflow",
+                            label=label,
+                            exc=exc,
+                            secret_values=secret_values,
+                            secret_urls=secret_urls,
+                        )
+                    )
+                else:
+                    payloads.append(
+                        writer.write_payload(
+                            payload_id=payload_id,
+                            kind="bw_get_dataflow",
+                            source=label,
+                            payload=payload,
+                        )
+                    )
+                    operations.append(
+                        _success_summary("bw_get_dataflow", label, payload)
+                    )
             if include_xref:
-                payloads.append(
-                    writer.write_payload(
-                        payload_id=f"xref-{index}-{_safe_fragment(object_name)}-{xref_direction}",
-                        kind="bw_xref",
-                        source=(
-                            f"bw://bw_xref/{xref_direction}?"
-                            f"objectName={quote(object_name, safe='')}"
-                        ),
-                        payload=client.fetch_xref(object_name, direction=xref_direction),
-                    )
+                label = (
+                    f"bw://bw_xref/{xref_direction}?"
+                    f"objectName={quote(object_name, safe='')}"
                 )
+                payload_id = f"xref-{index}-{_safe_fragment(object_name)}-{xref_direction}"
+                try:
+                    payload = client.fetch_xref(object_name, direction=xref_direction)
+                except Exception as exc:
+                    operations.append(
+                        _failure_summary(
+                            name="bw_xref",
+                            label=label,
+                            exc=exc,
+                            secret_values=secret_values,
+                            secret_urls=secret_urls,
+                        )
+                    )
+                else:
+                    payloads.append(
+                        writer.write_payload(
+                            payload_id=payload_id,
+                            kind="bw_xref",
+                            source=label,
+                            payload=payload,
+                        )
+                    )
+                    operations.append(_success_summary("bw_xref", label, payload))
     finally:
         client.close()
-    return writer.write_manifest(mode="live-read-only", payloads=payloads)
 
-
-def _run_operation(
-    *,
-    name: str,
-    label: str,
-    func: Callable[[], Any],
-    secret_values: Sequence[str],
-) -> LiveOperationSummary:
-    try:
-        payload = func()
-    except Exception as exc:
-        return LiveOperationSummary(
-            name=name,
-            label=label,
-            ok=False,
-            status="error",
-            error=_redact_text(str(exc) or type(exc).__name__, secret_values=secret_values),
+    failed = sum(1 for op in operations if not op.ok)
+    succeeded = len(operations) - failed
+    if succeeded == 0:
+        preview = "; ".join(
+            f"{op.name} {op.label}: {op.error or 'error'}"
+            for op in operations[:3]
         )
+        raise LiveCollectionError(
+            "live snapshot capture failed: "
+            f"no payloads collected ({failed} operation(s) failed)"
+            f"; {preview}"
+        )
+    manifest = writer.write_manifest(mode="live-read-only", payloads=payloads)
+    return LiveCollectionResult(
+        manifest=manifest,
+        operations=operations,
+        succeeded=succeeded,
+        failed=failed,
+    )
+
+
+def _success_summary(name: str, label: str, payload: Any) -> LiveOperationSummary:
     payload_kind, item_count = _payload_shape(payload)
     return LiveOperationSummary(
         name=name,
@@ -213,6 +301,45 @@ def _run_operation(
         payload_kind=payload_kind,
         item_count=item_count,
     )
+
+
+def _failure_summary(
+    *,
+    name: str,
+    label: str,
+    exc: Exception,
+    secret_values: Sequence[str],
+    secret_urls: Sequence[str],
+) -> LiveOperationSummary:
+    message = str(exc) or type(exc).__name__
+    return LiveOperationSummary(
+        name=name,
+        label=label,
+        ok=False,
+        status="error",
+        error=redact_text(message, secret_values=secret_values, urls=secret_urls),
+    )
+
+
+def _run_operation(
+    *,
+    name: str,
+    label: str,
+    func: Callable[[], Any],
+    secret_values: Sequence[str],
+    secret_urls: Sequence[str] = (),
+) -> LiveOperationSummary:
+    try:
+        payload = func()
+    except Exception as exc:
+        return _failure_summary(
+            name=name,
+            label=label,
+            exc=exc,
+            secret_values=secret_values,
+            secret_urls=secret_urls,
+        )
+    return _success_summary(name, label, payload)
 
 
 def _payload_shape(payload: Any) -> tuple[str, int | None]:
@@ -238,14 +365,5 @@ def _safe_fragment(value: str) -> str:
 
 
 def _redact_text(value: str, *, secret_values: Sequence[str]) -> str:
-    redacted = value
-    for secret in secret_values:
-        if secret:
-            redacted = redacted.replace(secret, "[REDACTED]")
-    redacted = re.sub(
-        r"(?i)(authorization|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)[^\s,;]+",
-        r"\1\2[REDACTED]",
-        redacted,
-    )
-    redacted = re.sub(r"(?i)Bearer\s+[^\s,;]+", "Bearer [REDACTED]", redacted)
-    return redacted
+    """Backwards-compatible shim. New code should call bwli.redact.redact_text."""
+    return redact_text(value, secret_values=secret_values)

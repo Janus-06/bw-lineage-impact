@@ -10,6 +10,7 @@ import {
   getRuntimeConfig,
   listObjects,
   listSnapshots,
+  postConnectionTest,
   postImpactAdvice,
   postImpactScenario,
   postLineage,
@@ -27,6 +28,7 @@ import {
   type ImpactScenarioResponse,
   type LineageAdviceResponse,
   type LineageResponse,
+  type LiveSmokeResult,
   type RuntimeConfigResponse,
   type SnapshotSummary,
   type SqlDraftResponse,
@@ -35,7 +37,20 @@ import {
 
 const fixtureGraphPath = 'tests/fixtures/sample-graph.json';
 const fixtureSqlPath = 'tests/fixtures/native_sql_view.sql';
-const typeFilters = ['', 'ADSO', 'HCPR', 'TRFN', 'QUERY', 'NATIVE_SQL_VIEW'];
+const bwObjectTypes = [
+  'ADSO',
+  'HCPR',
+  'RSDS',
+  'DSO',
+  'IOBJ',
+  'MPRO',
+  'CPRO',
+  'BCT',
+  'TRFN',
+  'QUERY',
+  'NATIVE_SQL_VIEW',
+];
+const typeFilters = ['', ...bwObjectTypes];
 const changeTypes: ChangeType[] = [
   'field_removed',
   'field_type_changed',
@@ -55,6 +70,10 @@ function parseObjectNamesText(value: string): string[] {
 
 function joinObjectNames(values: string[]): string {
   return Array.from(new Set(values)).join(', ');
+}
+
+function isBroadLiveSearchTerm(term: string): boolean {
+  return term.trim() === '*';
 }
 
 interface SetupForm {
@@ -122,12 +141,16 @@ export default function App() {
   const [bwSetupTouched, setBwSetupTouched] = useState(false);
 
   const [liveObjectNames, setLiveObjectNames] = useState('');
-  const [liveObjectType, setLiveObjectType] = useState('ADSO');
+  const [liveObjectType, setLiveObjectType] = useState<string>('ADSO');
   const [liveSourceSystem, setLiveSourceSystem] = useState('');
+  const [liveSearchTerms, setLiveSearchTerms] = useState('');
   const [liveDataflowDirection, setLiveDataflowDirection] = useState<DataflowDirection>('downwards');
   const [liveXrefDirection, setLiveXrefDirection] = useState<XrefDirection>('downstream');
   const [liveDataflowLevels, setLiveDataflowLevels] = useState(3);
   const [liveReadOnlyConfirmed, setLiveReadOnlyConfirmed] = useState(false);
+  const [connectionTest, setConnectionTest] = useState<LiveSmokeResult | null>(null);
+  const [connectionTestSearchTerm, setConnectionTestSearchTerm] = useState('Z*');
+  const [connectionTestOk, setConnectionTestOk] = useState(false);
 
   const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
   const selectedObject = objects.find((item) => item.id === selectedObjectId)
@@ -319,6 +342,8 @@ export default function App() {
       setSetupForm((current) => ({ ...current, password: '', llmApiKey: '' }));
       setBwSetupTouched(false);
       setDiagnosticsOpen(false);
+      setConnectionTest(null);
+      setConnectionTestOk(false);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -333,6 +358,8 @@ export default function App() {
       setRuntime(await clearRuntimeConfig());
       setSetupForm((current) => ({ ...current, password: '', llmApiKey: '' }));
       setBwSetupTouched(false);
+      setConnectionTest(null);
+      setConnectionTestOk(false);
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -356,8 +383,13 @@ export default function App() {
 
   async function captureLive() {
     const objectNames = parseLiveObjectNames();
-    if (objectNames.length === 0) {
-      setError('Live capture에는 dataflow/xref edge 수집 대상 object name이 최소 1개 필요합니다.');
+    const searchTerms = parseObjectNamesText(liveSearchTerms);
+    if (objectNames.length === 0 && searchTerms.length === 0) {
+      setError('Live capture에는 object name 또는 좁은 search term이 최소 1개 필요합니다.');
+      return;
+    }
+    if (searchTerms.some(isBroadLiveSearchTerm)) {
+      setError('Live capture search term으로 단독 * 는 허용하지 않습니다. 좁은 prefix(예: ZADSO_)나 정확한 object name을 사용하세요.');
       return;
     }
     setBusy('snapshot');
@@ -365,6 +397,7 @@ export default function App() {
       const snapshot = await captureLiveSnapshot({
         confirmReadOnly: liveReadOnlyConfirmed,
         objectNames,
+        searchTerms: searchTerms.length > 0 ? searchTerms : undefined,
         objectType: liveObjectType.trim() || undefined,
         sourceSystem: liveSourceSystem.trim() || undefined,
         dataflowDirection: liveDataflowDirection,
@@ -374,6 +407,30 @@ export default function App() {
       await reloadSnapshots(snapshot.id);
       setError('');
     } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function runConnectionTest() {
+    if (!runtime?.bw.configured) {
+      setError('Test connection 전 BW 설정을 저장하거나 .env로 로드해야 합니다.');
+      return;
+    }
+    if (bwSetupTouched) {
+      setError('변경한 BW 설정을 먼저 저장한 뒤 Test connection을 실행하세요.');
+      return;
+    }
+    setBusy('connection-test');
+    try {
+      const result = await postConnectionTest(connectionTestSearchTerm.trim() || '*');
+      setConnectionTest(result);
+      setConnectionTestOk(result.status !== 'error');
+      setError('');
+    } catch (err) {
+      setConnectionTest(null);
+      setConnectionTestOk(false);
       setError(errorText(err));
     } finally {
       setBusy('');
@@ -609,6 +666,51 @@ export default function App() {
             </section>
 
             <section className="drawerSection">
+              <h3>Test connection</h3>
+              <p>
+                저장된 BW 설정으로 <code>bw_search</code> 한 번만 호출해 인증/TLS/프록시를 확인합니다.
+                실패 시 BW host/secret은 표시되지 않습니다.
+              </p>
+              <div className="liveOptionsGrid">
+                <label>
+                  검색 패턴 (search_term)
+                  <input
+                    placeholder="예: Z* 또는 ZADSO_"
+                    value={connectionTestSearchTerm}
+                    onChange={(event) => setConnectionTestSearchTerm(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="captureRow">
+                <button
+                  className="secondaryButton"
+                  onClick={runConnectionTest}
+                  disabled={!runtime?.bw.configured || bwSetupTouched || busy === 'connection-test'}
+                >
+                  연결 테스트 실행
+                </button>
+                <span className={`connectionBadge ${connectionTestBadge(connectionTest)}`}>
+                  {connectionTestLabel(connectionTest, runtime?.bw.configured ?? false)}
+                </span>
+              </div>
+              {connectionTest ? (
+                <ul className="connectionOps" aria-label="connection test operations">
+                  {connectionTest.operations.map((op) => (
+                    <li key={op.label} className={op.ok ? 'opOk' : 'opError'}>
+                      <strong>{op.name}</strong>
+                      <small>{op.label}</small>
+                      {op.ok ? (
+                        <span>{op.payload_kind ?? 'ok'}{op.item_count != null ? ` · ${op.item_count}` : ''}</span>
+                      ) : (
+                        <code>{op.error ?? 'error'}</code>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </section>
+
+            <section className="drawerSection">
               <h3>Snapshot capture</h3>
               <p>Fixture는 로컬 샘플 검증용입니다. Live GET capture는 선택한 object names만 좁게 조회합니다.</p>
               <label className="fieldLabel">
@@ -648,10 +750,29 @@ export default function App() {
                   ))}
                 </div>
               ) : null}
+              <label className="fieldLabel">
+                Search terms (선택)
+                <input
+                  className="liveSearchInput"
+                  placeholder="예: ZADSO_, ZTRFN_ — 좁은 prefix만 권장 (broad * 자동 실행 금지)"
+                  value={liveSearchTerms}
+                  onChange={(event) => setLiveSearchTerms(event.target.value)}
+                />
+                <small className="livePickerHint">
+                  쉼표/줄바꿈으로 구분. 비워두면 search 호출 없이 dataflow/xref만 수행합니다.
+                </small>
+              </label>
               <div className="liveOptionsGrid">
                 <label>
                   Object type
-                  <input value={liveObjectType} onChange={(event) => setLiveObjectType(event.target.value)} />
+                  <select
+                    value={liveObjectType}
+                    onChange={(event) => setLiveObjectType(event.target.value)}
+                  >
+                    {bwObjectTypes.map((type) => (
+                      <option key={type} value={type}>{type}</option>
+                    ))}
+                  </select>
                 </label>
                 <label>
                   Source system
@@ -698,10 +819,28 @@ export default function App() {
                 <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>
                   Fixture capture
                 </button>
-                <button className="primaryButton" onClick={captureLive} disabled={!runtime?.bw.configured || !liveReadOnlyConfirmed || busy === 'snapshot'}>
+                <button
+                  className="primaryButton"
+                  onClick={captureLive}
+                  disabled={
+                    !runtime?.bw.configured
+                    || bwSetupTouched
+                    || !liveReadOnlyConfirmed
+                    || !connectionTestOk
+                    || busy === 'snapshot'
+                  }
+                  title={connectionTestOk ? '' : '먼저 Test connection을 실행해 성공해야 합니다.'}
+                >
                   Live GET capture
                 </button>
               </div>
+              {!connectionTestOk || bwSetupTouched ? (
+                <p className="livePickerHint">
+                  {bwSetupTouched
+                    ? '변경한 BW 설정을 저장하고 Test connection을 다시 실행해야 Live GET capture가 활성화됩니다.'
+                    : 'Live GET capture는 현재 세션에서 연결 테스트가 성공한 뒤에만 활성화됩니다.'}
+                </p>
+              ) : null}
             </section>
           </aside>
         </div>
@@ -1279,4 +1418,19 @@ function compactDate(value: string): string {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function connectionTestBadge(test: LiveSmokeResult | null): string {
+  if (!test) return 'idle';
+  if (test.status === 'ok') return 'ok';
+  if (test.status === 'partial') return 'warn';
+  return 'error';
+}
+
+function connectionTestLabel(test: LiveSmokeResult | null, configured: boolean): string {
+  if (!configured) return 'BW 설정 필요';
+  if (!test) return '미실행';
+  if (test.status === 'ok') return '연결 성공';
+  if (test.status === 'partial') return '부분 성공';
+  return '실패';
 }

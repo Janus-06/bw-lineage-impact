@@ -269,7 +269,7 @@ def _collect(args: argparse.Namespace) -> int:
             )
 
         try:
-            manifest = collect_live_snapshot(
+            result = collect_live_snapshot(
                 out_dir=out_dir,
                 client_factory=factory,
                 search_terms=args.search_terms,
@@ -281,11 +281,21 @@ def _collect(args: argparse.Namespace) -> int:
                 dataflow_source_system=args.source_system,
                 dataflow_direction=args.dataflow_direction,
                 dataflow_levels=args.dataflow_levels,
+                secret_values=[config.password.get_secret_value()],
+                secret_urls=[config.url],
             )
         except Exception as exc:
             print(f"live collection failed: {type(exc).__name__}", file=sys.stderr)
             return 1
-        print(f"wrote {out_dir / 'manifest.json'} with {len(manifest.payloads)} payload(s)")
+        manifest = result.manifest
+        print(
+            f"wrote {out_dir / 'manifest.json'} with {len(manifest.payloads)} payload(s) "
+            f"(succeeded={result.succeeded}, failed={result.failed})"
+        )
+        if result.failed:
+            for op in result.operations:
+                if not op.ok:
+                    print(f"  ! {op.name} {op.label}: {op.error}", file=sys.stderr)
         return 0
     print(SAFE_STUB_MESSAGE)
     return 0
