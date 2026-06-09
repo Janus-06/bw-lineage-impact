@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import stat
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 from fastapi.testclient import TestClient
 
 from bwli.llm.openai_compatible import LlmAuditMetadata, LlmCompletion
-from bwli.server import create_app
+from bwli.server import _project_relative_path, create_app
 from bwli.snapshot import SnapshotWriter
 from bwli.store import CatalogStore, SecretPersistenceError
 
@@ -638,6 +638,26 @@ def test_v1_manifest_capture_stores_project_relative_manifest_path(
     listed = client.get("/api/v1/snapshots")
     assert listed.status_code == 200
     assert listed.json()["snapshots"][0]["manifest_path"] == "snapshots/imported/manifest.json"
+
+
+class _WindowsResolvedPath:
+    def __init__(self, value: str) -> None:
+        self.value = PureWindowsPath(value)
+
+    def resolve(self) -> PureWindowsPath:
+        return self.value
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+def test_project_relative_path_uses_posix_separators_for_api_storage() -> None:
+    relative_path = _project_relative_path(
+        _WindowsResolvedPath("C:/repo"),  # type: ignore[arg-type]
+        _WindowsResolvedPath("C:/repo/snapshots/imported/manifest.json"),  # type: ignore[arg-type]
+    )
+
+    assert relative_path == "snapshots/imported/manifest.json"
 
 
 @pytest.mark.parametrize("cursor", ["abc", "-1"])
