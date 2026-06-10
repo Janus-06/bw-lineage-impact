@@ -118,6 +118,7 @@ export default function App() {
   const [impactDepth, setImpactDepth] = useState(3);
   const [sqlViewId, setSqlViewId] = useState('ZSQL_VIEW');
   const [sqlFile, setSqlFile] = useState(fixtureSqlPath);
+  const [sqlText, setSqlText] = useState('');
   const [sqlQuestion, setSqlQuestion] = useState('이 뷰의 주요 소스와 집계 로직을 설명하는 조회 초안');
   const [lineage, setLineage] = useState<LineageResponse | null>(null);
   const [lineageAdvice, setLineageAdvice] = useState<LineageAdviceResponse | null>(null);
@@ -188,7 +189,6 @@ export default function App() {
 
   useEffect(() => {
     if (selectedSnapshotId) {
-      void refreshObjects(selectedSnapshotId);
       void refreshSnapshotContext(selectedSnapshotId);
     } else {
       setObjects([]);
@@ -197,6 +197,12 @@ export default function App() {
       setCaptureScope([]);
       setGlossaryTerms([]);
     }
+  }, [selectedSnapshotId]);
+
+  useEffect(() => {
+    if (!selectedSnapshotId) return;
+    const timer = window.setTimeout(() => void refreshObjects(selectedSnapshotId), 200);
+    return () => window.clearTimeout(timer);
   }, [selectedSnapshotId, catalogQuery, objectType]);
 
   useEffect(() => {
@@ -298,9 +304,6 @@ export default function App() {
       setRepositoryNodes(repositoryResponse.items);
       setRepositorySource(repositoryResponse.source);
       setRepositoryActionRequired(repositoryResponse.action_required);
-      if (runtimeResponse.bw.configured) {
-        setDiagnosticsOpen(false);
-      }
       setError('');
     } catch (err) {
       setError(errorText(err));
@@ -413,7 +416,6 @@ export default function App() {
       setRuntime(next);
       setSetupForm((current) => ({ ...current, password: '', llmApiKey: '' }));
       setBwSetupTouched(false);
-      setDiagnosticsOpen(false);
       setConnectionTest(null);
       setConnectionTestOk(next.connection_status === 'ok');
       setError('');
@@ -610,7 +612,7 @@ export default function App() {
       setSqlExplain(
         await explainSql(selectedSnapshotId, {
           view_id: sqlViewId,
-          sql_file: sqlFile,
+          ...(sqlText.trim() ? { sql_text: sqlText } : { sql_file: sqlFile }),
           format: 'json',
         }),
       );
@@ -631,7 +633,7 @@ export default function App() {
           question: sqlQuestion,
           target_dialect: 'sap-hana-sql',
           view_id: sqlViewId,
-          sql_file: sqlFile,
+          ...(sqlText.trim() ? { sql_text: sqlText } : { sql_file: sqlFile }),
         }),
       );
       setError('');
@@ -661,7 +663,12 @@ export default function App() {
         </button>
       </header>
 
-      {error ? <div className="errorBar">{error}</div> : null}
+      {error ? (
+        <div className="errorBar" role="alert">
+          <span>{error}</span>
+          <button className="errorDismiss" onClick={() => setError('')} aria-label="오류 메시지 닫기">×</button>
+        </div>
+      ) : null}
 
       {runtimeMissing && !diagnosticsOpen ? (
         <div className="setupPrompt">
@@ -1201,6 +1208,8 @@ export default function App() {
               setViewId={setSqlViewId}
               sqlFile={sqlFile}
               setSqlFile={setSqlFile}
+              sqlText={sqlText}
+              setSqlText={setSqlText}
               question={sqlQuestion}
               setQuestion={setSqlQuestion}
               explain={sqlExplain}
@@ -1390,6 +1399,8 @@ function SqlTab(props: {
   setViewId: (value: string) => void;
   sqlFile: string;
   setSqlFile: (value: string) => void;
+  sqlText: string;
+  setSqlText: (value: string) => void;
   question: string;
   setQuestion: (value: string) => void;
   explain: SqlExplainResponse | null;
@@ -1407,7 +1418,15 @@ function SqlTab(props: {
         <label>View ID
           <input value={props.viewId} onChange={(event) => props.setViewId(event.target.value)} />
         </label>
-        <label>SQL file
+        <label>SQL text (붙여넣기)
+          <textarea
+            rows={6}
+            placeholder="Native SQL View 정의를 붙여넣으세요. 입력하면 SQL file 대신 분석합니다."
+            value={props.sqlText}
+            onChange={(event) => props.setSqlText(event.target.value)}
+          />
+        </label>
+        <label>SQL file (project 내 경로 · SQL text 비어있을 때 사용)
           <input value={props.sqlFile} onChange={(event) => props.setSqlFile(event.target.value)} />
         </label>
         <button className="primaryButton wide" onClick={props.onExplain} disabled={props.busy === 'sql-explain'}>
@@ -1703,7 +1722,11 @@ function NumberField(props: { label: string; value: number; min: number; max: nu
         min={props.min}
         max={props.max}
         value={props.value}
-        onChange={(event) => props.onChange(Number(event.target.value))}
+        onChange={(event) => {
+          const next = Number(event.target.value);
+          if (Number.isNaN(next)) return;
+          props.onChange(Math.min(props.max, Math.max(props.min, Math.trunc(next))));
+        }}
       />
     </label>
   );

@@ -74,7 +74,10 @@ pre { overflow: auto; max-height: 300px; margin: 12px 0 0; padding: 12px; border
 .statusPill.info { border-color: var(--border); background: #fff; }
 .statusPill.neutral { background: #f6f8fb; }
 
-.errorBar { margin: 12px 0; padding: 10px 12px; border: 1px solid #fecaca; border-radius: 12px; color: #991b1b; background: #fff1f2; }
+.errorBar { display: flex; align-items: start; justify-content: space-between; gap: 10px; margin: 12px 0; padding: 10px 12px; border: 1px solid #fecaca; border-radius: 12px; color: #991b1b; background: #fff1f2; }
+.errorBar span { min-width: 0; overflow-wrap: anywhere; }
+.errorDismiss { flex: none; min-height: 24px; padding: 0 8px; border-radius: 8px; color: #991b1b; background: transparent; font-size: 14px; font-weight: 750; }
+.errorDismiss:hover { background: #ffe1e4; }
 .setupPrompt { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: var(--panel-soft); font-size: 12px; font-weight: 650; }
 .setupPrompt button { min-height: 28px; padding: 0 9px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: #fff; font-size: 12px; font-weight: 750; }
 .settingsOverlay { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(15, 23, 42, .28); backdrop-filter: blur(4px); }
