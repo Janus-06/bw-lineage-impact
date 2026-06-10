@@ -729,6 +729,34 @@ def ingest_manifest(manifest_path: Path) -> tuple[SnapshotManifest, IngestedCata
     return manifest, combined.to_catalog()
 
 
+def parse_search_results(payload: object, *, source: str) -> list[CatalogObjectRecord]:
+    """Parse a live bw_search payload (JSON dict/list or XML text) into object records.
+
+    Reuses the deterministic snapshot-ingest parsing so live search results and
+    captured search payloads stay consistent. Unlike persisted catalog listings,
+    live search responses preserve the BW/result payload order so the picker does
+    not reshuffle what the user just searched for.
+    """
+    records = _ingest_payload(
+        payload,
+        payload_id="bw-search",
+        source=source,
+        kind="bw_search",
+    ).objects
+    return sorted(records, key=_search_result_order)
+
+
+def _search_result_order(record: CatalogObjectRecord) -> int:
+    for evidence_id in record.evidence_ids:
+        marker = ":search:"
+        if marker not in evidence_id:
+            continue
+        suffix = evidence_id.rsplit(marker, 1)[-1]
+        if suffix.isdigit():
+            return int(suffix)
+    return 0
+
+
 def _ingest_payload(
     payload: object,
     *,

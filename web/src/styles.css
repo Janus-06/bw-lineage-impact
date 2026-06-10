@@ -126,7 +126,7 @@ pre { overflow: auto; max-height: 300px; margin: 12px 0 0; padding: 12px; border
   background: var(--panel);
   box-shadow: var(--shadow);
 }
-.catalogPane { position: sticky; top: 82px; align-self: start; height: calc(100vh - 96px); padding: 14px; overflow: hidden; }
+.catalogPane { position: sticky; top: 82px; align-self: start; height: calc(100vh - 96px); padding: 14px; overflow: auto; }
 .paneHeader { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
 .eyebrow { color: var(--faint); font-size: 10px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 h1, h2, h3 { color: var(--text); letter-spacing: -.015em; }
@@ -163,7 +163,7 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.015em; }
 .catalogActionCard { display: grid; gap: 6px; margin: 12px 0; padding: 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-soft); }
 .catalogActionCard strong { font-size: 13px; }
 .catalogActionCard p, .catalogActionCard small { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
-.objectList { display: flex; flex-direction: column; gap: 7px; height: calc(100vh - 610px); min-height: 150px; overflow: auto; padding-right: 3px; }
+.objectList { display: flex; flex-direction: column; gap: 7px; max-height: 320px; min-height: 150px; overflow: auto; padding-right: 3px; }
 .objectItem { display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 4px 8px; width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 12px; color: var(--text); text-align: left; background: #fff; }
 .objectItem:hover, .objectItem.active { border-color: var(--blue); background: #f0f5ff; }
 .objectType { grid-row: span 2; align-self: center; padding: 4px 6px; border-radius: 8px; color: #334155; background: #e8edf3; font-size: 9px; font-weight: 750; text-align: center; }
@@ -188,7 +188,7 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.015em; }
 .secondaryButton, .ghostButton, .iconButton { border: 1px solid var(--border); color: var(--text); background: #fff; }
 .primaryButton:hover { background: #0f172a; }
 .secondaryButton:hover, .ghostButton:hover, .iconButton:hover { border-color: var(--border-strong); background: #f8fafc; }
-.wide { width: 100%; }
+.wide, .fullWidth { width: 100%; }
 .metaGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
 .metric { padding: 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-soft); }
 .metric span { display: block; color: var(--faint); font-size: 10px; font-weight: 850; text-transform: uppercase; }
@@ -288,6 +288,30 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.015em; }
 .termsOverview small { color: var(--muted); font-size: 11px; line-height: 1.35; }
 .termsOverviewList { display: flex; flex-wrap: wrap; gap: 5px; max-height: 76px; overflow: auto; }
 .termsOverviewList span { max-width: 100%; min-height: 22px; padding: 4px 7px; border: 1px solid #d6e2f5; border-radius: 8px; background: #f6f9ff; color: var(--text); font-size: 10.5px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.termsOverviewHeader .ghostButton { min-height: 24px; padding: 0 8px; font-size: 10.5px; }
+.basisRow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.analysisBasisField .secondaryButton { min-height: 36px; white-space: nowrap; }
+.bwSearchResults { display: grid; gap: 7px; max-height: 220px; overflow: auto; padding-right: 2px; }
+.bwSearchResult { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; align-items: center; padding: 7px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
+.searchResultMain { display: grid; grid-template-columns: 46px minmax(0, 1fr); gap: 2px 7px; width: 100%; color: var(--text); text-align: left; background: transparent; }
+.searchResultMain span { grid-row: span 2; align-self: center; padding: 3px 5px; border-radius: 7px; color: #334155; background: #e2e8f0; font-size: 8.5px; font-weight: 800; text-align: center; }
+.searchResultMain strong { overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.searchResultMain small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.miniPrimaryButton { min-height: 30px; padding: 0 9px; border-radius: 8px; color: #fff; background: var(--blue); font-size: 11px; font-weight: 800; white-space: nowrap; }
+.miniPrimaryButton:hover { background: #1d46ad; }
+.tabPurpose { margin: 8px 0 10px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.glossaryLayout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 12px; margin-top: 12px; align-items: start; }
+.glossaryMetrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.glossaryResults { display: grid; gap: 10px; margin-top: 12px; }
+.glossaryResult { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 12px; border: 1px solid var(--border); border-left: 5px solid #94a3b8; border-radius: 12px; background: #fff; }
+.glossaryResult.confirmed { border-left-color: var(--teal); }
+.glossaryResult.candidate { border-left-color: var(--warn); }
+.glossaryResultMain { display: grid; gap: 3px; min-width: 0; }
+.glossaryResultMain span { color: var(--faint); font-size: 10px; font-weight: 850; text-transform: uppercase; }
+.glossaryResultMain strong { overflow-wrap: anywhere; color: var(--text); font-size: 14px; }
+.glossaryResultMain small, .glossaryResult > small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.glossaryActions { display: flex; align-items: center; gap: 7px; }
+.glossaryActions .secondaryButton { min-height: 30px; padding: 0 9px; white-space: nowrap; }
 .sqlAdvanced { margin-top: 12px; padding: 10px; border-radius: 12px; }
 .sqlAnalysisGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0; }
 .sqlAnalysisGrid h3 { margin: 0 0 6px; font-size: 13px; }

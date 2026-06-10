@@ -18,7 +18,10 @@ import {
   postLineage,
   postLineageAdvice,
   putRuntimeConfig,
+  refreshSnapshotFromBw,
+  searchBwObjects,
   type AppTab,
+  type BwSearchItem,
   type CaptureScopeItem,
   type CatalogObject,
   type CatalogObjectDetail,
@@ -78,7 +81,7 @@ function joinObjectNames(values: string[]): string {
 }
 
 function isBroadLiveSearchTerm(term: string): boolean {
-  return term.trim() === '*';
+  return term.trim().replace(/[*%]/g, '').trim() === '';
 }
 
 interface SetupForm {
@@ -146,6 +149,7 @@ export default function App() {
   const [bwSetupTouched, setBwSetupTouched] = useState(false);
 
   const [liveObjectNames, setLiveObjectNames] = useState('');
+  const [liveObjectTargetTypes, setLiveObjectTargetTypes] = useState<Record<string, string>>({});
   const [liveObjectType, setLiveObjectType] = useState<string>('ADSO');
   const [liveSourceSystem, setLiveSourceSystem] = useState('');
   const [liveSearchTerms, setLiveSearchTerms] = useState('');
@@ -160,6 +164,11 @@ export default function App() {
   const [repositoryActionRequired, setRepositoryActionRequired] = useState<string | null>(null);
   const [captureScope, setCaptureScope] = useState<CaptureScopeItem[]>([]);
   const [glossaryTerms, setGlossaryTerms] = useState<GlossaryTerm[]>([]);
+  const [glossaryQuery, setGlossaryQuery] = useState('');
+  const [bwSearchTerm, setBwSearchTerm] = useState('');
+  const [bwSearchType, setBwSearchType] = useState('');
+  const [bwSearchResults, setBwSearchResults] = useState<BwSearchItem[]>([]);
+  const [bwSearchTruncated, setBwSearchTruncated] = useState(false);
 
   const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
   const selectedObject = objects.find((item) => item.id === selectedObjectId)
@@ -172,6 +181,9 @@ export default function App() {
   const snapshotPickObjects = useMemo(() => objects.slice(0, 16), [objects]);
   const bwSavedForTesting = Boolean(runtime?.bw.configured && !bwSetupTouched);
   const bwTestedForCapture = Boolean(connectionReady && !bwSetupTouched);
+  const refreshableAnalysisBasis = Boolean(
+    selectedSnapshot?.mode === 'live-read-only' && captureScope.some((item) => item.role === 'selected'),
+  );
   const selectedObjectGlossary = useMemo(
     () => objectDetail?.glossary_terms ?? glossaryTerms.filter((term) => term.object_id === selectedObjectId).slice(0, 12),
     [glossaryTerms, objectDetail, selectedObjectId],
@@ -229,7 +241,7 @@ export default function App() {
 
   const latestSnapshotLabel = selectedSnapshot
     ? compactDate(selectedSnapshot.created_at)
-    : '스냅샷 없음';
+    : '분석 기준 없음';
 
   const graphStats = useMemo(() => {
     if (!lineage) return 'Lineage 미실행';
@@ -260,17 +272,64 @@ export default function App() {
     return names.length > 0 ? names : parseObjectNamesText(selectedObjectId);
   }
 
-  function addLiveObjectName(objectId: string) {
-    if (!objectId.trim()) return;
-    setLiveObjectNames((current) => joinObjectNames([...parseObjectNamesText(current), objectId.trim()]));
+  function pruneLiveObjectTargetTypes(names: string[]) {
+    setLiveObjectTargetTypes((current) => Object.fromEntries(
+      Object.entries(current).filter(([objectId]) => names.includes(objectId)),
+    ));
+  }
+
+  function addLiveObjectName(objectId: string, objectType?: string | null) {
+    const objectName = objectId.trim();
+    if (!objectName) return;
+    if (isBroadLiveSearchTerm(objectName)) {
+      setError('단독 * / % 는 분석 대상 object name으로 허용하지 않습니다. 정확한 BW object name을 사용하세요.');
+      return;
+    }
+    setLiveObjectNames((current) => joinObjectNames([...parseObjectNamesText(current), objectName]));
+    const normalizedType = objectType?.trim();
+    if (normalizedType && normalizedType !== 'UNKNOWN') {
+      setLiveObjectTargetTypes((current) => ({ ...current, [objectName]: normalizedType }));
+    }
   }
 
   function removeLiveObjectName(objectId: string) {
     setLiveObjectNames((current) => joinObjectNames(parseObjectNamesText(current).filter((item) => item !== objectId)));
+    setLiveObjectTargetTypes((current) => {
+      const next = { ...current };
+      delete next[objectId];
+      return next;
+    });
   }
 
   function clearLiveObjectNames() {
     setLiveObjectNames('');
+    setLiveObjectTargetTypes({});
+  }
+
+  function liveObjectChipLabel(name: string): string {
+    const type = liveObjectTargetTypes[name];
+    return type ? `${type}: ${name}` : name;
+  }
+
+  function liveCaptureObjectTypeFor(objectNames: string[], explicitType?: string): string | undefined {
+    const defaultType = explicitType?.trim() || liveObjectType.trim();
+    const types = Array.from(new Set(
+      objectNames
+        .map((name) => {
+          if (explicitType?.trim()) return explicitType.trim();
+          const trackedType = liveObjectTargetTypes[name]?.trim();
+          if (trackedType) return trackedType;
+          if (selectedObject?.id === name && selectedObject.type && selectedObject.type !== 'UNKNOWN') {
+            return selectedObject.type;
+          }
+          return defaultType;
+        })
+        .filter(Boolean),
+    ));
+    if (types.length > 1) {
+      throw new Error('서로 다른 BW object type이 섞여 있습니다. type별로 나눠서 가져오거나 대상 목록을 정리하세요.');
+    }
+    return types[0] || defaultType || undefined;
   }
 
   async function refreshAll() {
@@ -367,7 +426,7 @@ export default function App() {
   }
 
   function selectRepositoryNode(node: RepositoryNode) {
-    addLiveObjectName(node.name);
+    addLiveObjectName(node.name, node.object_type);
     if (node.object_type && node.object_type !== 'UNKNOWN') {
       setLiveObjectType(node.object_type);
     }
@@ -460,31 +519,166 @@ export default function App() {
     }
   }
 
+  async function captureLiveWithTargets(options: {
+    objectNames: string[];
+    searchTerms?: string[];
+    objectType?: string;
+  }): Promise<SnapshotSummary> {
+    return captureLiveSnapshot({
+      confirmReadOnly: true,
+      objectNames: options.objectNames,
+      searchTerms: options.searchTerms && options.searchTerms.length > 0 ? options.searchTerms : undefined,
+      objectType: liveCaptureObjectTypeFor(options.objectNames, options.objectType),
+      sourceSystem: liveSourceSystem.trim() || undefined,
+      dataflowDirection: liveDataflowDirection,
+      dataflowLevels: liveDataflowLevels,
+    });
+  }
+
   async function captureLive() {
     const objectNames = parseLiveObjectNames();
     const searchTerms = parseObjectNamesText(liveSearchTerms);
     if (objectNames.length === 0 && searchTerms.length === 0) {
-      setError('Live capture에는 object name 또는 좁은 search term이 최소 1개 필요합니다.');
+      setError('BW에서 가져오려면 분석 대상 object 또는 좁은 search term이 최소 1개 필요합니다.');
       return;
     }
-    if (searchTerms.some(isBroadLiveSearchTerm)) {
-      setError('Live capture search term으로 단독 * 는 허용하지 않습니다. 좁은 prefix(예: ZADSO_)나 정확한 object name을 사용하세요.');
+    if (searchTerms.some(isBroadLiveSearchTerm) || objectNames.some(isBroadLiveSearchTerm)) {
+      setError('단독 * / % 는 BW에서 가져오기 대상/검색어로 허용하지 않습니다. 좁은 prefix 또는 정확한 object name을 사용하세요.');
       return;
     }
     setBusy('snapshot');
     try {
-      const snapshot = await captureLiveSnapshot({
-        confirmReadOnly: true,
-        objectNames,
-        searchTerms: searchTerms.length > 0 ? searchTerms : undefined,
-        objectType: liveObjectType.trim() || undefined,
-        sourceSystem: liveSourceSystem.trim() || undefined,
-        dataflowDirection: liveDataflowDirection,
-        dataflowLevels: liveDataflowLevels,
-      });
+      const snapshot = await captureLiveWithTargets({ objectNames, searchTerms });
       await reloadSnapshots(snapshot.id, snapshot);
       setError('');
     } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function findBwObjects() {
+    const term = bwSearchTerm.trim();
+    if (!connectionReady || bwSetupTouched) {
+      setError('먼저 Settings에서 BW 연결 테스트를 성공시켜야 BW에서 찾기를 사용할 수 있습니다.');
+      return;
+    }
+    if (!term) {
+      setError('BW에서 찾을 이름/설명/prefix를 입력하세요.');
+      return;
+    }
+    if (isBroadLiveSearchTerm(term)) {
+      setError('단독 * / % 검색은 허용하지 않습니다. 예: ZADSO_, SALES, MARGIN처럼 좁혀서 검색하세요.');
+      return;
+    }
+    setBusy('bw-search');
+    try {
+      const response = await searchBwObjects({
+        confirmReadOnly: true,
+        searchTerm: term,
+        objectType: bwSearchType || undefined,
+        limit: 20,
+      });
+      setBwSearchResults(response.items);
+      setBwSearchTruncated(response.truncated);
+      setError('');
+    } catch (err) {
+      setBwSearchResults([]);
+      setBwSearchTruncated(false);
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function fetchAndAnalyzeObject(item: BwSearchItem) {
+    if (!connectionReady || bwSetupTouched) {
+      setError('먼저 Settings에서 BW 연결 테스트를 성공시켜야 BW에서 가져오기를 사용할 수 있습니다.');
+      return;
+    }
+    setActiveTab('lineage');
+    setAllowHiddenSelection(true);
+    setSelectedObjectId(item.object_id);
+    setLineage(null);
+    setLineageAdvice(null);
+    setImpact(null);
+    setImpactAdvice(null);
+    setObjectDetail(null);
+    setBusy('live-analyze');
+    try {
+      const snapshot = await captureLiveWithTargets({
+        objectNames: [item.object_id],
+        objectType: item.object_type,
+      });
+      await reloadSnapshots(snapshot.id, snapshot);
+      setActiveTab('lineage');
+      setAllowHiddenSelection(true);
+      setSelectedObjectId(item.object_id);
+      const response = await postLineage(snapshot.id, {
+        object_id: item.object_id,
+        direction,
+        depth,
+        node_cap: nodeCap,
+        edge_cap: edgeCap,
+      });
+      setLineage(response);
+      setLineageAdvice(null);
+      setImpact(null);
+      setImpactAdvice(null);
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function refreshAnalysisBasis() {
+    if (!selectedSnapshotId) return;
+    const objectToRerun = selectedObjectId;
+    setBusy('refresh-bw');
+    try {
+      const snapshot = await refreshSnapshotFromBw(selectedSnapshotId);
+      await reloadSnapshots(snapshot.id, snapshot);
+      if (objectToRerun) {
+        setAllowHiddenSelection(true);
+        setSelectedObjectId(objectToRerun);
+      }
+      if (activeTab === 'lineage' && objectToRerun) {
+        const response = await postLineage(snapshot.id, {
+          object_id: objectToRerun,
+          direction,
+          depth,
+          node_cap: nodeCap,
+          edge_cap: edgeCap,
+        });
+        setLineage(response);
+        setLineageAdvice(null);
+      } else if (activeTab === 'impact' && objectToRerun) {
+        setImpact(await postImpactScenario(snapshot.id, { ...impactRequestBody(), object_id: objectToRerun }));
+        setImpactAdvice(null);
+      } else if (activeTab === 'glossary') {
+        const response = await getGlossary(snapshot.id, glossaryQuery.trim() || undefined);
+        setGlossaryTerms(response.items);
+      }
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function searchGlossary() {
+    if (!selectedSnapshotId) return;
+    setBusy('glossary');
+    try {
+      const response = await getGlossary(selectedSnapshotId, glossaryQuery.trim() || undefined);
+      setGlossaryTerms(response.items);
+      setError('');
+    } catch (err) {
+      setGlossaryTerms([]);
       setError(errorText(err));
     } finally {
       setBusy('');
@@ -653,13 +847,13 @@ export default function App() {
       <header className="topStatus">
         <div className="brandBlock">
           <div>
-            <strong>BW Workbench</strong>
-            <span>Lineage · Impact · SQL</span>
+            <strong>Live BW Workbench</strong>
+            <span>Find in BW · Lineage · Impact · SQL · Glossary</span>
           </div>
         </div>
         <div className="statusStrip">
           <StatusPill label="BW" value={bwStatus(runtime)} tone={runtime?.connection_status === 'ok' ? 'ok' : runtime?.bw.configured ? 'warn' : 'warn'} />
-          <StatusPill label="Snapshot" value={latestSnapshotLabel} tone={selectedSnapshot ? 'info' : 'warn'} />
+          <StatusPill label="Basis" value={latestSnapshotLabel} tone={selectedSnapshot ? 'info' : 'warn'} />
           <StatusPill label="LLM" value={runtime?.llm.configured ? 'local 설정됨' : 'disabled'} tone="neutral" />
         </div>
         <button className="ghostButton" onClick={() => setDiagnosticsOpen((value) => !value)}>
@@ -676,7 +870,7 @@ export default function App() {
 
       {runtimeMissing && !diagnosticsOpen ? (
         <div className="setupPrompt">
-          BW runtime 설정이 없어 Live GET capture는 비활성입니다. <button onClick={() => setDiagnosticsOpen(true)}>Settings 열기</button>
+          BW 연결 설정이 없어 BW에서 찾기/가져오기가 비활성입니다. <button onClick={() => setDiagnosticsOpen(true)}>Settings 열기</button>
         </div>
       ) : null}
 
@@ -687,7 +881,7 @@ export default function App() {
               <div>
                 <span className="eyebrow">Settings</span>
                 <h2>실행 설정</h2>
-                <p>설정 저장 시 프로젝트 로컬 .env 파일에 저장됩니다 (Git 제외). Secrets는 UI/API에 다시 표시되지 않습니다. Capture는 GET metadata만 사용합니다.</p>
+                <p>설정 저장 시 프로젝트 로컬 .env 파일에 저장됩니다 (Git 제외). Secrets는 UI/API에 다시 표시되지 않습니다. BW에서 찾기/가져오기는 GET-only metadata만 사용합니다.</p>
               </div>
               <button className="iconButton" onClick={() => setDiagnosticsOpen(false)} aria-label="Settings 닫기">×</button>
             </div>
@@ -707,7 +901,7 @@ export default function App() {
               />
               <SetupStep
                 index={3}
-                title="객체 선택/입력 후 Live GET capture"
+                title="BW에서 찾고 분석 기준 가져오기"
                 status={bwTestedForCapture && liveCaptureTargetReady ? '준비됨' : '대기'}
                 done={bwTestedForCapture && liveCaptureTargetReady}
               />
@@ -842,22 +1036,26 @@ export default function App() {
             </section>
 
             <section className="drawerSection">
-              <h3>3. 객체 선택/입력 후 Live GET capture</h3>
-              <p>테스트 성공 후 선택한 object만 capture합니다.</p>
+              <h3>3. 분석 대상 가져오기</h3>
+              <p>테스트 성공 후 선택한 object의 관련 메타데이터만 BW에서 가져옵니다. 사용자는 스냅샷을 먼저 알 필요 없이 찾고 분석하면 됩니다.</p>
               {!bwTestedForCapture ? (
-                <p className="dependencyHint">먼저 2단계 연결 테스트가 성공해야 Live GET capture가 활성화됩니다.</p>
+                <p className="dependencyHint">먼저 2단계 연결 테스트가 성공해야 BW에서 가져오기가 활성화됩니다.</p>
               ) : null}
               <label className="fieldLabel">
-                Live object names
+                분석 대상 object names
                 <textarea
                   className="liveObjectInput"
                   placeholder="ZADSO_SALES, ZTRFN_MARGIN — dataflow/xref edge 수집 대상"
                   value={liveObjectNames}
-                  onChange={(event) => setLiveObjectNames(event.target.value)}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setLiveObjectNames(next);
+                    pruneLiveObjectTargetTypes(parseObjectNamesText(next));
+                  }}
                 />
               </label>
               <div className="liveObjectTools">
-                <button className="secondaryButton" onClick={() => addLiveObjectName(selectedObjectId)} disabled={!selectedObjectId}>
+                <button className="secondaryButton" onClick={() => addLiveObjectName(selectedObjectId, selectedObject?.type)} disabled={!selectedObjectId}>
                   선택 객체 추가
                 </button>
                 <button className="secondaryButton" onClick={clearLiveObjectNames} disabled={liveObjectNameTokens.length === 0}>
@@ -868,7 +1066,7 @@ export default function App() {
                 <div className="selectedLiveObjects" aria-label="selected live capture objects">
                   {liveObjectNameTokens.map((name) => (
                     <button key={name} className="selectedObjectChip" onClick={() => removeLiveObjectName(name)} title="Live capture 대상에서 제거">
-                      {name} ×
+                      {liveObjectChipLabel(name)} ×
                     </button>
                   ))}
                 </div>
@@ -878,7 +1076,7 @@ export default function App() {
               {snapshotPickObjects.length > 0 ? (
                 <div className="snapshotPickList" aria-label="snapshot object quick picker">
                   {snapshotPickObjects.map((item) => (
-                    <button key={item.id} className="snapshotPickButton" onClick={() => addLiveObjectName(item.id)}>
+                    <button key={item.id} className="snapshotPickButton" onClick={() => addLiveObjectName(item.id, item.type)}>
                       <span>{item.type}</span>{item.id}
                     </button>
                   ))}
@@ -933,7 +1131,7 @@ export default function App() {
                   />
                 </label>
               </div>
-              <p className="policyNote fullSpan">Live capture는 서버에서 GET-only metadata 요청으로 고정됩니다.</p>
+              <p className="policyNote fullSpan">BW에서 가져오기는 서버에서 GET-only metadata 요청으로 고정됩니다.</p>
               <div className="captureRow">
                 <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>
                   Fixture capture
@@ -950,16 +1148,16 @@ export default function App() {
                   }
                   title={liveCaptureButtonTitle(connectionReady, liveCaptureTargetReady)}
                 >
-                  Live GET capture
+                  BW에서 가져오기
                 </button>
               </div>
               {!connectionReady || bwSetupTouched || !liveCaptureTargetReady ? (
                 <p className="livePickerHint">
                   {bwSetupTouched
-                    ? '변경한 BW 설정을 저장하고 Test connection을 다시 실행해야 Live GET capture가 활성화됩니다.'
+                    ? '변경한 BW 설정을 저장하고 Test connection을 다시 실행해야 BW에서 가져오기가 활성화됩니다.'
                     : !connectionReady
-                      ? 'Live GET capture는 현재 세션에서 연결 테스트가 성공한 뒤에만 활성화됩니다.'
-                      : 'Live GET capture에는 object name 또는 좁은 search term이 최소 1개 필요합니다.'}
+                      ? 'BW에서 가져오기는 현재 세션에서 연결 테스트가 성공한 뒤에만 활성화됩니다.'
+                      : 'BW에서 가져오려면 분석 대상 object 또는 좁은 search term이 최소 1개 필요합니다.'}
                 </p>
               ) : null}
               <CaptureOutcomeCard snapshot={selectedSnapshot} />
@@ -1009,8 +1207,8 @@ export default function App() {
         <aside className="catalogPane">
           <div className="paneHeader">
             <div>
-              <span className="eyebrow">Objects</span>
-              <h2>Snapshot</h2>
+              <span className="eyebrow">Find and analyze</span>
+              <h2>BW Objects</h2>
             </div>
             <button className="iconButton" onClick={() => void refreshAll()} disabled={busy === 'status'}>↻</button>
           </div>
@@ -1027,46 +1225,114 @@ export default function App() {
             onSelect={selectRepositoryNode}
           />
 
-          <label className="fieldLabel">
-            Snapshot
-            <select value={selectedSnapshotId} onChange={(event) => chooseSnapshot(event.target.value)}>
-              <option value="">스냅샷 없음</option>
-              {snapshots.map((snapshot) => (
-                <option key={snapshot.id} value={snapshot.id}>
-                  {compactDate(snapshot.created_at)} · {snapshot.object_count} objects
-                </option>
+          <section className="catalogActionCard bwSearchCard" aria-label="Find in BW">
+            <div className="basketHeader">
+              <strong>Find in BW</strong>
+              <span>{bwSearchResults.length}{bwSearchTruncated ? '+' : ''} results</span>
+            </div>
+            <input
+              className="catalogSearch"
+              placeholder="이름/설명/prefix 검색: ZADSO_, SALES, MARGIN"
+              value={bwSearchTerm}
+              onChange={(event) => setBwSearchTerm(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void findBwObjects();
+              }}
+            />
+            <select value={bwSearchType} onChange={(event) => setBwSearchType(event.target.value)}>
+              {typeFilters.map((filter) => (
+                <option key={filter || 'all'} value={filter}>{filter || '전체 타입'}</option>
               ))}
             </select>
+            <button
+              className="primaryButton wide"
+              onClick={() => void findBwObjects()}
+              disabled={!connectionReady || bwSetupTouched || busy === 'bw-search'}
+            >
+              BW에서 찾기
+            </button>
+            {bwSearchResults.length > 0 ? (
+              <div className="bwSearchResults" aria-label="BW live search results">
+                {bwSearchResults.map((item) => (
+                  <article key={`${item.object_type}-${item.object_id}`} className="bwSearchResult">
+                    <button
+                      className="searchResultMain"
+                      onClick={() => {
+                        addLiveObjectName(item.object_id, item.object_type);
+                        if (item.object_type && item.object_type !== 'UNKNOWN') setLiveObjectType(item.object_type);
+                      }}
+                      title="분석 대상에 추가"
+                    >
+                      <span>{item.object_type}</span>
+                      <strong>{item.object_id}</strong>
+                      <small>{item.name || '설명 없음'}</small>
+                    </button>
+                    <button
+                      className="miniPrimaryButton"
+                      onClick={() => void fetchAndAnalyzeObject(item)}
+                      disabled={busy === 'live-analyze'}
+                      title="BW에서 메타데이터를 가져오고 Lineage를 바로 실행"
+                    >
+                      가져와 분석
+                    </button>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <small>정확한 object name을 몰라도 BW 검색으로 후보를 찾을 수 있습니다.</small>
+            )}
+          </section>
+
+          <label className="fieldLabel analysisBasisField">
+            Analysis basis
+            <div className="basisRow">
+              <select value={selectedSnapshotId} onChange={(event) => chooseSnapshot(event.target.value)}>
+                <option value="">분석 기준 없음</option>
+                {snapshots.map((snapshot) => (
+                  <option key={snapshot.id} value={snapshot.id}>
+                    {compactDate(snapshot.created_at)} · {snapshot.object_count} objects
+                  </option>
+                ))}
+              </select>
+              <button
+                className="secondaryButton"
+                onClick={() => void refreshAnalysisBasis()}
+                disabled={!selectedSnapshotId || !connectionReady || bwSetupTouched || busy === 'refresh-bw'}
+                title="현재 분석 기준의 선택 scope를 BW에서 다시 가져옵니다."
+              >
+                BW 새로고침
+              </button>
+            </div>
           </label>
 
           <div className="catalogActionCard pickerBasket">
             <div className="basketHeader">
-              <strong>Capture basket</strong>
+              <strong>Analysis targets</strong>
               <span>{liveObjectNameTokens.length} selected</span>
             </div>
-            <button className="secondaryButton wide" onClick={() => addLiveObjectName(selectedObjectId)} disabled={!selectedObjectId}>
-              Add selected object
+            <button className="secondaryButton wide" onClick={() => addLiveObjectName(selectedObjectId, selectedObject?.type)} disabled={!selectedObjectId}>
+              Add selected to targets
             </button>
             {liveObjectNameTokens.length > 0 ? (
               <div className="selectedLiveObjects frontBasket" aria-label="selected live capture objects">
                 {liveObjectNameTokens.map((name) => (
                   <button key={name} className="selectedObjectChip" onClick={() => removeLiveObjectName(name)} title="Capture 대상에서 제거">
-                    {name} ×
+                    {liveObjectChipLabel(name)} ×
                   </button>
                 ))}
               </div>
             ) : (
-              <small>No selected object</small>
+              <small>No analysis target yet</small>
             )}
             <div className="captureRow">
-              <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>Fixture</button>
+              <button className="secondaryButton" onClick={captureFixture} disabled={busy === 'snapshot'}>Fixture demo</button>
               <button
                 className="primaryButton"
                 onClick={captureLive}
                 disabled={!connectionReady || bwSetupTouched || !liveCaptureTargetReady || busy === 'snapshot'}
                 title={liveCaptureButtonTitle(connectionReady, liveCaptureTargetReady)}
               >
-                Capture
+                Fetch from BW
               </button>
             </div>
             <button className="ghostButton wide" onClick={() => setDiagnosticsOpen(true)}>Settings</button>
@@ -1080,7 +1346,7 @@ export default function App() {
             </div>
           ) : null}
 
-          <TermsOverview terms={glossaryTerms} />
+          <TermsOverview terms={glossaryTerms} onOpen={() => setActiveTab('glossary')} />
 
           <input
             className="catalogSearch"
@@ -1146,6 +1412,7 @@ export default function App() {
             <TabButton id="lineage" active={activeTab} onClick={setActiveTab} label="Lineage" />
             <TabButton id="impact" active={activeTab} onClick={setActiveTab} label="Impact" />
             <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Analysis" />
+            <TabButton id="glossary" active={activeTab} onClick={setActiveTab} label="Glossary" />
           </nav>
 
           {activeTab === 'lineage' ? (
@@ -1223,6 +1490,27 @@ export default function App() {
               busy={busy}
             />
           ) : null}
+
+          {activeTab === 'glossary' ? (
+            <GlossaryTab
+              selectedSnapshot={selectedSnapshot}
+              query={glossaryQuery}
+              setQuery={setGlossaryQuery}
+              terms={glossaryTerms}
+              onSearch={() => void searchGlossary()}
+              onSelectObject={(objectId) => {
+                setAllowHiddenSelection(true);
+                setSelectedObjectId(objectId);
+                setLineage(null);
+                setLineageAdvice(null);
+                setImpact(null);
+                setImpactAdvice(null);
+                setActiveTab('lineage');
+              }}
+              onAddTarget={addLiveObjectName}
+              busy={busy === 'glossary'}
+            />
+          ) : null}
         </section>
       </main>
     </div>
@@ -1257,6 +1545,7 @@ function LineageTab(props: {
         <div className="sectionTitle">
           <span className="eyebrow">Lineage</span>
           <h1>{props.selectedObject?.id ?? '객체 선택'}</h1>
+          <p className="tabPurpose">데이터 흐름 지도: 이 객체의 데이터가 어디서 와서 어디로 가는지 확인합니다.</p>
           <p>{props.graphStats}</p>
         </div>
         <div className="compactForm three">
@@ -1300,7 +1589,7 @@ function LineageTab(props: {
               <span>Outgoing</span><strong>{props.objectDetail.outgoing_count}</strong>
               <span>Evidence</span><strong>{props.objectDetail.evidence_ids.length}</strong>
             </div>
-            <GlossaryList terms={props.objectGlossary} title="Terms" emptyText="Terms 없음" />
+            <GlossaryList terms={props.objectGlossary} title="Glossary" emptyText="Glossary 용어 없음" />
             <button className="secondaryButton wide" onClick={() => props.onExpand(props.objectDetail!.id)}>
               Expand from node
             </button>
@@ -1341,6 +1630,7 @@ function ImpactTab(props: {
       <section className="controlCard">
         <span className="eyebrow">Impact</span>
         <h1>변경 영향</h1>
+        <p className="tabPurpose">변경 사전 시뮬레이션: 이 객체를 바꾸면 무엇이 영향받는지 심각도순으로 확인합니다.</p>
         <div className="scenarioObject">선택 object: <strong>{props.selectedObject?.id ?? '없음'}</strong></div>
         <label>Change type
           <select value={props.changeType} onChange={(event) => props.setChangeType(event.target.value as ChangeType)}>
@@ -1389,9 +1679,9 @@ function ImpactTab(props: {
                 <small>Evidence IDs: {item.evidence_ids.join(', ') || '—'}</small>
               </article>
             ))}
-            {props.impact.affected_objects.length === 0 ? <div className="emptyState">Impact 없음</div> : null}
+            {props.impact.affected_objects.length === 0 ? <div className="emptyState">이 범위 내 영향 없음 (깊이 기준 확인 필요)</div> : null}
           </div>
-        ) : <div className="emptyState">시나리오를 실행하세요.</div>}
+        ) : <div className="emptyState">변경 시나리오(예: 필드 삭제)를 고르면 영향 객체를 심각도순으로 보여드립니다. Lineage에서 본 객체가 자동으로 선택됩니다.</div>}
       </section>
     </div>
   );
@@ -1418,6 +1708,7 @@ function SqlTab(props: {
       <section className="controlCard">
         <span className="eyebrow">SQL Analysis</span>
         <h1>Reference extraction</h1>
+        <p className="tabPurpose">Native SQL View가 참조하는 객체·컬럼을 증거로 추출합니다. DB 실행은 하지 않습니다.</p>
         <p className="warningText">Parse only · DB execution disabled</p>
         <label>View ID
           <input value={props.viewId} onChange={(event) => props.setViewId(event.target.value)} />
@@ -1478,10 +1769,10 @@ function SqlTab(props: {
                 </ul>
               </div>
             </div>
-            <GlossaryList terms={props.explain.glossary_terms} title="Terms" emptyText="Terms 없음" />
+            <GlossaryList terms={props.explain.glossary_terms} title="Glossary" emptyText="Glossary 용어 없음" />
             <pre>{JSON.stringify(props.explain.result.reference_edges, null, 2)}</pre>
           </div>
-        ) : <div className="emptyState">SQL file을 분석하세요.</div>}
+        ) : <div className="emptyState">Native SQL View 정의를 붙여넣으면 참조 객체·컬럼을 결정적으로 추출합니다. DB 실행은 하지 않습니다.</div>}
         {props.draft ? (
           <div className="draftBox">
             <h3>Draft 상태: {props.draft.status}</h3>
@@ -1489,6 +1780,118 @@ function SqlTab(props: {
             <small>Citations: {props.draft.citations.join(', ') || 'none'}</small>
           </div>
         ) : null}
+      </section>
+    </div>
+  );
+}
+
+function GlossaryTab(props: {
+  selectedSnapshot: SnapshotSummary | null;
+  query: string;
+  setQuery: (value: string) => void;
+  terms: GlossaryTerm[];
+  onSearch: () => void;
+  onSelectObject: (objectId: string) => void;
+  onAddTarget: (objectId: string) => void;
+  busy: boolean;
+}) {
+  const [sourceFilter, setSourceFilter] = useState('');
+  const [candidateFilter, setCandidateFilter] = useState<'all' | 'candidate' | 'confirmed'>('all');
+  const sources = useMemo(
+    () => Array.from(new Set(props.terms.map((term) => term.source).filter(Boolean))).sort(),
+    [props.terms],
+  );
+  const filteredTerms = useMemo(
+    () => props.terms.filter((term) => {
+      if (sourceFilter && term.source !== sourceFilter) return false;
+      if (candidateFilter === 'candidate' && !term.candidate) return false;
+      if (candidateFilter === 'confirmed' && term.candidate) return false;
+      return true;
+    }),
+    [candidateFilter, props.terms, sourceFilter],
+  );
+  const canSearch = Boolean(props.selectedSnapshot);
+  return (
+    <div className="glossaryLayout">
+      <section className="controlCard">
+        <span className="eyebrow">Glossary</span>
+        <h1>업무 용어 검색</h1>
+        <p className="tabPurpose">기술 ID와 업무 용어를 연결합니다. 객체명을 몰라도 용어로 찾고 분석 대상에 추가할 수 있습니다.</p>
+        <div className="scenarioObject">
+          분석 기준: <strong>{props.selectedSnapshot ? compactDate(props.selectedSnapshot.created_at) : '없음'}</strong>
+        </div>
+        <label>Search term
+          <input
+            value={props.query}
+            placeholder="매출, AMOUNT, margin, source table..."
+            disabled={!canSearch}
+            onChange={(event) => props.setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') props.onSearch();
+            }}
+          />
+        </label>
+        <button className="primaryButton wide" onClick={props.onSearch} disabled={!canSearch || props.busy}>
+          Glossary 검색
+        </button>
+        <div className="compactForm">
+          <label>Source filter
+            <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)}>
+              <option value="">All sources</option>
+              {sources.map((source) => <option key={source} value={source}>{source}</option>)}
+            </select>
+          </label>
+          <label>Candidate filter
+            <select value={candidateFilter} onChange={(event) => setCandidateFilter(event.target.value as 'all' | 'candidate' | 'confirmed')}>
+              <option value="all">All terms</option>
+              <option value="candidate">Candidates only</option>
+              <option value="confirmed">Confirmed only</option>
+            </select>
+          </label>
+        </div>
+        <div className="metaGrid glossaryMetrics">
+          <Metric label="Terms" value={String(props.terms.length)} />
+          <Metric label="Visible" value={String(filteredTerms.length)} />
+          <Metric label="Sources" value={String(sources.length)} />
+        </div>
+      </section>
+      <section className="resultCard">
+        <span className="eyebrow">Term map</span>
+        {canSearch ? (
+          filteredTerms.length > 0 ? (
+            <div className="glossaryResults">
+              {filteredTerms.map((term) => {
+                const qualifier = glossaryQualifier(term);
+                return (
+                  <article key={term.id} className={`glossaryResult ${term.candidate ? 'candidate' : 'confirmed'}`}>
+                    <div className="glossaryResultMain">
+                      <span>{term.source}{term.candidate ? ' · candidate' : ''}</span>
+                      <strong>{term.term}</strong>
+                      <small>
+                        {term.object_id ?? 'object 연결 없음'}{term.field_name ? ` · ${term.field_name}` : ''}{qualifier ? ` · ${qualifier}` : ''}
+                      </small>
+                    </div>
+                    {term.object_id ? (
+                      <div className="glossaryActions">
+                        <button className="secondaryButton" onClick={() => props.onSelectObject(term.object_id!)}>
+                          Lineage에서 보기
+                        </button>
+                        <button className="miniPrimaryButton" onClick={() => props.onAddTarget(term.object_id!)}>
+                          대상 추가
+                        </button>
+                      </div>
+                    ) : null}
+                    <small>Evidence IDs: {term.evidence_ids.join(', ') || '—'}</small>
+                  </article>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="emptyState">검색 결과가 없습니다. 다른 업무 용어 또는 object/field 일부를 입력하세요.</div>
+          )
+        ) : (
+          <div className="emptyState">먼저 Fixture demo 또는 BW에서 가져오기로 분석 기준을 만든 뒤 Glossary를 검색하세요.</div>
+        )}
       </section>
     </div>
   );
@@ -1573,12 +1976,13 @@ function glossaryQualifier(term: GlossaryTerm): string {
   return value ?? '';
 }
 
-function TermsOverview(props: { terms: GlossaryTerm[] }) {
+function TermsOverview(props: { terms: GlossaryTerm[]; onOpen: () => void }) {
   const visibleTerms = props.terms.slice(0, 8);
   return (
     <section className="termsOverview" aria-label="snapshot glossary terms">
       <div className="termsOverviewHeader">
-        <strong>Terms</strong>
+        <strong>Glossary</strong>
+        <button className="ghostButton" onClick={props.onOpen}>열기</button>
         <span>{props.terms.length}</span>
       </div>
       {visibleTerms.length > 0 ? (
@@ -1590,7 +1994,7 @@ function TermsOverview(props: { terms: GlossaryTerm[] }) {
           ))}
         </div>
       ) : (
-        <small>Snapshot capture 후 metadata/SQL 용어가 표시됩니다.</small>
+        <small>분석 기준을 가져오면 metadata/SQL에서 추출한 Glossary 용어가 표시됩니다.</small>
       )}
     </section>
   );
@@ -1598,7 +2002,7 @@ function TermsOverview(props: { terms: GlossaryTerm[] }) {
 
 function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: string) => void; selectedId: string | null }) {
   if (!props.lineage) {
-    return <div className="emptyState graphEmpty">Lineage를 실행하세요.</div>;
+    return <div className="emptyState graphEmpty">왼쪽에서 객체를 찾고 선택한 뒤 Lineage를 실행하세요. 객체명을 몰라도 Find in BW 또는 Glossary로 검색할 수 있습니다.</div>;
   }
   const levelValues = Object.values(props.lineage.levels);
   const minLevel = Math.min(0, ...levelValues);

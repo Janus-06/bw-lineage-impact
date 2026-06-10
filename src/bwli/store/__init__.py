@@ -10,6 +10,7 @@ from bwli.store.catalog import (
     catalog_path_for,
     ingest_fixture_payload,
     ingest_manifest,
+    parse_search_results,
 )
 from bwli.store.secret_guard import SecretPersistenceError, assert_no_persisted_secrets
 
@@ -27,4 +28,5 @@ __all__ = [
     "catalog_path_for",
     "ingest_fixture_payload",
     "ingest_manifest",
+    "parse_search_results",
 ]
