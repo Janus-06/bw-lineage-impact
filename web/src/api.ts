@@ -2,7 +2,7 @@ export type ConfigSource = 'env' | 'ui' | 'unset';
 export type ConnectionStatus = 'unconfigured' | 'untested' | 'ok' | 'failed' | 'stale';
 export type Direction = 'upstream' | 'downstream' | 'both';
 export type DataflowDirection = 'upwards' | 'downwards' | 'both';
-export type AppTab = 'lineage' | 'impact' | 'sql';
+export type AppTab = 'lineage' | 'impact' | 'sql' | 'glossary';
 export type ChangeType =
   | 'field_removed'
   | 'field_type_changed'
@@ -135,6 +135,23 @@ export interface RepositoryResponse {
   count: number;
   items: RepositoryNode[];
   action_required: string | null;
+}
+
+export interface BwSearchItem {
+  object_id: string;
+  object_type: string;
+  name: string | null;
+  source: 'live';
+}
+
+export interface BwSearchResponse {
+  mode: string;
+  read_only: boolean;
+  search_term: string;
+  object_type: string | null;
+  count: number;
+  truncated: boolean;
+  items: BwSearchItem[];
 }
 
 export interface SnapshotSummary {
@@ -350,6 +367,26 @@ export async function getRepository(options: {
   if (options.confirmReadOnly) query.set('confirm_read_only', 'true');
   const suffix = query.toString() ? `?${query}` : '';
   return getJson<RepositoryResponse>(`/api/v1/repository${suffix}`);
+}
+
+export async function searchBwObjects(options: {
+  confirmReadOnly: boolean;
+  searchTerm: string;
+  objectType?: string;
+  limit?: number;
+}): Promise<BwSearchResponse> {
+  return postJson<BwSearchResponse>('/api/v1/bw/search', {
+    confirm_read_only: options.confirmReadOnly,
+    search_term: options.searchTerm,
+    object_type: options.objectType || undefined,
+    limit: options.limit ?? 20,
+  });
+}
+
+export async function refreshSnapshotFromBw(snapshotId: string): Promise<SnapshotSummary> {
+  return postJson<SnapshotSummary>(`/api/v1/snapshots/${encodeURIComponent(snapshotId)}/refresh`, {
+    confirm_read_only: true,
+  });
 }
 
 export async function getCaptureScope(snapshotId: string): Promise<CaptureScopeResponse> {

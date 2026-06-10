@@ -9,6 +9,7 @@ from contextlib import suppress
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, Protocol, cast
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -63,6 +64,7 @@ from bwli.store import (
     catalog_path_for,
     ingest_fixture_payload,
     ingest_manifest,
+    parse_search_results,
 )
 from bwli.store.catalog import EdgeInput, ObjectInput
 from bwli.store.secret_guard import SecretPersistenceError, assert_no_persisted_secrets
@@ -334,6 +336,47 @@ class V1ConnectionTestRequest(BaseModel):
     search_term: str = "Z*"
 
 
+MAX_LIVE_CAPTURE_OBJECTS = 20
+MAX_LIVE_CAPTURE_SEARCH_TERMS = 20
+MAX_BW_SEARCH_LIMIT = 50
+
+
+class V1BwSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_read_only: bool = False
+    search_term: str
+    object_type: str | None = None
+    limit: int = Field(default=20, ge=1, le=MAX_BW_SEARCH_LIMIT)
+
+
+class V1BwSearchItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object_id: str
+    object_type: str
+    name: str | None = None
+    source: Literal["live"] = "live"
+
+
+class V1BwSearchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "live-read-only"
+    read_only: bool = True
+    search_term: str
+    object_type: str | None = None
+    count: int
+    truncated: bool = False
+    items: list[V1BwSearchItem]
+
+
+class V1SnapshotRefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_read_only: bool = False
+
+
 class V1SnapshotCaptureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -553,6 +596,47 @@ def create_app(
             runtime_config.connection_status = "failed"
             raise _live_http_error(exc, state=state) from exc
 
+    @app.post("/api/v1/bw/search", response_model=V1BwSearchResponse)
+    def bw_search_v1(request: V1BwSearchRequest) -> V1BwSearchResponse:
+        state = _ensure_live_ready(runtime_config, request.confirm_read_only)
+        try:
+            if runtime_config.connection_status != "ok":
+                raise ValueError("run a successful Test connection before BW search")
+            term = request.search_term.strip()
+            if not term:
+                raise ValueError("search_term is required")
+            if _is_broad_search_term(term):
+                raise ValueError(
+                    "broad wildcard search is not allowed; "
+                    "use a narrow prefix such as ZADSO_ or an object name"
+                )
+            client = _build_runtime_bw_client(state, bw_client_factory)
+            try:
+                payload = client.fetch_search(term, object_type=request.object_type)
+            finally:
+                client.close()
+            records = parse_search_results(
+                payload,
+                source=f"bw://bw_search?term={quote(term, safe='')}",
+            )
+        except Exception as exc:
+            raise _live_http_error(exc, state=state) from exc
+        items = [
+            V1BwSearchItem(
+                object_id=record.id,
+                object_type=record.type,
+                name=record.name,
+            )
+            for record in records[: request.limit]
+        ]
+        return V1BwSearchResponse(
+            search_term=term,
+            object_type=request.object_type,
+            count=len(items),
+            truncated=len(records) > request.limit,
+            items=items,
+        )
+
     @app.post("/api/v1/snapshots/capture")
     def capture_snapshot_v1(request: V1SnapshotCaptureRequest) -> dict[str, object]:
         live_state = runtime_config.bw if runtime_config.bw.configured else None
@@ -570,6 +654,34 @@ def create_app(
         if capture_meta is not None:
             payload["capture"] = capture_meta
         payload["capture_scope"] = [entry.model_dump(mode="json") for entry in capture_scope]
+        return payload
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/refresh")
+    def refresh_snapshot_v1(
+        snapshot_id: str,
+        request: V1SnapshotRefreshRequest,
+    ) -> dict[str, object]:
+        live_state = runtime_config.bw if runtime_config.bw.configured else None
+        try:
+            capture_request = _build_refresh_capture_request(
+                catalog_store,
+                snapshot_id,
+                confirm_read_only=request.confirm_read_only,
+            )
+            snapshot, capture_meta, capture_scope = _capture_v1_snapshot(
+                root=root,
+                store=catalog_store,
+                runtime_config=runtime_config,
+                request=capture_request,
+                bw_client_factory=bw_client_factory,
+            )
+        except Exception as exc:
+            raise _live_http_error(exc, state=live_state) from exc
+        payload = snapshot.model_dump(mode="json")
+        if capture_meta is not None:
+            payload["capture"] = capture_meta
+        payload["capture_scope"] = [entry.model_dump(mode="json") for entry in capture_scope]
+        payload["refreshed_from"] = snapshot_id
         return payload
 
     @app.get("/api/v1/repository", response_model=V1RepositoryResponse)
@@ -1400,6 +1512,11 @@ def _resolve_local_path(root: Path, user_path: str) -> Path:
     return resolved
 
 
+def _is_broad_search_term(term: str) -> bool:
+    """True when the term is only wildcard characters (``*``, ``%``) or blanks."""
+    return not term.strip().strip("*%").strip()
+
+
 def _ensure_live_ready(state: RuntimeConfigState, confirm_read_only: bool) -> RuntimeBwConfigState:
     if not state.bw.configured:
         raise HTTPException(status_code=400, detail="BW runtime config is not configured")
@@ -1559,17 +1676,39 @@ def _capture_v1_snapshot(
     if runtime_config.connection_status != "ok":
         raise ValueError("run a successful Test connection before live capture")
     out_dir = _resolve_local_output_dir(root, _live_snapshot_output_dir())
-    if not request.search_terms and not request.object_names:
+    search_terms = _unique_texts(request.search_terms)
+    object_names = _unique_texts(request.object_names)
+    source_system = _clean_optional_text(request.source_system)
+    object_type = request.object_type.strip() or "ADSO"
+    if not search_terms and not object_names:
         raise ValueError("live capture requires at least one search term or object name")
+    if any(_is_broad_search_term(term) for term in search_terms):
+        raise ValueError(
+            "broad wildcard search terms are not allowed for live capture; "
+            "use a narrow prefix such as ZADSO_ or explicit object names"
+        )
+    if any(_is_broad_search_term(object_name) for object_name in object_names):
+        raise ValueError(
+            "broad wildcard object names are not allowed for live capture; "
+            "use explicit BW object names"
+        )
+    if len(search_terms) > MAX_LIVE_CAPTURE_SEARCH_TERMS:
+        raise ValueError(
+            f"live capture is limited to {MAX_LIVE_CAPTURE_SEARCH_TERMS} search terms per call"
+        )
+    if len(object_names) > MAX_LIVE_CAPTURE_OBJECTS:
+        raise ValueError(
+            f"live capture is limited to {MAX_LIVE_CAPTURE_OBJECTS} object names per call"
+        )
     result = collect_live_snapshot(
         out_dir=out_dir,
         client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
-        search_terms=request.search_terms,
-        object_names=request.object_names,
+        search_terms=search_terms,
+        object_names=object_names,
         include_dataflow=request.include_dataflow,
         include_xref=request.include_xref,
-        dataflow_object_type=request.object_type,
-        dataflow_source_system=request.source_system,
+        dataflow_object_type=object_type,
+        dataflow_source_system=source_system,
         dataflow_direction=request.dataflow_direction,
         dataflow_levels=request.dataflow_levels,
         secret_values=_runtime_secret_values(state),
@@ -1595,8 +1734,12 @@ def _capture_v1_snapshot(
     }
     scope_entries = [
         *_selected_scope_entries(
-            request.object_names,
-            object_type=request.object_type,
+            object_names,
+            object_type=object_type,
+            source_system=source_system,
+            dataflow_direction=request.dataflow_direction,
+            dataflow_levels=request.dataflow_levels,
+            xref_direction=request.xref_direction,
             include_dataflow=request.include_dataflow,
             include_xref=request.include_xref,
             operations=result.operations,
@@ -1605,6 +1748,39 @@ def _capture_v1_snapshot(
     ]
     capture_scope = _replace_scope_or_delete_snapshot(store, snapshot.id, scope_entries)
     return record, capture_meta, capture_scope
+
+
+def _build_refresh_capture_request(
+    store: CatalogStore,
+    snapshot_id: str,
+    *,
+    confirm_read_only: bool,
+) -> V1SnapshotCaptureRequest:
+    """Rebuild a bounded live capture request from a snapshot's selected scope."""
+    if store.get_snapshot(snapshot_id) is None:
+        raise FileNotFoundError(f"snapshot not found: {snapshot_id}")
+    selected = [
+        entry for entry in store.list_capture_scope(snapshot_id) if entry.role == "selected"
+    ]
+    if not selected:
+        raise ValueError(
+            "snapshot has no selected capture scope to refresh; "
+            "run a live fetch with explicit object names first"
+        )
+    object_names = _unique_texts([entry.object_id for entry in selected])
+    include_dataflow = any(entry.operation == "bw_get_dataflow" for entry in selected)
+    include_xref = any(entry.operation == "bw_xref" for entry in selected)
+    return V1SnapshotCaptureRequest(
+        confirm_read_only=confirm_read_only,
+        object_names=object_names,
+        include_dataflow=include_dataflow,
+        include_xref=include_xref,
+        xref_direction=_selected_xref_direction(selected),
+        object_type=_selected_object_type(selected),
+        source_system=_selected_metadata_text(selected, "source_system"),
+        dataflow_direction=_selected_dataflow_direction(selected),
+        dataflow_levels=_selected_dataflow_levels(selected),
+    )
 
 
 def _replace_catalog_or_delete_snapshot(
@@ -1637,11 +1813,21 @@ def _selected_scope_entries(
     object_names: Sequence[str],
     *,
     object_type: str,
+    source_system: str | None,
+    dataflow_direction: DataflowDirection,
+    dataflow_levels: int,
+    xref_direction: Literal["upstream", "downstream"],
     include_dataflow: bool,
     include_xref: bool,
     operations: Sequence[object],
 ) -> list[CaptureScopeRecord]:
     entries: list[CaptureScopeRecord] = []
+    capture_metadata = _capture_scope_metadata(
+        source_system=source_system,
+        dataflow_direction=dataflow_direction,
+        dataflow_levels=dataflow_levels,
+        xref_direction=xref_direction,
+    )
     for object_name in _unique_texts(object_names):
         if include_dataflow:
             entries.append(
@@ -1650,6 +1836,7 @@ def _selected_scope_entries(
                     object_type=object_type,
                     operation="bw_get_dataflow",
                     operations=operations,
+                    capture_metadata=capture_metadata,
                 )
             )
         if include_xref:
@@ -1659,6 +1846,7 @@ def _selected_scope_entries(
                     object_type=object_type,
                     operation="bw_xref",
                     operations=operations,
+                    capture_metadata=capture_metadata,
                 )
             )
     return entries
@@ -1670,7 +1858,9 @@ def _scope_entry_from_operations(
     object_type: str,
     operation: str,
     operations: Sequence[object],
+    capture_metadata: dict[str, object],
 ) -> CaptureScopeRecord:
+    entries_metadata = dict(capture_metadata)
     matching = [
         op
         for op in operations
@@ -1684,17 +1874,12 @@ def _scope_entry_from_operations(
             role="selected",
             operation=operation,
             status="skipped",
+            metadata=entries_metadata,
         )
     op = matching[0]
     ok = bool(getattr(op, "ok", False))
-    return CaptureScopeRecord(
-        object_id=object_name,
-        object_type=object_type,
-        role="selected",
-        operation=operation,
-        status="ok" if ok else "error",
-        error=None if ok else _persistable_error(getattr(op, "error", None)),
-        metadata={
+    entries_metadata.update(
+        {
             key: value
             for key, value in {
                 "label": getattr(op, "label", None),
@@ -1702,7 +1887,16 @@ def _scope_entry_from_operations(
                 "item_count": getattr(op, "item_count", None),
             }.items()
             if value is not None
-        },
+        }
+    )
+    return CaptureScopeRecord(
+        object_id=object_name,
+        object_type=object_type,
+        role="selected",
+        operation=operation,
+        status="ok" if ok else "error",
+        error=None if ok else _persistable_error(getattr(op, "error", None)),
+        metadata=entries_metadata,
     )
 
 
@@ -1752,6 +1946,99 @@ def _unique_texts(values: Sequence[str]) -> list[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _clean_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _capture_scope_metadata(
+    *,
+    source_system: str | None,
+    dataflow_direction: DataflowDirection,
+    dataflow_levels: int,
+    xref_direction: Literal["upstream", "downstream"],
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "dataflow_direction": dataflow_direction,
+        "dataflow_levels": dataflow_levels,
+        "xref_direction": xref_direction,
+    }
+    if source_system:
+        metadata["source_system"] = source_system
+    return metadata
+
+
+def _selected_object_type(selected: Sequence[CaptureScopeRecord]) -> str:
+    object_types = _unique_texts(
+        [entry.object_type for entry in selected if entry.object_type != "UNKNOWN"]
+    )
+    if len(object_types) > 1:
+        raise ValueError(
+            "snapshot selected capture scope uses mixed object types; rerun live fetch"
+        )
+    return object_types[0] if object_types else "ADSO"
+
+
+def _selected_metadata_text(
+    selected: Sequence[CaptureScopeRecord],
+    key: str,
+) -> str | None:
+    values: list[str] = []
+    for entry in selected:
+        value = entry.metadata.get(key)
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                values.append(text)
+    unique = _unique_texts(values)
+    if len(unique) > 1:
+        raise ValueError(
+            f"snapshot selected capture scope uses mixed {key} values; rerun live fetch"
+        )
+    return unique[0] if unique else None
+
+
+def _selected_dataflow_direction(selected: Sequence[CaptureScopeRecord]) -> DataflowDirection:
+    value = _selected_metadata_text(selected, "dataflow_direction")
+    if value is None:
+        return "downwards"
+    if value not in {"upwards", "downwards", "both"}:
+        raise ValueError("snapshot selected capture scope has invalid dataflow direction")
+    return cast(DataflowDirection, value)
+
+
+def _selected_xref_direction(
+    selected: Sequence[CaptureScopeRecord],
+) -> Literal["upstream", "downstream"]:
+    value = _selected_metadata_text(selected, "xref_direction")
+    if value is None:
+        return "downstream"
+    if value not in {"upstream", "downstream"}:
+        raise ValueError("snapshot selected capture scope has invalid xref direction")
+    return cast(Literal["upstream", "downstream"], value)
+
+
+def _selected_dataflow_levels(selected: Sequence[CaptureScopeRecord]) -> int:
+    values: list[int] = []
+    for entry in selected:
+        value = entry.metadata.get("dataflow_levels")
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, int):
+            values.append(value)
+            continue
+        if isinstance(value, str) and value.strip().isdigit():
+            values.append(int(value.strip()))
+    unique = sorted(set(values))
+    if len(unique) > 1:
+        raise ValueError(
+            "snapshot selected capture scope uses mixed dataflow level values; rerun live fetch"
+        )
+    return unique[0] if unique else 3
 
 
 def _project_relative_path(root: Path, path: Path) -> str:
