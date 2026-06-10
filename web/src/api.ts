@@ -533,13 +533,32 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function parseJsonResponse<T>(response: Response): Promise<T> {
-  const payload = (await response.json()) as unknown;
   if (!response.ok) {
-    const detail =
-      typeof payload === 'object' && payload !== null && 'detail' in payload
-        ? String((payload as { detail: unknown }).detail)
-        : response.statusText;
-    throw new Error(detail);
+    let detail: string | null = null;
+    try {
+      detail = detailText((await response.json()) as unknown);
+    } catch {
+      detail = null;
+    }
+    throw new Error(detail || `${response.status} ${response.statusText}`.trim());
   }
-  return payload as T;
+  return (await response.json()) as T;
+}
+
+function detailText(payload: unknown): string | null {
+  if (typeof payload !== 'object' || payload === null || !('detail' in payload)) return null;
+  const detail = (payload as { detail: unknown }).detail;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const lines = detail.map((item) => {
+      if (typeof item === 'object' && item !== null && 'msg' in item) {
+        const entry = item as { msg: unknown; loc?: unknown };
+        const loc = Array.isArray(entry.loc) ? entry.loc.filter((part) => part !== 'body').join('.') : '';
+        return loc ? `${loc}: ${String(entry.msg)}` : String(entry.msg);
+      }
+      return String(item);
+    });
+    return lines.join(' · ') || null;
+  }
+  return JSON.stringify(detail);
 }
