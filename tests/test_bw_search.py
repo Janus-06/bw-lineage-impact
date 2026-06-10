@@ -218,7 +218,10 @@ def test_v1_bw_search_enforces_result_limit_and_reports_truncation(
     assert too_large.status_code == 422
 
 
-@pytest.mark.parametrize("term", ["*", " * ", "**", "%", "*%", "% *", " * % ", "  "])
+@pytest.mark.parametrize(
+    "term",
+    ["*", " * ", "**", "%", "*%", "% *", "% * %", "* % *", " * % ", "  "],
+)
 def test_v1_bw_search_rejects_broad_wildcard_terms_server_side(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -327,7 +330,7 @@ def test_v1_live_capture_rejects_broad_terms_and_too_many_objects(
 
     broad_name = client.post(
         "/api/v1/snapshots/capture",
-        json={"confirm_read_only": True, "object_names": [" % "]},
+        json={"confirm_read_only": True, "object_names": ["% * %"]},
     )
     assert broad_name.status_code == 400
     assert "broad wildcard object names" in broad_name.text

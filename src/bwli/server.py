@@ -1514,7 +1514,7 @@ def _resolve_local_path(root: Path, user_path: str) -> Path:
 
 def _is_broad_search_term(term: str) -> bool:
     """True when the term is only wildcard characters (``*``, ``%``) or blanks."""
-    return not term.strip().strip("*%").strip()
+    return not re.sub(r"[*%\s]+", "", term)
 
 
 def _ensure_live_ready(state: RuntimeConfigState, confirm_read_only: bool) -> RuntimeBwConfigState:
