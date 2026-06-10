@@ -388,10 +388,14 @@ export default function App() {
   async function saveSetup() {
     setBusy('setup');
     try {
-      const bwConfigRequested = bwSetupTouched;
+      const bwConfigRequested =
+        bwSetupTouched ||
+        Boolean(runtime?.bw.configured) ||
+        Boolean(setupForm.url.trim() || setupForm.user.trim() || setupForm.password.trim());
       const llmFieldsProvided =
         setupForm.llmEnabled || Boolean(setupForm.llmBaseUrl.trim() || setupForm.llmModel.trim() || setupForm.llmApiKey.trim());
       const next = await putRuntimeConfig({
+        persist_to_env: true,
         bw: bwConfigRequested
           ? {
               url: setupForm.url.trim() || runtime?.bw.url || '',
@@ -683,7 +687,7 @@ export default function App() {
               <div>
                 <span className="eyebrow">Settings</span>
                 <h2>실행 설정</h2>
-                <p>Secrets는 process memory에만 보관됩니다. Capture는 GET metadata만 사용합니다.</p>
+                <p>설정 저장 시 프로젝트 로컬 .env 파일에 저장됩니다 (Git 제외). Secrets는 UI/API에 다시 표시되지 않습니다. Capture는 GET metadata만 사용합니다.</p>
               </div>
               <button className="iconButton" onClick={() => setDiagnosticsOpen(false)} aria-label="Settings 닫기">×</button>
             </div>
@@ -737,7 +741,7 @@ export default function App() {
                   BW_PASSWORD <span aria-hidden="true">*</span>
                   <input
                     aria-label="required BW_PASSWORD"
-                    placeholder={runtime?.bw.configured ? '저장됨 — 변경 시에만 입력' : 'process memory에만 저장'}
+                    placeholder={runtime?.bw.configured ? '저장됨 — 변경 시에만 입력' : '로컬 .env에 저장됩니다'}
                     type="password"
                     required={!runtime?.bw.configured}
                     value={setupForm.password}
@@ -786,7 +790,7 @@ export default function App() {
                   />
                   Proxy env 신뢰
                 </label>
-                <p className="setupHint fullSpan">저장 후 연결 테스트를 실행하세요. Secrets는 표시하지 않습니다.</p>
+                <p className="setupHint fullSpan">설정은 프로젝트 .env에 저장되어 재시작 후에도 유지됩니다. 저장 후 연결 테스트를 실행하세요. Secrets는 표시하지 않습니다.</p>
                 <button className="primaryButton" onClick={saveSetup} disabled={busy === 'setup'}>설정 저장</button>
                 <button className="secondaryButton" onClick={clearSetup} disabled={busy === 'setup'}>초기화 / env fallback</button>
               </div>

@@ -67,11 +67,12 @@ This starts:
 
 The frontend talks to the local backend through Vite's `/api` proxy. If you use the `Runtime Settings` tab, BW credentials temporarily pass through browser memory and are sent only to the local backend.
 
-Use the `Runtime Settings` tab to enter BW and optional local LLM runtime values from the web UI. The backend keeps these values in process memory only:
+Use the `Runtime Settings` tab to enter BW and optional local LLM runtime values from the web UI. Saving applies the values to the backend process and also persists the supported keys to the project-root `.env` file (gitignored), so they survive backend restarts:
 
-- Not written to `.env`, config files, snapshots, reports, or Git.
+- Written only to the local project `.env`; never to other config files, snapshots, reports, or Git.
 - Secret values are not returned by API responses; the UI only receives `[REDACTED]` status.
-- Values are cleared when the backend process stops or when you click `Clear`.
+- `초기화 / env fallback` resets the in-memory values back to the current `.env`/environment; edit or delete `.env` to remove persisted values.
+- Legacy/direct API callers that omit `persist_to_env` keep the old process-memory-only behavior.
 
 Current live-BW readiness note: the project has GET-only calls for `bw_search`, `bw_get_dataflow`, `bw_xref`, `fetch_hcpr`, and `fetch_adso`. Live smoke/snapshot/dataflow rendering is available for controlled sandbox use only: it remains opt-in, local-only, and requires explicit read-only confirmation before any SAP BW metadata call.
 
@@ -114,7 +115,7 @@ parsed from `BW_URL`. This mutation is process-local; it is not written back to
 The web UI's **Settings** drawer drives the read-only live flow in three steps:
 
 1. **Settings → Runtime / Diagnostics → 설정 저장** — store BW URL/USER/PASSWORD/CLIENT in
-   the backend process memory only (never persisted to disk).
+   the backend process memory and persist them to the project-root `.env` (gitignored).
 2. **Settings → Test connection → 연결 테스트 실행** — calls `POST /api/v1/connection/test`,
    which runs a single read-only `bw_search` probe. Per-operation status, item counts, and
    redacted error messages are shown inline (BW host, query string, and password are scrubbed

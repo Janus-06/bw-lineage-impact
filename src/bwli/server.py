@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -113,6 +115,7 @@ class RuntimeConfigRequest(BaseModel):
 
     bw: RuntimeBwConfigRequest | None = None
     llm: RuntimeLlmConfigRequest | None = None
+    persist_to_env: bool = False
 
 
 class RuntimeBwConfigState(BaseModel):
@@ -505,7 +508,7 @@ def create_app(
     @app.put("/api/runtime-config", response_model=RuntimeConfigResponse)
     def put_runtime_config(request: RuntimeConfigRequest) -> RuntimeConfigResponse:
         try:
-            _apply_runtime_config(runtime_config, request)
+            _apply_runtime_request(runtime_config, request, root)
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return runtime_config.redacted()
@@ -522,14 +525,16 @@ def create_app(
     @app.put("/api/v1/runtime-config", response_model=V1RuntimeConfigResponse)
     def put_runtime_config_v1(request: RuntimeConfigRequest) -> V1RuntimeConfigResponse:
         try:
-            _apply_runtime_config(runtime_config, request)
+            _apply_runtime_request(runtime_config, request, root)
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return runtime_config.redacted_v1()
 
     @app.delete("/api/v1/runtime-config", response_model=V1RuntimeConfigResponse)
     def clear_runtime_config_v1() -> V1RuntimeConfigResponse:
-        _reset_runtime_config(runtime_config, runtime_env)
+        # Re-read the project .env so the fallback reflects values persisted
+        # by a later "설정 저장" instead of the snapshot taken at startup.
+        _reset_runtime_config(runtime_config, _merged_runtime_env(root))
         return runtime_config.redacted_v1()
 
     @app.post("/api/v1/connection/test", response_model=LiveSmokeResult)
@@ -937,12 +942,14 @@ def _initial_runtime_config(env: Mapping[str, str]) -> RuntimeConfigState:
 
 
 def _clear_runtime_config(state: RuntimeConfigState) -> None:
+    state.storage = "process-memory"
     state.connection_status = "unconfigured"
     state.bw = RuntimeBwConfigState()
     state.llm = RuntimeLlmConfigState()
 
 
 def _reset_runtime_config(state: RuntimeConfigState, env: Mapping[str, str]) -> None:
+    state.storage = "process-memory"
     state.bw = _env_bw_state(env)
     state.connection_status = "untested" if state.bw.configured else "unconfigured"
     state.llm = _env_llm_state(env)
@@ -1019,6 +1026,154 @@ def _apply_runtime_config(state: RuntimeConfigState, request: RuntimeConfigReque
             state.connection_status = "ok"
         else:
             state.connection_status = "untested"
+
+
+def _apply_runtime_request(
+    state: RuntimeConfigState,
+    request: RuntimeConfigRequest,
+    root: Path,
+) -> None:
+    next_state = state.model_copy(deep=True)
+    _apply_runtime_config(next_state, request)
+    if not request.persist_to_env:
+        next_state.storage = "process-memory"
+        _replace_runtime_config_state(state, next_state)
+        return
+    try:
+        _persist_runtime_env(
+            root,
+            next_state,
+            include_bw=request.bw is not None,
+            include_llm=request.llm is not None,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="failed to write runtime config to project .env",
+        ) from exc
+    next_state.storage = "process-memory+project-env"
+    _replace_runtime_config_state(state, next_state)
+
+
+def _replace_runtime_config_state(
+    state: RuntimeConfigState,
+    next_state: RuntimeConfigState,
+) -> None:
+    state.storage = next_state.storage
+    state.connection_status = next_state.connection_status
+    state.bw = next_state.bw
+    state.llm = next_state.llm
+
+
+def _persist_runtime_env(
+    root: Path,
+    state: RuntimeConfigState,
+    *,
+    include_bw: bool,
+    include_llm: bool,
+) -> None:
+    """Write the requested runtime config sections to the project-root .env.
+
+    Secrets are persisted from the applied in-process state, so redaction
+    markers submitted by the UI never reach disk. A ``None`` update removes
+    the key from the file; unrelated keys and comments are preserved.
+    """
+
+    updates: dict[str, str | None] = {}
+    if include_bw and state.bw.configured:
+        updates.update(
+            {
+                "BW_URL": state.bw.url or "",
+                "BW_USER": state.bw.user or "",
+                "BW_PASSWORD": state.bw.password or "",
+                "BW_CLIENT": state.bw.client or "",
+                "BW_LANGUAGE": state.bw.language,
+                "BW_VERIFY_SSL": "true" if state.bw.verify_ssl else "false",
+                "BW_CA_BUNDLE": state.bw.ca_bundle,
+                "BW_TRUST_ENV": "true" if state.bw.trust_env else "false",
+            }
+        )
+    if include_llm:
+        if state.llm.configured:
+            updates.update(
+                {
+                    "BWLI_LLM_BASE_URL": state.llm.base_url or "",
+                    "BWLI_LLM_MODEL": state.llm.model or "",
+                    "BWLI_LLM_API_KEY": state.llm.api_key or "",
+                }
+            )
+        else:
+            updates.update(
+                {
+                    "BWLI_LLM_BASE_URL": None,
+                    "BWLI_LLM_MODEL": None,
+                    "BWLI_LLM_API_KEY": None,
+                }
+            )
+    if not updates:
+        return
+    for key, value in updates.items():
+        if value is not None and ("\n" in value or "\r" in value):
+            raise ConfigError(f"{key} cannot contain line breaks when persisting to .env")
+    _update_env_file(root / ".env", updates)
+
+
+def _update_env_file(env_file: Path, updates: Mapping[str, str | None]) -> None:
+    lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.is_file() else []
+    pending = dict(updates)
+    output: list[str] = []
+    for raw_line in lines:
+        key = _env_line_key(raw_line)
+        if key is None or key not in updates:
+            output.append(raw_line)
+            continue
+        if key in pending:
+            value = pending.pop(key)
+            if value is not None:
+                output.append(f"{key}={_quote_env_value(value)}")
+        # later duplicates of a managed key are dropped so one line wins
+    additions = [(key, value) for key, value in pending.items() if value is not None]
+    if not env_file.is_file() and not additions:
+        return
+    if additions:
+        if output and output[-1].strip():
+            output.append("")
+        output.extend(f"{key}={_quote_env_value(value)}" for key, value in additions)
+    rendered = "\n".join(output) + "\n"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{env_file.name}.",
+        suffix=".tmp",
+        dir=env_file.parent,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(rendered)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, env_file)
+    except Exception:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
+    os.chmod(env_file, 0o600)
+
+
+def _env_line_key(raw_line: str) -> str | None:
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    if line.startswith("export "):
+        line = line.removeprefix("export ").strip()
+    key, _, _ = line.partition("=")
+    return key.strip() or None
+
+
+def _quote_env_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _bw_materially_changed(
@@ -1184,11 +1339,24 @@ def _is_supported_env_key(key: str) -> bool:
 
 def _parse_env_value(raw_value: str) -> str:
     value = raw_value.strip()
-    if not value:
-        return ""
-    if value[0] == value[-1:] and value[0] in {'"', "'"}:
-        return value[1:-1]
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        inner = value[1:-1]
+        return _unescape_double_quoted(inner) if value[0] == '"' else inner
     return value
+
+
+def _unescape_double_quoted(inner: str) -> str:
+    result: list[str] = []
+    index = 0
+    while index < len(inner):
+        char = inner[index]
+        if char == "\\" and index + 1 < len(inner) and inner[index + 1] in {'"', "\\"}:
+            result.append(inner[index + 1])
+            index += 2
+        else:
+            result.append(char)
+            index += 1
+    return "".join(result)
 
 
 def _env_bool(env: Mapping[str, str], name: str, *, default: bool) -> bool:
