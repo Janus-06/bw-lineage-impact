@@ -8,6 +8,21 @@ from bwli.snapshot import SnapshotWriter
 from bwli.store import CatalogStore, ingest_fixture_payload, ingest_manifest
 
 
+def _skip_if_file_symlink_unavailable(tmp_path: Path) -> None:
+    target = tmp_path / "symlink-probe-target.txt"
+    link = tmp_path / "symlink-probe-link.txt"
+    target.write_text("probe", encoding="utf-8")
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"file symlinks are unavailable in this environment: {exc}")
+    finally:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        if target.exists():
+            target.unlink()
+
+
 def _write_manifest_payload(
     tmp_path: Path,
     *,
@@ -256,6 +271,8 @@ def test_catalog_search_matches_visible_label_when_name_is_missing(tmp_path: Pat
 
 
 def test_ingest_manifest_rejects_symlink_payload_outside_snapshot_root(tmp_path: Path) -> None:
+    _skip_if_file_symlink_unavailable(tmp_path)
+
     writer = SnapshotWriter(tmp_path / "snapshot")
     metadata = writer.write_payload(
         payload_id="safe",

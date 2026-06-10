@@ -1758,7 +1758,7 @@ def _project_relative_path(root: Path, path: Path) -> str:
     root_resolved = root.resolve()
     resolved = path.resolve()
     try:
-        return str(resolved.relative_to(root_resolved))
+        return resolved.relative_to(root_resolved).as_posix()
     except ValueError as exc:
         raise ValueError(f"local snapshot path must stay under project root: {path}") from exc
 
