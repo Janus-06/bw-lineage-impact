@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+import httpcore
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from bwli.config import LlmRuntimeConfig, _validate_local_llm_base_url
+from bwli.config import (
+    LlmRuntimeConfig,
+    _validate_local_llm_base_url,
+    _validated_llm_connection_host,
+)
 from bwli.llm.sanitizer import sanitize_llm_evidence
 
 TransportLike = httpx.BaseTransport | Callable[[httpx.Request], httpx.Response]
@@ -66,7 +71,7 @@ class OpenAICompatibleClient:
         timeout: float = 30.0,
     ) -> None:
         self._runtime = runtime
-        self._transport = _coerce_transport(transport)
+        self._transport = _EndpointGuardTransport(_coerce_transport(transport))
         self._timeout = timeout
 
     def chat(self, request: LlmChatRequest) -> LlmCompletion:
@@ -121,12 +126,67 @@ def write_llm_audit_log(completion: LlmCompletion, audit_dir: Path) -> Path:
     return path
 
 
-def _coerce_transport(transport: TransportLike | None) -> httpx.BaseTransport | None:
+class _EndpointGuardTransport(httpx.BaseTransport):
+    def __init__(self, inner: httpx.BaseTransport) -> None:
+        self._inner = inner
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        _validate_local_llm_base_url(str(request.url))
+        return self._inner.handle_request(request)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def _coerce_transport(transport: TransportLike | None) -> httpx.BaseTransport:
     if transport is None:
-        return None
+        return _GuardedHTTPTransport()
     if isinstance(transport, httpx.BaseTransport):
         return transport
     return httpx.MockTransport(transport)
+
+
+class _GuardedHTTPTransport(httpx.HTTPTransport):
+    def __init__(self) -> None:
+        super().__init__(trust_env=False)
+        self._pool._network_backend = _GuardedNetworkBackend()
+
+
+class _GuardedNetworkBackend(httpcore.NetworkBackend):
+    def __init__(self) -> None:
+        self._inner = httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        connection_host = _validated_llm_connection_host(host.lower(), port)
+        return self._inner.connect_tcp(
+            host=connection_host,
+            port=port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        return self._inner.connect_unix_socket(
+            path=path,
+            timeout=timeout,
+            socket_options=socket_options,
+        )
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
 
 
 def _normalized_base_url(base_url: str) -> str:

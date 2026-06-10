@@ -9,13 +9,10 @@ _BW_URL_PLACEHOLDER = "[BW_URL]"
 _SECRET_PLACEHOLDER = "[REDACTED]"
 
 _SECRET_KEY_PATTERN = re.compile(
-    r"(?i)(authorization|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)[^\s,;]+",
+    r"(?i)(authorization|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)(?:Bearer\s+)?[^\s,;&]+",
 )
 _URL_USERINFO_PATTERN = re.compile(r"(?i)(https?://)[^\s/@]+@")
-_BEARER_PATTERN = re.compile(r"(?i)Bearer\s+[^\s,;]+")
-_SAP_QUERY_PATTERN = re.compile(
-    r"(?i)(sap[_-]?client|mandt|sap[_-]?language)(\s*[:=]\s*)[^\s,;&]+",
-)
+_BEARER_PATTERN = re.compile(r"(?i)Bearer\s+[^\s,;&]+")
 
 
 def redact_text(
@@ -26,8 +23,9 @@ def redact_text(
 ) -> str:
     """Scrub secrets, BW URL/host fragments, and credential-shaped tokens from text.
 
-    Used for user-visible error messages: ensures BW host, query parameters, and
-    declared secret values never appear verbatim in HTTP responses or logs.
+    Used for user-visible error messages: ensures BW host and declared secret values
+    never appear verbatim in HTTP responses or logs while preserving non-secret SAP
+    context such as sap-client/sap-language values.
     """
     if not value:
         return value
@@ -42,10 +40,9 @@ def redact_text(
         host = _extract_host(url)
         if host:
             redacted = redacted.replace(host, _BW_HOST_PLACEHOLDER)
+    redacted = _SECRET_KEY_PATTERN.sub(rf"\1\2{_SECRET_PLACEHOLDER}", redacted)
     redacted = _URL_USERINFO_PATTERN.sub(rf"\1{_SECRET_PLACEHOLDER}@", redacted)
     redacted = _BEARER_PATTERN.sub(f"Bearer {_SECRET_PLACEHOLDER}", redacted)
-    redacted = _SECRET_KEY_PATTERN.sub(rf"\1\2{_SECRET_PLACEHOLDER}", redacted)
-    redacted = _SAP_QUERY_PATTERN.sub(rf"\1\2{_SECRET_PLACEHOLDER}", redacted)
     return redacted
 
 

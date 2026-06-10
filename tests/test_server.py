@@ -262,8 +262,12 @@ def test_runtime_config_is_stored_in_memory_and_redacts_secrets(
     assert "fixture-llm-secret" not in response.text
 
 
-def test_runtime_config_rejects_non_local_llm_endpoint() -> None:
+def test_runtime_config_accepts_remote_llm_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     client = TestClient(create_app(project_root=Path.cwd()))
+    monkeypatch.setattr(
+        "bwli.config._resolve_hostname_addresses",
+        lambda _host, _port: ["93.184.216.34"],
+    )
 
     response = client.put(
         "/api/runtime-config",
@@ -277,9 +281,32 @@ def test_runtime_config_rejects_non_local_llm_endpoint() -> None:
         },
     )
 
-    assert response.status_code == 400
-    assert "loopback/local host" in response.text
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["llm"]["enabled"] is True
+    assert payload["llm"]["configured"] is True
+    assert payload["llm"]["base_url"] == "https://api.openai.com/v1"
+    assert payload["llm"]["api_key"] == "[REDACTED]"
     assert "fixture-llm-secret" not in response.text
+
+
+def test_runtime_config_rejects_invalid_llm_port_without_echoing_secret() -> None:
+    client = TestClient(create_app(project_root=Path.cwd()))
+
+    response = client.put(
+        "/api/runtime-config",
+        json={
+            "llm": {
+                "enabled": True,
+                "base_url": "http://llm.example.invalid:notaport/v1",
+                "model": "remote-model",
+                "api_key": "do-not-render-llm-key",
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert "do-not-render-llm-key" not in response.text
 
 
 def test_runtime_config_validation_error_does_not_echo_submitted_secrets() -> None:
@@ -324,7 +351,7 @@ def test_runtime_config_failed_put_is_atomic() -> None:
             },
             "llm": {
                 "enabled": True,
-                "base_url": "https://api.openai.com/v1",
+                "base_url": "http://169.254.169.254/v1",
                 "model": "remote-model",
                 "api_key": "do-not-render-llm-key",
             },
@@ -652,7 +679,10 @@ class HostLeakingSearchClient(FakeLiveBwClient):
         self._host_url = host_url
 
     def fetch_search(self, search_term: str, *, object_type: str | None = None) -> dict[str, Any]:
-        raise RuntimeError(f"HTTP 401 from {self._host_url}/sap/bw/modeling?sap-client=100")
+        raise RuntimeError(
+            f"HTTP 401 from {self._host_url}/sap/bw/modeling?"
+            "sap-client=100 password=mock-leaked-bw-password"
+        )
 
 
 def test_connection_test_redacts_bw_host_and_secret_in_error_detail() -> None:
@@ -685,12 +715,13 @@ def test_connection_test_redacts_bw_host_and_secret_in_error_detail() -> None:
     assert response.status_code == 200
     assert "mock-leaked-bw-password" not in response.text
     assert "bw.example.invalid" not in response.text
-    assert "sap-client=100" not in response.text
+    assert "sap-client=100" in response.text
     payload = response.json()
     search_op = next(op for op in payload["operations"] if op["name"] == "bw_search")
     assert search_op["ok"] is False
     assert "[BW_HOST]" in search_op["error"] or "[BW_URL]" in search_op["error"]
     assert "[REDACTED]" in search_op["error"]
+    assert "sap-client=100" in search_op["error"]
     assert client.get("/api/v1/runtime-config").json()["connection_status"] == "failed"
 
 

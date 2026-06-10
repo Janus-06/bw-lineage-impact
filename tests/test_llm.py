@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpcore
 import httpx
 import pytest
 from pydantic import SecretStr
@@ -20,6 +21,7 @@ from bwli.llm.openai_compatible import (
     LlmAuditMetadata,
     LlmCompletion,
     OpenAICompatibleClient,
+    _GuardedNetworkBackend,
     write_llm_audit_log,
 )
 from bwli.llm.sanitizer import REDACTED, sanitize_llm_evidence, sanitize_text
@@ -564,24 +566,116 @@ def test_openai_compatible_client_disables_environment_proxy_trust(
     assert observed["trust_env"] is False
 
 
-def test_openai_compatible_client_rejects_public_runtime_endpoint_before_network() -> None:
+def test_openai_compatible_client_accepts_remote_runtime_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = LlmRuntimeConfig(
-        base_url="https://api.openai.com/v1",
+        base_url="https://llm-gateway.example.invalid/v1",
         model="local-fixture-model",
         api_key=SecretStr("fixture-runtime-key"),
     )
+    seen_requests: list[httpx.Request] = []
+    monkeypatch.setattr(
+        "bwli.config._resolve_hostname_addresses",
+        lambda _host, _port: ["93.184.216.34"],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Remote advisory."}}]},
+        )
+
+    client = OpenAICompatibleClient(runtime=runtime, transport=handler)
+
+    completion = client.chat(build_sql_explainer_request(_sample_sql_result()))
+
+    assert completion.content == "Remote advisory."
+    assert len(seen_requests) == 1
+    assert str(seen_requests[0].url) == "https://llm-gateway.example.invalid/v1/chat/completions"
+    auth_scheme, auth_value = seen_requests[0].headers["authorization"].split(" ", 1)
+    assert auth_scheme == "Bearer"
+    assert auth_value == "fixture-runtime-key"
+
+
+def test_openai_compatible_client_rechecks_resolved_host_at_request_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = LlmRuntimeConfig(
+        base_url="https://llm-gateway.example.invalid/v1",
+        model="local-fixture-model",
+        api_key=SecretStr("fixture-runtime-key"),
+    )
+    resolutions = iter([["93.184.216.34"], ["169.254.169.254"]])
     calls = 0
+
+    monkeypatch.setattr(
+        "bwli.config._resolve_hostname_addresses",
+        lambda _host, _port: next(resolutions),
+    )
 
     def forbidden_transport(_request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        raise AssertionError("public endpoint must be rejected before network I/O")
+        raise AssertionError("link-local re-resolution must be rejected before request I/O")
 
     client = OpenAICompatibleClient(runtime=runtime, transport=forbidden_transport)
 
     with pytest.raises(ConfigError):
         client.chat(build_sql_explainer_request(_sample_sql_result()))
     assert calls == 0
+
+
+def test_guarded_network_backend_rejects_link_local_rebinding_at_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "bwli.config._resolve_hostname_addresses",
+        lambda _host, _port: ["169.254.169.254"],
+    )
+
+    with pytest.raises(ConfigError):
+        _GuardedNetworkBackend().connect_tcp("llm-gateway.example.invalid", 443)
+
+
+def test_guarded_network_backend_connects_to_validated_numeric_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        "bwli.config._resolve_hostname_addresses",
+        lambda _host, _port: ["93.184.216.34"],
+    )
+
+    def fake_connect_tcp(
+        self: object,
+        *,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: object | None = None,
+    ) -> httpcore.NetworkStream:
+        seen.update(
+            {
+                "self": self,
+                "host": host,
+                "port": port,
+                "timeout": timeout,
+                "local_address": local_address,
+                "socket_options": socket_options,
+            }
+        )
+        raise RuntimeError("stop before network I/O")
+
+    monkeypatch.setattr("httpcore.SyncBackend.connect_tcp", fake_connect_tcp)
+
+    with pytest.raises(RuntimeError, match="stop before network I/O"):
+        _GuardedNetworkBackend().connect_tcp("llm-gateway.example.invalid", 443)
+
+    assert seen["host"] == "93.184.216.34"
+    assert seen["port"] == 443
 
 
 def test_openai_compatible_client_rejects_link_local_metadata_endpoint_before_network() -> None:
@@ -604,7 +698,7 @@ def test_openai_compatible_client_rejects_link_local_metadata_endpoint_before_ne
     assert calls == 0
 
 
-def test_openai_compatible_client_rejects_private_non_loopback_endpoint_before_network() -> None:
+def test_openai_compatible_client_accepts_private_non_loopback_endpoint() -> None:
     runtime = LlmRuntimeConfig(
         base_url="http://10.0.0.1/v1",
         model="local-fixture-model",
@@ -612,16 +706,20 @@ def test_openai_compatible_client_rejects_private_non_loopback_endpoint_before_n
     )
     calls = 0
 
-    def forbidden_transport(_request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        raise AssertionError("private non-loopback endpoint must be rejected before network I/O")
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Private advisory."}}]},
+        )
 
-    client = OpenAICompatibleClient(runtime=runtime, transport=forbidden_transport)
+    client = OpenAICompatibleClient(runtime=runtime, transport=handler)
 
-    with pytest.raises(ConfigError):
-        client.chat(build_sql_explainer_request(_sample_sql_result()))
-    assert calls == 0
+    completion = client.chat(build_sql_explainer_request(_sample_sql_result()))
+
+    assert completion.content == "Private advisory."
+    assert calls == 1
 
 
 def test_build_sql_explainer_request_sanitizes_header_view_id() -> None:

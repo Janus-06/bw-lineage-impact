@@ -142,9 +142,6 @@ class BwClient:
             return response.text
 
     def _request_read(self, endpoint: Endpoint) -> httpx.Response:
-        params = dict(endpoint.params)
-        params.setdefault("sap-client", self._sap_client)
-        params.setdefault("sap-language", self._language)
         request_headers = {
             "Accept": endpoint.accept,
             "sap-adt-request-id": str(uuid4()),
@@ -154,7 +151,7 @@ class BwClient:
         response = self._client.request(
             "GET",
             endpoint.path,
-            params=params,
+            params=endpoint.params,
             headers=request_headers,
         )
         return response
@@ -165,10 +162,6 @@ class BwClient:
         response = self._client.request(
             "GET",
             "/sap/bw/modeling/repo/is/systeminfo",
-            params={
-                "sap-client": self._sap_client,
-                "sap-language": self._language,
-            },
             headers={
                 "Accept": "application/xml",
                 "X-CSRF-Token": "Fetch",

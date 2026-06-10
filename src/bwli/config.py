@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-from ipaddress import ip_address
+import socket
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+IpAddress = IPv4Address | IPv6Address
 
 
 class ConfigError(RuntimeError):
@@ -84,7 +87,7 @@ class LlmConfig(BaseModel):
         if not self.enabled:
             return None
         if self.provider != "openai-compatible":
-            raise ConfigError("MVP supports only local OpenAI-compatible LLM endpoints")
+            raise ConfigError("MVP supports only OpenAI-compatible LLM endpoints")
         base_url = _resolve_env_ref(self.base_url_ref)
         _validate_local_llm_base_url(base_url)
         return LlmRuntimeConfig(
@@ -139,22 +142,79 @@ def validate_local_llm_base_url(base_url: str) -> None:
 
 def _validate_local_llm_base_url(base_url: str) -> None:
     parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError("LLM base URL must be an http(s) OpenAI-compatible endpoint") from exc
+    if parsed.scheme not in {"http", "https"} or not hostname:
         raise ConfigError("LLM base URL must be an http(s) OpenAI-compatible endpoint")
 
-    host = parsed.hostname.lower()
-    if host in {"localhost", "host.docker.internal"}:
-        return
+    host = hostname.lower()
+    _validated_llm_connection_host(host, port)
+
+
+def _validated_llm_connection_host(host: str, port: int | None) -> str:
+    """Return a validated numeric connect host for an LLM endpoint hostname."""
 
     try:
         address = ip_address(host)
-    except ValueError as exc:
-        raise ConfigError("LLM base URL must point to a loopback/local host endpoint") from exc
+    except ValueError:
+        resolved_addresses = _validate_resolved_llm_addresses(host, port)
+        return resolved_addresses[0]
 
-    if address.is_loopback:
-        return
+    _reject_disallowed_llm_address(address)
 
-    raise ConfigError("LLM base URL must point to a loopback/local host endpoint")
+    if address.is_loopback or address.is_private or address.is_global:
+        return host
+
+    raise ConfigError("LLM base URL must be a reachable http(s) OpenAI-compatible endpoint")
+
+
+def _reject_disallowed_llm_address(address: IpAddress) -> None:
+    if address.is_link_local:
+        raise ConfigError("LLM base URL must not point to a link-local metadata endpoint")
+
+
+def _validate_resolved_llm_addresses(host: str, port: int | None) -> list[str]:
+    resolved_addresses = _resolve_hostname_addresses(host, port)
+    if not resolved_addresses:
+        raise ConfigError("LLM base URL hostname must resolve before use")
+
+    for resolved_address in resolved_addresses:
+        try:
+            address = ip_address(resolved_address)
+        except ValueError as exc:
+            raise ConfigError("LLM base URL hostname resolved to an invalid address") from exc
+        _reject_disallowed_llm_address(address)
+        if address.is_loopback or address.is_private or address.is_global:
+            continue
+        raise ConfigError("LLM base URL must resolve to a reachable endpoint")
+    return resolved_addresses
+
+
+def _resolve_hostname_addresses(host: str, port: int | None) -> list[str]:
+    """Resolve hostname addresses for runtime metadata endpoint blocking."""
+
+    try:
+        infos = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return []
+
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        address = sockaddr[0]
+        if not isinstance(address, str):
+            continue
+        if address in seen:
+            continue
+        seen.add(address)
+        addresses.append(address)
+    return addresses
 
 
 def redact_config_for_log(value: Any) -> str:
