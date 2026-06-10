@@ -21,7 +21,7 @@ export interface HealthResponse {
 }
 
 export interface RuntimeConfigResponse {
-  storage: 'process-memory';
+  storage: 'process-memory' | 'process-memory+project-env';
   connection_status: ConnectionStatus;
   bw: {
     source: ConfigSource;
@@ -46,6 +46,7 @@ export interface RuntimeConfigResponse {
 }
 
 export interface RuntimeConfigRequest {
+  persist_to_env?: boolean;
   bw?: {
     url: string;
     user: string;

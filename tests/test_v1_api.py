@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,290 @@ def test_v1_runtime_config_loads_project_dotenv_as_startup_seed(
     assert cleared.json()["bw"]["source"] == "env"
     assert cleared.json()["bw"]["user"] == "dotenv-user"
     assert env_file.read_text(encoding="utf-8") == original_env + "\n"
+
+
+_RUNTIME_ENV_KEYS = (
+    "BW_URL",
+    "BW_USER",
+    "BW_PASSWORD",
+    "BW_CLIENT",
+    "BW_LANGUAGE",
+    "BW_VERIFY_SSL",
+    "BW_CA_BUNDLE",
+    "BW_TRUST_ENV",
+    "BWLI_LLM_BASE_URL",
+    "BWLI_LLM_MODEL",
+    "BWLI_LLM_API_KEY",
+)
+
+
+def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _RUNTIME_ENV_KEYS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_v1_runtime_config_persist_to_env_writes_env_file_without_echoing_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "# unrelated comment stays",
+                "UNRELATED_TOOL_KEY=keep-me",
+                "BW_URL=https://old.example.invalid",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(project_root=tmp_path))
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "persist_to_env": True,
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": "fixture-secret-value",
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            },
+            "llm": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "fixture-local-model",
+                "api_key": "fixture-llm-secret",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["storage"] == "process-memory+project-env"
+    assert payload["bw"]["password"] == "[REDACTED]"
+    assert payload["llm"]["api_key"] == "[REDACTED]"
+    assert "fixture-secret-value" not in response.text
+    assert "fixture-llm-secret" not in response.text
+
+    content = env_file.read_text(encoding="utf-8")
+    assert "# unrelated comment stays" in content
+    assert "UNRELATED_TOOL_KEY=keep-me" in content
+    assert "https://old.example.invalid" not in content
+    assert 'BW_URL="https://bw.example.invalid"' in content
+    assert 'BW_PASSWORD="fixture-secret-value"' in content
+    assert 'BW_VERIFY_SSL="true"' in content
+    assert 'BWLI_LLM_BASE_URL="http://127.0.0.1:11434/v1"' in content
+    assert 'BWLI_LLM_API_KEY="fixture-llm-secret"' in content
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+    memory_only = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://memory-only.example.invalid",
+                "user": "memory-user",
+                "password": "memory-secret-value",
+                "client": "999",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert memory_only.status_code == 200, memory_only.text
+    assert memory_only.json()["storage"] == "process-memory"
+    assert memory_only.json()["bw"]["url"] == "https://memory-only.example.invalid"
+    assert env_file.read_text(encoding="utf-8") == content
+
+    reset = client.delete("/api/v1/runtime-config")
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["bw"]["source"] == "env"
+    assert reset.json()["bw"]["url"] == "https://bw.example.invalid"
+    assert "fixture-secret-value" not in reset.text
+
+    restarted = TestClient(create_app(project_root=tmp_path))
+    seeded = restarted.get("/api/v1/runtime-config")
+    assert seeded.status_code == 200
+    seeded_payload = seeded.json()
+    assert seeded_payload["storage"] == "process-memory"
+    assert seeded_payload["bw"]["configured"] is True
+    assert seeded_payload["bw"]["source"] == "env"
+    assert seeded_payload["bw"]["url"] == "https://bw.example.invalid"
+    assert seeded_payload["llm"]["configured"] is True
+    assert "fixture-secret-value" not in seeded.text
+    assert "fixture-llm-secret" not in seeded.text
+
+
+@pytest.mark.parametrize("marker", ["[REDACTED]", "[REACTED]"])
+def test_v1_runtime_config_persist_reuses_in_process_secret_for_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    client = TestClient(create_app(project_root=tmp_path))
+    bw_body = {
+        "url": "https://bw.example.invalid",
+        "user": "fixture-user",
+        "password": "actual-secret-value",
+        "client": "100",
+        "language": "EN",
+        "verify_ssl": True,
+    }
+    assert client.put("/api/v1/runtime-config", json={"bw": bw_body}).status_code == 200
+    assert not (tmp_path / ".env").exists()
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={"persist_to_env": True, "bw": {**bw_body, "password": marker}},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["storage"] == "process-memory+project-env"
+    assert "actual-secret-value" not in response.text
+    content = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert 'BW_PASSWORD="actual-secret-value"' in content
+    assert marker not in content
+
+
+def test_v1_runtime_config_persist_rejects_placeholder_without_prior_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    client = TestClient(create_app(project_root=tmp_path))
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "persist_to_env": True,
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": "[REDACTED]",
+                "client": "100",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "password" in response.text
+    assert not (tmp_path / ".env").exists()
+
+
+def test_v1_runtime_config_failed_env_persist_does_not_mutate_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    client = TestClient(create_app(project_root=tmp_path))
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "persist_to_env": True,
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": "bad\nsecret",
+                "client": "100",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "line breaks" in response.text
+    assert client.get("/api/v1/runtime-config").json()["bw"]["configured"] is False
+    assert not (tmp_path / ".env").exists()
+
+
+def test_v1_runtime_config_persist_round_trips_quoted_secret_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    tricky_secret = 'pa#ss"word\\$value'
+    client = TestClient(create_app(project_root=tmp_path))
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "persist_to_env": True,
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": tricky_secret,
+                "client": "100",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    escaped_line = 'BW_PASSWORD="pa#ss\\"word\\\\$value"'
+    assert escaped_line in (tmp_path / ".env").read_text(encoding="utf-8")
+
+    # A restarted backend seeds the secret from .env; resubmitting only the
+    # redaction marker and persisting again must rewrite the identical value,
+    # proving the quote/unquote round trip is lossless.
+    restarted = TestClient(create_app(project_root=tmp_path))
+    resubmitted = restarted.put(
+        "/api/v1/runtime-config",
+        json={
+            "persist_to_env": True,
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "fixture-user",
+                "password": "[REDACTED]",
+                "client": "100",
+            },
+        },
+    )
+    assert resubmitted.status_code == 200, resubmitted.text
+    assert escaped_line in (tmp_path / ".env").read_text(encoding="utf-8")
+    assert tricky_secret not in resubmitted.text
+
+
+def test_v1_runtime_config_persist_disabled_llm_removes_env_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    client = TestClient(create_app(project_root=tmp_path))
+    configured = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "persist_to_env": True,
+            "llm": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "fixture-local-model",
+                "api_key": "fixture-llm-secret",
+            },
+        },
+    )
+    assert configured.status_code == 200
+    assert "BWLI_LLM_MODEL" in (tmp_path / ".env").read_text(encoding="utf-8")
+
+    response = client.put(
+        "/api/v1/runtime-config",
+        json={"persist_to_env": True, "llm": {"enabled": False}},
+    )
+
+    assert response.status_code == 200
+    content = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "BWLI_LLM_BASE_URL" not in content
+    assert "BWLI_LLM_MODEL" not in content
+    assert "BWLI_LLM_API_KEY" not in content
 
 
 @pytest.mark.parametrize("marker", ["[REDACTED]", "[REACTED]"])
