@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import bwli.config as config_module
 from bwli.config import AppConfig, BwConnectionConfig, ConfigError, LlmConfig, LlmRuntimeConfig
 
 
@@ -86,13 +87,20 @@ def test_llm_enabled_rejects_missing_runtime_refs(monkeypatch: pytest.MonkeyPatc
         LlmConfig(enabled=True).resolve_runtime()
 
 
-def test_llm_enabled_rejects_public_runtime_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("BWLI_LLM_BASE_URL", "https://api.openai.com/v1")
+def test_llm_enabled_accepts_remote_runtime_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BWLI_LLM_BASE_URL", "https://llm-gateway.example.invalid/v1")
     monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
     monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
+    monkeypatch.setattr(
+        config_module,
+        "_resolve_hostname_addresses",
+        lambda _host, _port: ["93.184.216.34"],
+    )
 
-    with pytest.raises(ConfigError):
-        LlmConfig(enabled=True).resolve_runtime()
+    runtime = LlmConfig(enabled=True).resolve_runtime()
+
+    assert isinstance(runtime, LlmRuntimeConfig)
+    assert runtime.base_url == "https://llm-gateway.example.invalid/v1"
 
 
 def test_llm_enabled_rejects_link_local_metadata_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,7 +112,65 @@ def test_llm_enabled_rejects_link_local_metadata_endpoint(monkeypatch: pytest.Mo
         LlmConfig(enabled=True).resolve_runtime()
 
 
-def test_llm_enabled_rejects_private_non_loopback_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_llm_enabled_rejects_hostname_resolving_to_link_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BWLI_LLM_BASE_URL", "http://metadata.example.invalid/v1")
+    monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
+    monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
+    monkeypatch.setattr(
+        config_module,
+        "_resolve_hostname_addresses",
+        lambda _host, _port: ["169.254.169.254"],
+        raising=False,
+    )
+
+    with pytest.raises(ConfigError):
+        LlmConfig(enabled=True).resolve_runtime()
+
+
+def test_llm_enabled_rejects_unresolved_hostname(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BWLI_LLM_BASE_URL", "https://llm-gateway.example.invalid/v1")
+    monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
+    monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
+    monkeypatch.setattr(
+        config_module,
+        "_resolve_hostname_addresses",
+        lambda _host, _port: [],
+    )
+
+    with pytest.raises(ConfigError):
+        LlmConfig(enabled=True).resolve_runtime()
+
+
+def test_llm_enabled_rejects_localhost_resolving_to_link_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BWLI_LLM_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
+    monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
+    monkeypatch.setattr(
+        config_module,
+        "_resolve_hostname_addresses",
+        lambda _host, _port: ["169.254.169.254"],
+    )
+
+    with pytest.raises(ConfigError):
+        LlmConfig(enabled=True).resolve_runtime()
+
+
+def test_llm_enabled_rejects_invalid_port_as_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BWLI_LLM_BASE_URL", "http://llm.example.invalid:notaport/v1")
+    monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
+    monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
+
+    with pytest.raises(ConfigError):
+        LlmConfig(enabled=True).resolve_runtime()
+
+
+def test_llm_enabled_accepts_private_non_loopback_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     for base_url in [
         "http://10.0.0.1/v1",
         "http://172.16.0.1/v1",
@@ -114,8 +180,10 @@ def test_llm_enabled_rejects_private_non_loopback_endpoint(monkeypatch: pytest.M
         monkeypatch.setenv("BWLI_LLM_MODEL", "local-fixture-model")
         monkeypatch.setenv("BWLI_LLM_API_KEY", "dummy-key")
 
-        with pytest.raises(ConfigError):
-            LlmConfig(enabled=True).resolve_runtime()
+        runtime = LlmConfig(enabled=True).resolve_runtime()
+
+        assert isinstance(runtime, LlmRuntimeConfig)
+        assert runtime.base_url == base_url
 
 
 def test_app_config_rejects_plaintext_secret_fields(tmp_path) -> None:

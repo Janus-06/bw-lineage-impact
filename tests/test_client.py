@@ -232,6 +232,52 @@ def test_bw_client_fetch_sends_eclipse_adt_headers() -> None:
     UUID(headers["sap-adt-request-id"])
 
 
+def test_bw_client_xref_uses_configured_sap_context_as_headers_not_query_params() -> None:
+    seen_headers: list[httpx.Headers] = []
+    seen_queries: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(request.headers)
+        seen_queries.append(dict(request.url.params.multi_items()))
+        if request.url.path == "/sap/bw/modeling/repo/is/systeminfo":
+            return httpx.Response(
+                200,
+                text="<systeminfo />",
+                headers={"x-csrf-token": "csrf-token"},
+            )
+        return httpx.Response(200, text="<feed />")
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username="fixture-user",
+        password="[REDACTED]",
+        sap_client="321",
+        language="KO",
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        assert client.fetch_xref("ZSALES", object_type="ADSO") == "<feed />"
+    finally:
+        client.close()
+
+    assert len(seen_headers) == 2
+    bootstrap_headers = seen_headers[0]
+    bootstrap_query = seen_queries[0]
+    xref_headers = seen_headers[1]
+    xref_query = seen_queries[1]
+    assert bootstrap_headers["sap-client"] == "321"
+    assert bootstrap_headers["sap-language"] == "KO"
+    assert "sap-client" not in bootstrap_query
+    assert "sap-language" not in bootstrap_query
+    assert xref_headers["sap-client"] == "321"
+    assert xref_headers["sap-language"] == "KO"
+    assert xref_query["objectType"] == "ADSO"
+    assert xref_query["objectName"] == "ZSALES"
+    assert "sap-client" not in xref_query
+    assert "sap-language" not in xref_query
+
+
 @pytest.mark.parametrize(
     ("call_name", "expected_path"),
     [
