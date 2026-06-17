@@ -769,6 +769,22 @@ def _ingest_payload(
         payload.get("edges"), list
     ):
         return _ingest_graph_payload(payload, payload_id=payload_id)
+    if kind_value in {"bw_list_requests", "list_requests", "request_list"}:
+        if isinstance(payload, dict | list):
+            return _ingest_request_list_payload(
+                payload,
+                payload_id=payload_id,
+                source=source,
+            )
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_request", "get_request", "request_detail"}:
+        if isinstance(payload, dict):
+            return _ingest_request_detail_payload(
+                payload,
+                payload_id=payload_id,
+                source=source,
+            )
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
     if kind_value in {"bw_get_process_chain", "process_chain", "processchain"}:
         if isinstance(payload, dict):
             return _ingest_process_chain_payload(payload, payload_id=payload_id, source=source)
@@ -1317,6 +1333,79 @@ def _ingest_composite_provider_xml(xml: str, *, payload_id: str) -> IngestedCata
     return mutable.to_catalog()
 
 
+def _ingest_request_list_payload(
+    payload: dict[str, object] | list[object],
+    *,
+    payload_id: str,
+    source: str,
+) -> IngestedCatalog:
+    raw_items = _request_payload_items(payload)
+    requests = _sorted_request_records(
+        [_request_record(item) for item in raw_items if isinstance(item, dict)]
+    )
+    target = _request_target(source, payload=payload, requests=requests)
+    if target is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    target_type = _request_target_type(source, payload=payload, requests=requests)
+    evidence_id = f"{payload_id}:request-list"
+    return IngestedCatalog(
+        objects=[
+            CatalogObjectRecord(
+                id=target,
+                type=target_type,
+                metadata={
+                    "request_freshness": _request_freshness_metadata(
+                        target=target,
+                        target_type=target_type,
+                        requests=requests,
+                    )
+                },
+                evidence_ids=[evidence_id],
+            )
+        ],
+        edges=[],
+        evidence_ids=[evidence_id],
+    )
+
+
+def _ingest_request_detail_payload(
+    payload: dict[str, object],
+    *,
+    payload_id: str,
+    source: str,
+) -> IngestedCatalog:
+    detail = _request_detail_payload(payload)
+    request = _request_record(
+        detail,
+        request_tsn=_source_query_value(source, "requestTsn"),
+        storage=_source_query_value(source, "storage"),
+    )
+    requests = _sorted_request_records([request])
+    target = _request_target(source, payload=payload, requests=requests)
+    if target is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    target_type = _request_target_type(source, payload=payload, requests=requests)
+    evidence_id = f"{payload_id}:request-detail"
+    return IngestedCatalog(
+        objects=[
+            CatalogObjectRecord(
+                id=target,
+                type=target_type,
+                metadata={
+                    "request_freshness": _request_freshness_metadata(
+                        target=target,
+                        target_type=target_type,
+                        requests=requests,
+                    )
+                },
+                evidence_ids=[evidence_id],
+            )
+        ],
+        edges=[],
+        evidence_ids=[evidence_id],
+    )
+
+
 def _ingest_search_payload(
     payload: dict[str, object] | list[object],
     *,
@@ -1539,6 +1628,253 @@ def _xref_xml_items(xml: str) -> list[dict[str, object]]:
     return refs or [_xml_fields(element) for element in root.iter() if _xml_fields(element)]
 
 
+def _request_payload_items(payload: dict[str, object] | list[object]) -> list[dict[str, object]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    for key in ("requests", "results", "items", "objects"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _request_detail_payload(payload: dict[str, object]) -> dict[str, object]:
+    header = payload.get("header")
+    if isinstance(header, dict):
+        return {key: value for key, value in header.items() if isinstance(key, str)}
+    return payload
+
+
+def _request_record(
+    item: dict[str, object],
+    *,
+    request_tsn: str | None = None,
+    storage: str | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {}
+    resolved_request_tsn = request_tsn or _first_text(
+        item,
+        "requestTsn",
+        "request_tsn",
+        "request",
+        "requestId",
+    )
+    external_tsn = _first_text(item, "requestTsnExternal", "request_tsn_external", "tsn")
+    resolved_storage = storage or _first_text(item, "storage")
+    status = _first_text(item, "requestStatus", "request_status", "status")
+    last_process_status = _first_text(
+        item,
+        "lastProcessStatus",
+        "last_process_status",
+        "processStatus",
+    )
+    last_action = _first_text(item, "lastAction", "last_action", "action")
+    records = _number_value(item.get("records")) or _number_value(item.get("recordCount"))
+    timestamp = _first_text(
+        item,
+        "lastTimeStamp",
+        "lastTimestamp",
+        "timestamp",
+        "createdAt",
+        "requestStart",
+        "requestFinish",
+    )
+    for key, value in (
+        ("request_tsn", resolved_request_tsn),
+        ("tsn", external_tsn),
+        ("storage", resolved_storage),
+        ("status", status),
+        ("last_process_status", last_process_status),
+        ("last_action", last_action),
+        ("records", records),
+        ("timestamp", timestamp),
+    ):
+        if value is not None:
+            record[key] = value
+    return record
+
+
+def _request_freshness_metadata(
+    *,
+    target: str,
+    target_type: str,
+    requests: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "target": target,
+        "target_type": target_type,
+        "requests": list(requests),
+    }
+    if requests:
+        metadata["latest"] = dict(requests[0])
+    return metadata
+
+
+def _request_target(
+    source: str,
+    *,
+    payload: dict[str, object] | list[object],
+    requests: Sequence[dict[str, object]],
+) -> str | None:
+    target = (
+        _source_query_value(source, "objectName")
+        or _source_query_value(source, "target")
+        or _source_query_value(source, "datatarget")
+    )
+    if target is not None:
+        return target
+    if isinstance(payload, dict):
+        target = _first_text(
+            payload,
+            "dataTarget",
+            "datatarget",
+            "target",
+            "objectName",
+            "technicalName",
+        )
+        if target is not None:
+            return target
+    for request in requests:
+        target_value = request.get("target")
+        if isinstance(target_value, str) and target_value.strip():
+            return target_value.strip()
+    return None
+
+
+def _request_target_type(
+    source: str,
+    *,
+    payload: dict[str, object] | list[object],
+    requests: Sequence[dict[str, object]],
+) -> str:
+    target_type = (
+        _source_query_value(source, "objectType")
+        or _source_query_value(source, "targetType")
+        or _source_query_value(source, "tlogo")
+    )
+    if target_type is not None:
+        return target_type.upper()
+    if isinstance(payload, dict):
+        target_type = _first_text(payload, "objectType", "targetType", "tlogo", "type")
+        if target_type is not None:
+            return target_type.upper()
+    for request in requests:
+        value = request.get("target_type")
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+    return "UNKNOWN"
+
+
+def _sorted_request_records(
+    requests: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    return sorted(
+        [request for request in requests if request],
+        key=_request_sort_key,
+        reverse=True,
+    )
+
+
+def _request_sort_key(request: dict[str, object]) -> tuple[bool, str, str]:
+    timestamp = request.get("timestamp")
+    request_tsn = request.get("request_tsn") or request.get("tsn")
+    return (
+        isinstance(timestamp, str) and bool(timestamp),
+        timestamp if isinstance(timestamp, str) else "",
+        request_tsn if isinstance(request_tsn, str) else "",
+    )
+
+
+def _number_value(value: object) -> int | float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int | float):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            if "." in text:
+                return float(text)
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _merge_metadata(
+    current: dict[str, object],
+    incoming: dict[str, object],
+) -> dict[str, object]:
+    metadata: dict[str, object] = {**incoming, **current}
+    current_freshness = current.get("request_freshness")
+    incoming_freshness = incoming.get("request_freshness")
+    if isinstance(current_freshness, dict) and isinstance(incoming_freshness, dict):
+        metadata["request_freshness"] = _merge_request_freshness(
+            current_freshness,
+            incoming_freshness,
+        )
+    return metadata
+
+
+def _merge_request_freshness(
+    current: dict[object, object],
+    incoming: dict[object, object],
+) -> dict[str, object]:
+    target = _dict_text(current, "target") or _dict_text(incoming, "target") or ""
+    target_type = _dict_text(current, "target_type") or _dict_text(incoming, "target_type")
+    requests = _merge_request_records(
+        [
+            *_freshness_requests(current),
+            *_freshness_requests(incoming),
+            *_freshness_latest(current),
+            *_freshness_latest(incoming),
+        ]
+    )
+    metadata = _request_freshness_metadata(
+        target=target,
+        target_type=target_type or "UNKNOWN",
+        requests=requests,
+    )
+    return metadata
+
+
+def _freshness_requests(value: dict[object, object]) -> list[dict[str, object]]:
+    requests = value.get("requests")
+    if not isinstance(requests, list):
+        return []
+    return [item for item in requests if isinstance(item, dict)]
+
+
+def _freshness_latest(value: dict[object, object]) -> list[dict[str, object]]:
+    latest = value.get("latest")
+    return [latest] if isinstance(latest, dict) else []
+
+
+def _merge_request_records(
+    requests: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    by_key: dict[str, dict[str, object]] = {}
+    for index, request in enumerate(requests):
+        key = _request_record_key(request, fallback=str(index))
+        by_key[key] = {**by_key.get(key, {}), **request}
+    return _sorted_request_records(list(by_key.values()))
+
+
+def _request_record_key(request: dict[str, object], *, fallback: str) -> str:
+    for key in ("request_tsn", "tsn"):
+        value = request.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return fallback
+
+
+def _dict_text(value: dict[object, object], key: str) -> str | None:
+    item = value.get(key)
+    return item.strip() if isinstance(item, str) and item.strip() else None
+
+
 class _MutableCatalog:
     def __init__(self) -> None:
         self.objects: dict[str, CatalogObjectRecord] = {}
@@ -1561,7 +1897,7 @@ class _MutableCatalog:
             name=current.name or obj.name,
             type=current.type if current.type != "UNKNOWN" else obj.type,
             label=current.label or obj.label,
-            metadata={**obj.metadata, **current.metadata},
+            metadata=_merge_metadata(current.metadata, obj.metadata),
             evidence_ids=evidence_ids,
         )
 

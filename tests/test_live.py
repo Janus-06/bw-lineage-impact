@@ -7,6 +7,7 @@ import pytest
 
 from bwli.live import LiveCollectionError, collect_live_snapshot
 from bwli.snapshot import SnapshotReader
+from bwli.store import ingest_manifest
 
 
 class RecordingLiveClient:
@@ -66,6 +67,19 @@ class RecordingLiveClient:
 
     def fetch_composite_provider(self, composite_provider_name: str) -> dict[str, Any]:
         return {"composite_provider": composite_provider_name}
+
+    def fetch_list_requests(
+        self,
+        target: str,
+        *,
+        target_type: str = "ADSO",
+        top: int = 3,
+        created_from: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def fetch_request(self, request_tsn: str, *, storage: str = "AQ") -> dict[str, Any]:
+        return {"requestTsn": request_tsn, "storage": storage}
 
     def close(self) -> None:
         self.closed = True
@@ -129,6 +143,54 @@ class MetadataFlakyLiveClient(RecordingLiveClient):
         )
 
 
+class RequestFreshnessClient(RecordingLiveClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[Any, ...]] = []
+
+    def fetch_list_requests(
+        self,
+        target: str,
+        *,
+        target_type: str = "ADSO",
+        top: int = 3,
+        created_from: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(("list_requests", target, target_type, top, created_from))
+        return [
+            {
+                "requestTsn": "TSN_NEW",
+                "requestTsnExternal": "REQ_NEW",
+                "storage": "AQ",
+                "requestStatus": "G",
+                "lastProcessStatus": "G",
+                "records": 42,
+                "lastTimeStamp": "2026-06-17T12:00:00Z",
+            },
+            {
+                "requestTsn": "TSN_OLD",
+                "requestTsnExternal": "REQ_OLD",
+                "storage": "AQ",
+                "requestStatus": "R",
+                "records": 1,
+                "lastTimeStamp": "2026-06-16T12:00:00Z",
+            },
+        ]
+
+    def fetch_request(self, request_tsn: str, *, storage: str = "AQ") -> dict[str, Any]:
+        self.calls.append(("get_request", request_tsn, storage))
+        return {
+            "requestTsn": request_tsn,
+            "requestTsnExternal": "REQ_NEW",
+            "storage": storage,
+            "requestStatus": "G",
+            "lastProcessStatus": "G",
+            "records": 43,
+            "lastTimeStamp": "2026-06-17T12:05:00Z",
+            "lastAction": "LOAD",
+        }
+
+
 def test_collect_live_snapshot_uses_unique_payload_paths_for_colliding_labels(tmp_path) -> None:
     first = "Z" * 90 + "A"
     second = "Z" * 90 + "B"
@@ -173,6 +235,57 @@ def test_collect_live_snapshot_partial_success_keeps_succeeded_payloads(tmp_path
     assert "redaction-target-secret" not in failed_ops[0].error
     assert "[REDACTED]" in failed_ops[0].error
     assert "bw.example.invalid" not in failed_ops[0].error
+
+
+def test_request_freshness_attached_to_provider_node(tmp_path) -> None:
+    client = RequestFreshnessClient()
+
+    result = collect_live_snapshot(
+        out_dir=tmp_path,
+        client_factory=lambda: client,
+        object_names=["ZADSO_SALES"],
+        include_dataflow=False,
+        include_xref=False,
+        include_request_freshness=True,
+        request_freshness_top=2,
+    )
+
+    assert client.closed is True
+    assert client.calls == [
+        ("list_requests", "ZADSO_SALES", "ADSO", 2, None),
+        ("get_request", "TSN_NEW", "AQ"),
+    ]
+    assert result.succeeded == 2
+    assert result.failed == 0
+    assert [payload.kind for payload in result.manifest.payloads] == [
+        "bw_list_requests",
+        "bw_get_request",
+    ]
+    assert [op.name for op in result.operations] == [
+        "bw_list_requests",
+        "bw_get_request",
+    ]
+
+    reader = SnapshotReader(tmp_path)
+    persisted = {
+        payload.kind: reader.read_payload(payload)
+        for payload in result.manifest.payloads
+    }
+    assert persisted["bw_list_requests"][0]["requestTsn"] == "TSN_NEW"
+    assert persisted["bw_get_request"]["requestTsn"] == "TSN_NEW"
+    assert "objectName=ZADSO_SALES" in result.manifest.payloads[0].source
+    assert "requestTsn=TSN_NEW" in result.manifest.payloads[1].source
+
+    _, catalog = ingest_manifest(tmp_path / "manifest.json")
+    objects = {item.id: item for item in catalog.objects}
+    freshness = objects["ZADSO_SALES"].metadata["request_freshness"]
+    assert freshness["target"] == "ZADSO_SALES"
+    assert freshness["target_type"] == "ADSO"
+    assert freshness["latest"]["request_tsn"] == "TSN_NEW"
+    assert freshness["latest"]["tsn"] == "REQ_NEW"
+    assert freshness["latest"]["status"] == "G"
+    assert freshness["latest"]["records"] == 43
+    assert freshness["latest"]["timestamp"] == "2026-06-17T12:05:00Z"
 
 
 def test_collect_live_snapshot_writes_xml_payload_as_xml_file(tmp_path) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -47,11 +47,17 @@ ACCEPT_HEADERS: dict[str, str] = {
         "application/vnd.sap.bw.modeling.lsys-v1_1_0+xml"
     ),
     "query": _QUERY_ACCEPT,
+    "request_monitor": "*/*",
 }
 
 DataflowDirection = Literal["upwards", "downwards", "both"]
 _WIDE_DATE_FROM = "1970-01-01T00:00:00Z"
 _WIDE_DATE_TO = "2099-12-31T23:59:59Z"
+REQUEST_MONITOR_TOP_DEFAULT = 3
+REQUEST_MONITOR_TOP_CAP = 20
+_REQUEST_MONITOR_STORAGE = "AQ,AX,AT"
+_REQUEST_MONITOR_STATUS = "N,GG,GR,YG,RR,YR,RG,U,Y,X"
+_REQUEST_MONITOR_HEADERS = {"Content-Type": "application/json"}
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,7 @@ class Endpoint:
     path: str
     params: dict[str, Any]
     accept: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 def build_search_endpoint(search_term: str, *, object_type: str | None = None) -> Endpoint:
@@ -212,8 +219,53 @@ def build_query_endpoint(query_name: str, *, active: bool = True) -> Endpoint:
     )
 
 
+def build_list_requests_endpoint(
+    target: str,
+    *,
+    target_type: str = "ADSO",
+    top: int = REQUEST_MONITOR_TOP_DEFAULT,
+    created_from: str | None = None,
+) -> Endpoint:
+    safe_top = _request_monitor_top(top)
+    params: dict[str, Any] = {
+        "tlogo": target_type.lower(),
+        "datatarget": target.lower(),
+        "storage": _REQUEST_MONITOR_STORAGE,
+        "top": safe_top,
+        "status": _REQUEST_MONITOR_STATUS,
+    }
+    if created_from:
+        params["createdfrom"] = created_from
+    else:
+        params["latestrequests"] = safe_top
+    return Endpoint(
+        path="/sap/bc/http/sap/bw4/v1/manage/requests",
+        params=params,
+        accept=ACCEPT_HEADERS["request_monitor"],
+        headers=dict(_REQUEST_MONITOR_HEADERS),
+    )
+
+
+def build_get_request_endpoint(request_tsn: str, storage: str = "AQ") -> Endpoint:
+    return Endpoint(
+        path=(
+            "/sap/bc/http/sap/bw4/v1/manage/requests/"
+            f"{quote(request_tsn, safe='')}/{_url_lower(storage)}"
+        ),
+        params={},
+        accept=ACCEPT_HEADERS["request_monitor"],
+        headers=dict(_REQUEST_MONITOR_HEADERS),
+    )
+
+
 def build_composite_provider_endpoint(object_name: str) -> Endpoint:
     return build_hcpr_endpoint(object_name)
+
+
+def _request_monitor_top(value: int) -> int:
+    if value <= 0:
+        return REQUEST_MONITOR_TOP_DEFAULT
+    return min(value, REQUEST_MONITOR_TOP_CAP)
 
 
 def _dataflow_object_name(

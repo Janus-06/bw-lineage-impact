@@ -17,7 +17,9 @@ from bwli.endpoints import (
     build_dataflow_endpoint,
     build_datasource_endpoint,
     build_dtp_endpoint,
+    build_get_request_endpoint,
     build_hcpr_endpoint,
+    build_list_requests_endpoint,
     build_process_chain_endpoint,
     build_process_variant_endpoint,
     build_query_endpoint,
@@ -156,6 +158,26 @@ class BwClient:
     def fetch_composite_provider(self, object_name: str) -> Any:
         return self._fetch(build_composite_provider_endpoint(object_name))
 
+    def fetch_list_requests(
+        self,
+        target: str,
+        *,
+        target_type: str = "ADSO",
+        top: int = 3,
+        created_from: str | None = None,
+    ) -> Any:
+        return self._fetch(
+            build_list_requests_endpoint(
+                target,
+                target_type=target_type,
+                top=top,
+                created_from=created_from,
+            )
+        )
+
+    def fetch_request(self, request_tsn: str, *, storage: str = "AQ") -> Any:
+        return self._fetch(build_get_request_endpoint(request_tsn, storage=storage))
+
     def close(self) -> None:
         self._client.close()
 
@@ -203,6 +225,7 @@ class BwClient:
             "Accept": endpoint.accept,
             "sap-adt-request-id": str(uuid4()),
         }
+        request_headers.update(endpoint.headers)
         if self._csrf_token:
             request_headers["X-CSRF-Token"] = self._csrf_token
         response = self._client.request(

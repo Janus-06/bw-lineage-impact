@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict
 
-from bwli.endpoints import DataflowDirection
+from bwli.endpoints import REQUEST_MONITOR_TOP_CAP, REQUEST_MONITOR_TOP_DEFAULT, DataflowDirection
 from bwli.redact import redact_text
 from bwli.snapshot import PayloadMetadata, SnapshotManifest, SnapshotWriter
 
@@ -49,6 +49,17 @@ class BwReadClient(Protocol):
     def fetch_query(self, query_name: str) -> Any: ...
 
     def fetch_composite_provider(self, composite_provider_name: str) -> Any: ...
+
+    def fetch_list_requests(
+        self,
+        target: str,
+        *,
+        target_type: str = "ADSO",
+        top: int = REQUEST_MONITOR_TOP_DEFAULT,
+        created_from: str | None = None,
+    ) -> Any: ...
+
+    def fetch_request(self, request_tsn: str, *, storage: str = "AQ") -> Any: ...
 
     def close(self) -> None: ...
 
@@ -189,6 +200,9 @@ def collect_live_snapshot(
     composite_providers: Sequence[str] = (),
     include_dataflow: bool = True,
     include_xref: bool = True,
+    include_request_freshness: bool = False,
+    request_freshness_top: int = REQUEST_MONITOR_TOP_DEFAULT,
+    request_freshness_created_from: str | None = None,
     dataflow_object_type: str = "ADSO",
     dataflow_source_system: str | None = None,
     dataflow_direction: DataflowDirection = "downwards",
@@ -324,6 +338,21 @@ def collect_live_snapshot(
                         )
                     )
                     operations.append(_success_summary("bw_xref", label, payload))
+
+            if include_request_freshness:
+                _capture_request_freshness(
+                    writer=writer,
+                    payloads=payloads,
+                    operations=operations,
+                    index=index,
+                    object_name=object_name,
+                    object_type=dataflow_object_type,
+                    top=request_freshness_top,
+                    created_from=request_freshness_created_from,
+                    client=client,
+                    secret_values=secret_values,
+                    secret_urls=secret_urls,
+                )
 
         for index, chain_name in enumerate(process_chains):
             _capture_live_payload(
@@ -517,6 +546,189 @@ def _capture_live_payload(
         )
     )
     operations.append(_success_summary(kind, label, payload))
+
+
+def _capture_request_freshness(
+    *,
+    writer: SnapshotWriter,
+    payloads: list[PayloadMetadata],
+    operations: list[LiveOperationSummary],
+    index: int,
+    object_name: str,
+    object_type: str,
+    top: int,
+    created_from: str | None,
+    client: BwReadClient,
+    secret_values: Sequence[str],
+    secret_urls: Sequence[str],
+) -> None:
+    safe_top = _request_freshness_top(top)
+    list_label = _request_list_label(
+        object_name,
+        object_type=object_type,
+        top=safe_top,
+        created_from=created_from,
+    )
+    list_payload_id = f"requests-{index}-{_safe_fragment(object_name)}"
+    try:
+        list_payload = client.fetch_list_requests(
+            object_name,
+            target_type=object_type,
+            top=safe_top,
+            created_from=created_from,
+        )
+    except Exception as exc:
+        operations.append(
+            _failure_summary(
+                name="bw_list_requests",
+                label=list_label,
+                exc=exc,
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+        )
+        return
+    payloads.append(
+        writer.write_payload(
+            payload_id=list_payload_id,
+            kind="bw_list_requests",
+            source=list_label,
+            payload=list_payload,
+        )
+    )
+    operations.append(_success_summary("bw_list_requests", list_label, list_payload))
+
+    latest = _latest_request_pointer(list_payload)
+    if latest is None:
+        return
+    request_tsn, storage = latest
+    detail_label = _request_detail_label(
+        object_name,
+        object_type=object_type,
+        request_tsn=request_tsn,
+        storage=storage,
+    )
+    detail_payload_id = (
+        f"request-{index}-{_safe_fragment(object_name)}-"
+        f"{_safe_fragment(request_tsn)}"
+    )
+    try:
+        detail_payload = client.fetch_request(request_tsn, storage=storage)
+    except Exception as exc:
+        operations.append(
+            _failure_summary(
+                name="bw_get_request",
+                label=detail_label,
+                exc=exc,
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+        )
+        return
+    payloads.append(
+        writer.write_payload(
+            payload_id=detail_payload_id,
+            kind="bw_get_request",
+            source=detail_label,
+            payload=detail_payload,
+        )
+    )
+    operations.append(_success_summary("bw_get_request", detail_label, detail_payload))
+
+
+def _request_freshness_top(value: int) -> int:
+    if value <= 0:
+        return REQUEST_MONITOR_TOP_DEFAULT
+    return min(value, REQUEST_MONITOR_TOP_CAP)
+
+
+def _request_list_label(
+    object_name: str,
+    *,
+    object_type: str,
+    top: int,
+    created_from: str | None,
+) -> str:
+    query = (
+        f"objectName={quote(object_name, safe='')}&"
+        f"objectType={quote(object_type, safe='')}&"
+        f"top={top}"
+    )
+    if created_from:
+        query += f"&createdFrom={quote(created_from, safe='')}"
+    return f"bw://bw_list_requests?{query}"
+
+
+def _request_detail_label(
+    object_name: str,
+    *,
+    object_type: str,
+    request_tsn: str,
+    storage: str,
+) -> str:
+    query = (
+        f"objectName={quote(object_name, safe='')}&"
+        f"objectType={quote(object_type, safe='')}&"
+        f"requestTsn={quote(request_tsn, safe='')}&"
+        f"storage={quote(storage, safe='')}"
+    )
+    return f"bw://bw_get_request?{query}"
+
+
+def _latest_request_pointer(payload: Any) -> tuple[str, str] | None:
+    candidates: list[tuple[tuple[bool, str, str, int], str, str]] = []
+    for index, item in enumerate(_request_payload_items(payload)):
+        request_tsn = _text_value(
+            item,
+            "requestTsn",
+            "request_tsn",
+            "request",
+            "requestId",
+        )
+        if request_tsn is None:
+            continue
+        timestamp = _text_value(
+            item,
+            "lastTimeStamp",
+            "lastTimestamp",
+            "timestamp",
+            "createdAt",
+            "requestStart",
+            "requestFinish",
+        ) or ""
+        external = _text_value(item, "requestTsnExternal", "request_tsn_external", "tsn") or ""
+        storage = _text_value(item, "storage") or "AQ"
+        candidates.append(
+            (
+                (bool(timestamp), timestamp, external or request_tsn, -index),
+                request_tsn,
+                storage,
+            )
+        )
+    if not candidates:
+        return None
+    _, request_tsn, storage = max(candidates, key=lambda item: item[0])
+    return request_tsn, storage
+
+
+def _request_payload_items(payload: Any) -> list[dict[str, object]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("requests", "results", "items", "objects"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return [payload]
+    return []
+
+
+def _text_value(item: dict[str, object], *keys: str) -> str | None:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _xref_label(
