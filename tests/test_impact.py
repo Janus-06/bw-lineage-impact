@@ -4,12 +4,16 @@ import json
 from pathlib import Path
 
 from bwli.cli import app
-from bwli.graph import BwGraph
+from bwli.fingerprint import ChangeLevel
+from bwli.graph import BwGraph, BwLayer
 from bwli.impact import (
+    ChangeGrade,
     ChangeSet,
     ChangeType,
     ImpactSeverity,
+    SnapshotDiff,
     diff_graphs,
+    grade_diff,
     load_changes,
     render_impact_report,
     run_impact_analysis,
@@ -109,6 +113,163 @@ def test_snapshot_diff_detects_changed_payloads_for_stable_ids() -> None:
     assert diff.changed_edge_ids == ["e1"]
 
 
+def test_grade_diff_skip_when_no_structural_change() -> None:
+    before = BwGraph.model_validate(
+        {
+            "nodes": [{"id": "A", "type": "ADSO", "label": "Old", "metadata": {"owner": "fin"}}],
+            "edges": [],
+        }
+    )
+    after = BwGraph.model_validate(
+        {
+            "nodes": [{"id": "A", "type": "ADSO", "label": "New", "metadata": {"owner": "fin"}}],
+            "edges": [],
+        }
+    )
+
+    result = grade_diff(
+        diff_graphs(before, after), total_nodes=len(after.nodes), before=before, after=after
+    )
+
+    assert result.grade == ChangeGrade.SKIP
+    assert result.change_level == ChangeLevel.COSMETIC
+    assert result.structural_change_count == 0
+    assert result.cosmetic_node_ids == ["A"]
+
+
+def test_grade_diff_full_update_over_threshold() -> None:
+    diff = SnapshotDiff(
+        added_node_ids=[f"N{i:02d}" for i in range(31)],
+        removed_node_ids=[],
+        changed_node_ids=[],
+        added_edge_ids=[],
+        removed_edge_ids=[],
+        changed_edge_ids=[],
+    )
+
+    result = grade_diff(diff, total_nodes=100)
+
+    assert result.grade == ChangeGrade.FULL_UPDATE
+    assert result.change_level == ChangeLevel.STRUCTURAL
+    assert result.structural_change_count == 31
+
+
+def test_grade_diff_architecture_update_on_layer_shift() -> None:
+    before = BwGraph.model_validate(
+        {
+            "nodes": [
+                {"id": "A", "type": "ADSO", "layer": BwLayer.PROVIDER},
+                {"id": "B", "type": "QUERY", "layer": BwLayer.REPORTING},
+                {"id": "C", "type": "TRFN", "layer": BwLayer.TRANSFORMATION},
+            ],
+            "edges": [],
+        }
+    )
+    after = BwGraph.model_validate(
+        {
+            "nodes": [
+                {"id": "A", "type": "ADSO", "layer": BwLayer.REPORTING},
+                {"id": "B", "type": "QUERY", "layer": BwLayer.REPORTING},
+                {"id": "C", "type": "TRFN", "layer": BwLayer.TRANSFORMATION},
+            ],
+            "edges": [],
+        }
+    )
+
+    result = grade_diff(
+        diff_graphs(before, after), total_nodes=len(after.nodes), before=before, after=after
+    )
+
+    assert result.grade == ChangeGrade.ARCHITECTURE_UPDATE
+    assert result.layer_shift_node_ids == ["A"]
+    assert result.structural_node_ids == ["A"]
+
+
+def test_grade_diff_full_update_ratio_dominates_layer_shift() -> None:
+    before = BwGraph.model_validate(
+        {
+            "nodes": [
+                {
+                    "id": f"N{i}",
+                    "type": "ADSO",
+                    "layer": BwLayer.PROVIDER,
+                    "metadata": {"owner": "fin"},
+                }
+                for i in range(10)
+            ],
+            "edges": [],
+        }
+    )
+    after = BwGraph.model_validate(
+        {
+            "nodes": [
+                {
+                    "id": f"N{i}",
+                    "type": "ADSO",
+                    "layer": BwLayer.REPORTING if i == 0 else BwLayer.PROVIDER,
+                    "metadata": {"owner": "sales" if 1 <= i <= 5 else "fin"},
+                }
+                for i in range(10)
+            ],
+            "edges": [],
+        }
+    )
+
+    result = grade_diff(diff_graphs(before, after), total_nodes=10, before=before, after=after)
+
+    assert result.grade == ChangeGrade.FULL_UPDATE
+    assert result.structural_change_count == 6
+    assert result.layer_shift_node_ids == ["N0"]
+
+
+def test_grade_diff_full_update_on_single_node_layer_shift_ratio() -> None:
+    before = BwGraph.model_validate(
+        {"nodes": [{"id": "A", "type": "ADSO", "layer": BwLayer.PROVIDER}], "edges": []}
+    )
+    after = BwGraph.model_validate(
+        {"nodes": [{"id": "A", "type": "ADSO", "layer": BwLayer.REPORTING}], "edges": []}
+    )
+
+    result = grade_diff(diff_graphs(before, after), total_nodes=1, before=before, after=after)
+
+    assert result.grade == ChangeGrade.FULL_UPDATE
+    assert result.structural_change_count == 1
+    assert result.layer_shift_node_ids == ["A"]
+
+
+def test_grade_diff_partial_update_localized() -> None:
+    before = BwGraph.model_validate(
+        {
+            "nodes": [
+                {"id": "A", "type": "ADSO", "metadata": {"owner": "fin"}},
+                {"id": "B", "type": "QUERY"},
+                {"id": "C", "type": "TRFN"},
+                {"id": "D", "type": "ADSO"},
+            ],
+            "edges": [],
+        }
+    )
+    after = BwGraph.model_validate(
+        {
+            "nodes": [
+                {"id": "A", "type": "ADSO", "metadata": {"owner": "sales"}},
+                {"id": "B", "type": "QUERY"},
+                {"id": "C", "type": "TRFN"},
+                {"id": "D", "type": "ADSO"},
+            ],
+            "edges": [],
+        }
+    )
+
+    result = grade_diff(
+        diff_graphs(before, after), total_nodes=len(after.nodes), before=before, after=after
+    )
+
+    assert result.grade == ChangeGrade.PARTIAL_UPDATE
+    assert result.change_level == ChangeLevel.STRUCTURAL
+    assert result.structural_node_ids == ["A"]
+
+
 def test_impact_evidence_is_limited_to_impacted_branch() -> None:
     graph = BwGraph.model_validate(
         {
@@ -183,6 +344,61 @@ def test_diff_cli_writes_snapshot_diff_json(tmp_path, capsys) -> None:
     assert "wrote" in capsys.readouterr().out
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert payload["removed_node_ids"] == ["LOOP", "QRY"]
+
+
+def test_diff_cli_grade_wraps_plain_diff_with_deterministic_grade(tmp_path, capsys) -> None:
+    plain_out = tmp_path / "plain-diff.json"
+    graded_out = tmp_path / "graded-diff.json"
+
+    assert (
+        app(
+            [
+                "diff",
+                "--before",
+                str(GRAPH),
+                "--after",
+                str(GRAPH_AFTER),
+                "--out",
+                str(plain_out),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        app(
+            [
+                "diff",
+                "--before",
+                str(GRAPH),
+                "--after",
+                str(GRAPH_AFTER),
+                "--grade",
+                "--out",
+                str(graded_out),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    plain_payload = json.loads(plain_out.read_text(encoding="utf-8"))
+    graded_payload = json.loads(graded_out.read_text(encoding="utf-8"))
+
+    assert set(plain_payload) == {
+        "schema_version",
+        "added_node_ids",
+        "removed_node_ids",
+        "changed_node_ids",
+        "added_edge_ids",
+        "removed_edge_ids",
+        "changed_edge_ids",
+    }
+    assert set(graded_payload) == {"diff", "grade"}
+    assert graded_payload["diff"] == plain_payload
+    assert graded_payload["grade"]["grade"] == "FULL_UPDATE"
+    assert graded_payload["grade"]["structural_change_count"] == 5
 
 
 def test_diff_cli_rejects_partial_real_input(capsys) -> None:

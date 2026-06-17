@@ -23,9 +23,11 @@ from bwli.graph import Direction
 from bwli.impact import (
     ImpactOutputFormat,
     diff_graphs,
+    grade_diff,
     load_changes,
     render_impact_report,
     render_snapshot_diff,
+    render_snapshot_diff_with_grade,
     run_impact_analysis,
 )
 from bwli.lineage import load_graph, render_lineage
@@ -135,6 +137,11 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--before", type=Path, help="Before graph JSON file.")
     diff.add_argument("--after", type=Path, help="After graph JSON file.")
     diff.add_argument("--out", type=Path, help="Optional output path.")
+    diff.add_argument(
+        "--grade",
+        action="store_true",
+        help="Include deterministic change grade metadata.",
+    )
 
     field_lineage = subparsers.add_parser(
         "field-lineage",
@@ -328,8 +335,14 @@ def _diff(args: argparse.Namespace) -> int:
             return 2
         print(f"diff {SAFE_STUB_MESSAGE}")
         return 0
-    diff = diff_graphs(load_graph(args.before), load_graph(args.after))
-    rendered = render_snapshot_diff(diff)
+    before = load_graph(args.before)
+    after = load_graph(args.after)
+    diff = diff_graphs(before, after)
+    if args.grade:
+        grade = grade_diff(diff, total_nodes=len(before.nodes), before=before, after=after)
+        rendered = render_snapshot_diff_with_grade(diff, grade)
+    else:
+        rendered = render_snapshot_diff(diff)
     return _write_or_print(rendered, args.out)
 
 
