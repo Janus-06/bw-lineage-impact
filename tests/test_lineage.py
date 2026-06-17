@@ -143,3 +143,59 @@ def test_lineage_cli_writes_requested_format(tmp_path, capsys) -> None:
     assert exit_code == 0
     assert "wrote" in capsys.readouterr().out
     assert "Target ADSO" in out.read_text(encoding="utf-8")
+
+
+def test_lineage_payload_uses_graph_schema_version() -> None:
+    graph = BwGraph.model_validate(
+        {
+            "schema_version": "1.1",
+            "nodes": [{"id": "SRC"}],
+            "edges": [],
+        }
+    )
+
+    payload = graph.traverse("SRC").to_payload()
+
+    assert payload["schema_version"] == "1.1"
+
+
+def test_lineage_payload_v10_omits_v11_default_fields() -> None:
+    graph = BwGraph.model_validate(
+        {
+            "schema_version": "1.0",
+            "nodes": [
+                {
+                    "id": "SRC",
+                    "type": "LSYS",
+                    "label": "Source System",
+                    "metadata": {"source": "sap"},
+                },
+                {"id": "TGT", "type": "ADSO", "metadata": {"role": "target"}},
+            ],
+            "edges": [
+                {
+                    "id": "e1",
+                    "source": "SRC",
+                    "target": "TGT",
+                    "type": "loads",
+                    "confidence": "high",
+                    "metadata": {"mode": "delta"},
+                }
+            ],
+        }
+    )
+
+    payload = graph.traverse("SRC", max_depth=1).to_payload()
+
+    assert payload["schema_version"] == "1.0"
+    for node in payload["nodes"]:
+        assert "metadata" in node
+        assert "label" in node
+        assert not {"summary", "tags", "complexity", "layer"}.intersection(node)
+    assert payload["nodes"][0]["label"] == "Source System"
+    assert payload["nodes"][0]["metadata"] == {"source": "sap"}
+
+    assert len(payload["edges"]) == 1
+    edge = payload["edges"][0]
+    assert edge["metadata"] == {"mode": "delta"}
+    assert not {"weight", "description"}.intersection(edge)
