@@ -769,6 +769,34 @@ def _ingest_payload(
         payload.get("edges"), list
     ):
         return _ingest_graph_payload(payload, payload_id=payload_id)
+    if kind_value in {"bw_get_process_chain", "process_chain", "processchain"}:
+        if isinstance(payload, dict):
+            return _ingest_process_chain_payload(payload, payload_id=payload_id, source=source)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_process_variant", "process_variant", "processvariant"}:
+        if isinstance(payload, dict):
+            return _ingest_process_variant_payload(payload, payload_id=payload_id, source=source)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_dtp", "dtp", "dtpa"}:
+        if isinstance(payload, str):
+            return _ingest_dtp_xml(payload, payload_id=payload_id)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_datasource", "datasource", "rsds"}:
+        if isinstance(payload, str):
+            return _ingest_datasource_xml(payload, payload_id=payload_id)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_source_system", "source_system", "sourcesystem", "lsys"}:
+        if isinstance(payload, str):
+            return _ingest_source_system_xml(payload, payload_id=payload_id)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_query", "query"}:
+        if isinstance(payload, str):
+            return _ingest_query_xml(payload, payload_id=payload_id, source=source)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_composite_provider", "composite_provider", "hcpr"}:
+        if isinstance(payload, str):
+            return _ingest_composite_provider_xml(payload, payload_id=payload_id)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
     if kind_value in {"bw_search", "bwsearch", "search"}:
         if isinstance(payload, dict | list):
             return _ingest_search_payload(payload, payload_id=payload_id, source=source)
@@ -864,6 +892,426 @@ def _ingest_dataflow_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
                 type="dataflow",
                 confidence="direct",
                 evidence_ids=[edge_id],
+            )
+        )
+    return mutable.to_catalog()
+
+
+def _ingest_process_chain_payload(
+    payload: dict[str, object],
+    *,
+    payload_id: str,
+    source: str,
+) -> IngestedCatalog:
+    header = payload.get("oHeader")
+    header_fields = header if isinstance(header, dict) else {}
+    chain_id = _first_text(
+        header_fields,
+        "sProcessChainId",
+        "processChainId",
+        "chainName",
+        "name",
+    ) or _source_query_value(source, "chainName")
+    if chain_id is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    chain_name = _first_text(header_fields, "sDescription", "description", "label")
+    chain_evidence_id = f"{payload_id}:process-chain"
+    mutable = _MutableCatalog()
+    mutable.add_object(
+        CatalogObjectRecord(
+            id=chain_id,
+            name=chain_name,
+            type="RSPC",
+            metadata={
+                "object_status": _first_text(header_fields, "sObjectStatus", "objectStatus"),
+                "object_version": _first_text(header_fields, "sObjectVersion", "objectVersion"),
+            },
+            evidence_ids=[chain_evidence_id],
+        )
+    )
+
+    raw_nodes = payload.get("aNode")
+    nodes = (
+        [item for item in raw_nodes if isinstance(item, dict)]
+        if isinstance(raw_nodes, list)
+        else []
+    )
+    node_ids: list[str] = []
+    for index, node in enumerate(nodes):
+        variant_id = _first_text(
+            node,
+            "sProcessVariant",
+            "processVariant",
+            "variantName",
+            "name",
+        ) or f"{chain_id}:step:{index}"
+        process_type = _first_text(
+            node,
+            "sProcessType",
+            "processType",
+            "type",
+        ) or "PROCESS"
+        evidence_id = f"{payload_id}:process-chain-node:{index}"
+        node_ids.append(variant_id)
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=variant_id,
+                name=_first_text(
+                    node,
+                    "sVariantDescription",
+                    "sTypeDescription",
+                    "description",
+                    "label",
+                ),
+                type=process_type,
+                metadata={
+                    "chain_id": chain_id,
+                    "step_index": index,
+                    "status": _first_text(node, "sStatus", "status"),
+                },
+                evidence_ids=[evidence_id],
+            )
+        )
+        contains_id = f"{payload_id}:process-chain-contains:{chain_id}->{variant_id}"
+        mutable.add_edge(
+            CatalogEdgeRecord(
+                id=contains_id,
+                source=chain_id,
+                target=variant_id,
+                type="contains",
+                confidence="direct",
+                metadata={"step_index": index},
+                evidence_ids=[contains_id],
+            )
+        )
+
+    raw_edges = payload.get("aEdge")
+    edges = (
+        [item for item in raw_edges if isinstance(item, dict)]
+        if isinstance(raw_edges, list)
+        else []
+    )
+    for edge in edges:
+        source_index = _int_value(edge.get("iNodeIndexFrom"))
+        target_index = _int_value(edge.get("iNodeIndexTo"))
+        if source_index is None or target_index is None:
+            continue
+        if not (0 <= source_index < len(node_ids) and 0 <= target_index < len(node_ids)):
+            continue
+        source_id = node_ids[source_index]
+        target_id = node_ids[target_index]
+        edge_id = f"{payload_id}:process-chain-sequence:{source_index}->{target_index}"
+        mutable.add_edge(
+            CatalogEdgeRecord(
+                id=edge_id,
+                source=source_id,
+                target=target_id,
+                type="sequence",
+                confidence="direct",
+                metadata={
+                    "chain_id": chain_id,
+                    "status": _first_text(edge, "sStatus", "status"),
+                    "strength": _first_text(edge, "sStrength", "strength"),
+                },
+                evidence_ids=[edge_id],
+            )
+        )
+    return mutable.to_catalog()
+
+
+def _ingest_process_variant_payload(
+    payload: dict[str, object],
+    *,
+    payload_id: str,
+    source: str,
+) -> IngestedCatalog:
+    variant_name = (
+        _source_query_value(source, "variantName")
+        or _first_text(payload, "sProcessVariant", "variantName", "name")
+    )
+    if variant_name is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    process_type = (
+        _source_query_value(source, "processType")
+        or _first_text(payload, "sProcessType", "processType", "type")
+        or "PROCESS"
+    )
+    evidence_id = f"{payload_id}:process-variant"
+    metadata: JsonDict = {}
+    active = payload.get("bActive")
+    if isinstance(active, bool):
+        metadata["active"] = active
+    return IngestedCatalog(
+        objects=[
+            CatalogObjectRecord(
+                id=variant_name,
+                name=_first_text(payload, "sVariantDescription", "description", "label"),
+                type=process_type,
+                metadata=metadata,
+                evidence_ids=[evidence_id],
+            )
+        ],
+        edges=[],
+        evidence_ids=[evidence_id],
+    )
+
+
+def _ingest_dtp_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
+    root = _xml_root(xml)
+    if root is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    fields = _xml_fields(root)
+    source_fields = _first_xml_child_fields(root, "source")
+    target_fields = _first_xml_child_fields(root, "target")
+    overview_object_fields = _dtp_overview_object_fields(root)
+    dtp_id = _first_text(fields, "name", "technicalName", "dtpName", "objectName")
+    if dtp_id is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+
+    mutable = _MutableCatalog()
+    dtp_evidence_id = f"{payload_id}:dtp"
+    mutable.add_object(
+        CatalogObjectRecord(
+            id=dtp_id,
+            name=_first_text(fields, "description", "label"),
+            type="DTPA",
+            metadata={
+                "object_status": _first_text(fields, "objectStatus", "status"),
+                "source_system": _first_text(fields, "sourceSystemName", "sourceSystem"),
+            },
+            evidence_ids=[dtp_evidence_id],
+        )
+    )
+
+    source_id = _first_text(
+        fields,
+        "sourceObjectName",
+        "sourceName",
+        "source",
+        "sourceObject",
+    ) or _first_text(source_fields, "technicalName", "name", "objectName")
+    source_type = _first_text(
+        fields,
+        "sourceObjectType",
+        "sourceType",
+        "sourceTlogo",
+    ) or _first_text(source_fields, "objectType", "type", "tlogo") or "UNKNOWN"
+    source_system = _first_text(fields, "sourceSystemName", "sourceSystem") or _first_text(
+        source_fields, "sourceSystemName", "sourceSystem"
+    )
+    if source_id is not None:
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=source_id,
+                type=source_type,
+                metadata={"source_system": source_system},
+                evidence_ids=[dtp_evidence_id],
+            )
+        )
+        _add_edge(
+            mutable,
+            payload_id=payload_id,
+            source=source_id,
+            target=dtp_id,
+            edge_type="dataflow",
+            suffix="dtp-source",
+        )
+
+    target_id = _first_text(
+        fields,
+        "targetObjectName",
+        "targetName",
+        "target",
+        "targetObject",
+    ) or _first_text(target_fields, "technicalName", "name", "objectName")
+    target_type = _first_text(
+        fields,
+        "targetObjectType",
+        "targetType",
+        "targetTlogo",
+    ) or _first_text(target_fields, "objectType", "type", "tlogo") or "UNKNOWN"
+    if target_id is not None:
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=target_id,
+                type=target_type,
+                evidence_ids=[dtp_evidence_id],
+            )
+        )
+        _add_edge(
+            mutable,
+            payload_id=payload_id,
+            source=dtp_id,
+            target=target_id,
+            edge_type="dataflow",
+            suffix="dtp-target",
+        )
+
+    transformation_id = _first_text(
+        fields,
+        "transformationName",
+        "transformation",
+        "transformationObjectName",
+    ) or _first_text(overview_object_fields, "technicalName", "name", "objectName")
+    if transformation_id is not None:
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=transformation_id,
+                name=_first_text(overview_object_fields, "description", "label"),
+                type="TRFN",
+                evidence_ids=[dtp_evidence_id],
+            )
+        )
+        _add_edge(
+            mutable,
+            payload_id=payload_id,
+            source=dtp_id,
+            target=transformation_id,
+            edge_type="uses_transformation",
+            suffix="dtp-transformation",
+        )
+    return mutable.to_catalog()
+
+
+def _ingest_datasource_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
+    root = _xml_root(xml)
+    if root is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    fields = _xml_fields(root)
+    datasource_id = _first_text(fields, "name", "technicalName", "dataSourceName")
+    if datasource_id is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    field_metadata = _datasource_fields(root)
+    evidence_id = f"{payload_id}:datasource"
+    metadata: JsonDict = {
+        "source_system": _first_text(fields, "sourceSystemName", "sourceSystem"),
+        "datasource_type": _first_text(fields, "type", "dataSourceType"),
+    }
+    if field_metadata:
+        metadata["fields"] = field_metadata
+    return IngestedCatalog(
+        objects=[
+            CatalogObjectRecord(
+                id=datasource_id,
+                name=_first_text(fields, "description", "label"),
+                type="RSDS",
+                metadata=metadata,
+                evidence_ids=[evidence_id],
+            )
+        ],
+        edges=[],
+        evidence_ids=[evidence_id],
+    )
+
+
+def _ingest_source_system_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
+    root = _xml_root(xml)
+    if root is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    fields = _xml_fields(root)
+    source_system_id = _first_text(fields, "name", "technicalName", "sourceSystemName")
+    if source_system_id is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    evidence_id = f"{payload_id}:source-system"
+    return IngestedCatalog(
+        objects=[
+            CatalogObjectRecord(
+                id=source_system_id,
+                name=_first_text(fields, "description", "label"),
+                type="LSYS",
+                metadata={"source_system_type": _first_text(fields, "type", "context")},
+                evidence_ids=[evidence_id],
+            )
+        ],
+        edges=[],
+        evidence_ids=[evidence_id],
+    )
+
+
+def _ingest_query_xml(xml: str, *, payload_id: str, source: str) -> IngestedCatalog:
+    root = _xml_root(xml)
+    if root is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    fields = _xml_fields(root)
+    query_id = (
+        _first_text(fields, "technicalName", "name", "queryName")
+        or _source_query_value(source, "queryName")
+    )
+    if query_id is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    evidence_id = f"{payload_id}:query"
+    mutable = _MutableCatalog()
+    mutable.add_object(
+        CatalogObjectRecord(
+            id=query_id,
+            name=_first_text(fields, "description", "label", "text"),
+            type="QUERY",
+            evidence_ids=[evidence_id],
+        )
+    )
+    for index, (provider_id, provider_type) in enumerate(
+        _related_providers_from_links(root, current_object_id=query_id)
+    ):
+        provider_evidence_id = f"{payload_id}:query-provider:{index}"
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=provider_id,
+                type=provider_type,
+                evidence_ids=[provider_evidence_id],
+            )
+        )
+        mutable.add_edge(
+            CatalogEdgeRecord(
+                id=provider_evidence_id,
+                source=provider_id,
+                target=query_id,
+                type="provides",
+                confidence="direct",
+                evidence_ids=[provider_evidence_id],
+            )
+        )
+    return mutable.to_catalog()
+
+
+def _ingest_composite_provider_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
+    root = _xml_root(xml)
+    if root is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    fields = _xml_fields(root)
+    hcpr_id = _first_text(fields, "technicalName", "name", "compositeProviderName")
+    if hcpr_id is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    evidence_id = f"{payload_id}:hcpr"
+    mutable = _MutableCatalog()
+    mutable.add_object(
+        CatalogObjectRecord(
+            id=hcpr_id,
+            name=_first_text(fields, "description", "label"),
+            type="HCPR",
+            evidence_ids=[evidence_id],
+        )
+    )
+    for index, provider in enumerate(_composite_input_providers(root)):
+        provider_id = _first_text(provider, "technicalName", "name", "objectName")
+        if provider_id is None:
+            continue
+        provider_type = _first_text(provider, "objectType", "type") or "UNKNOWN"
+        provider_evidence_id = f"{payload_id}:hcpr-input:{index}"
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=provider_id,
+                type=provider_type,
+                evidence_ids=[provider_evidence_id],
+            )
+        )
+        mutable.add_edge(
+            CatalogEdgeRecord(
+                id=provider_evidence_id,
+                source=provider_id,
+                target=hcpr_id,
+                type="composite_input",
+                confidence="direct",
+                evidence_ids=[provider_evidence_id],
             )
         )
     return mutable.to_catalog()
@@ -1479,6 +1927,198 @@ def _payload_items(payload: dict[str, object], keys: tuple[str, ...]) -> list[di
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _source_query_value(source: str, key: str) -> str | None:
+    wanted = key.lower()
+    for raw_key, values in parse_qs(urlparse(source).query).items():
+        if raw_key.lower() == wanted and values:
+            return values[0]
+    return None
+
+
+def _int_value(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _add_edge(
+    mutable: _MutableCatalog,
+    *,
+    payload_id: str,
+    source: str,
+    target: str,
+    edge_type: str,
+    suffix: str,
+) -> None:
+    edge_id = f"{payload_id}:{suffix}:{source}->{target}"
+    mutable.add_edge(
+        CatalogEdgeRecord(
+            id=edge_id,
+            source=source,
+            target=target,
+            type=edge_type,
+            confidence="direct",
+            evidence_ids=[edge_id],
+        )
+    )
+
+
+def _xml_root(xml: str) -> ET.Element[str] | None:
+    try:
+        return ET.fromstring(xml)
+    except ET.ParseError:
+        return None
+
+
+def _datasource_fields(root: ET.Element[str]) -> list[dict[str, object]]:
+    fields: list[dict[str, object]] = []
+    for element in root.iter():
+        if element is root or _local_xml_name(element.tag) != "field":
+            continue
+        item = _xml_fields(element)
+        name = _first_text(item, "name", "technicalName", "fieldName")
+        if name is None:
+            continue
+        record: dict[str, object] = {"name": name}
+        for source_key, target_key in (
+            ("description", "description"),
+            ("type", "type"),
+            ("length", "length"),
+        ):
+            value = _first_text(item, source_key)
+            if value is not None:
+                record[target_key] = value
+        fields.append(record)
+    return fields
+
+
+def _first_xml_child_fields(root: ET.Element[str], *local_names: str) -> dict[str, object]:
+    allowed_names = set(local_names)
+    for element in root.iter():
+        if element is root or _local_xml_name(element.tag) not in allowed_names:
+            continue
+        fields = _xml_fields(element)
+        if fields:
+            return fields
+    return {}
+
+
+def _dtp_overview_object_fields(root: ET.Element[str]) -> dict[str, object]:
+    for overview in root.iter():
+        if _local_xml_name(overview.tag) != "overview":
+            continue
+        for element in list(overview):
+            if _local_xml_name(element.tag) != "object":
+                continue
+            fields = _xml_fields(element)
+            object_name = _first_text(fields, "technicalName", "name", "objectName")
+            if object_name is None:
+                continue
+            object_type = _first_text(fields, "objectType", "type", "tlogo")
+            if object_type is None or object_type.upper() in {"TRFN", "TRANSFORMATION"}:
+                return fields
+    return {}
+
+
+def _related_providers_from_links(
+    root: ET.Element[str],
+    *,
+    current_object_id: str | None = None,
+) -> list[tuple[str, str]]:
+    providers: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    current_object_key = current_object_id.upper() if current_object_id is not None else None
+    for element in root.iter():
+        if _local_xml_name(element.tag) != "link":
+            continue
+        rel = _text(element.attrib.get("rel"))
+        if rel is None or rel.lower() != "related":
+            continue
+        href = _text(element.attrib.get("href"))
+        if href is None:
+            continue
+        provider = _provider_from_href(href)
+        if provider is None or provider in seen:
+            continue
+        provider_id, _provider_type = provider
+        if current_object_key is not None and provider_id.upper() == current_object_key:
+            continue
+        seen.add(provider)
+        providers.append(provider)
+    return providers
+
+
+def _provider_from_href(href: str) -> tuple[str, str] | None:
+    parts = [part for part in urlparse(href).path.split("/") if part]
+    type_by_segment = {
+        "hcpr": "HCPR",
+        "adso": "ADSO",
+        "rsds": "RSDS",
+        "query": "QUERY",
+    }
+    lower_parts = [part.lower() for part in parts]
+    for index, segment in enumerate(lower_parts):
+        provider_type = type_by_segment.get(segment)
+        if provider_type is None or index + 1 >= len(parts):
+            continue
+        return parts[index + 1].upper(), provider_type
+    return None
+
+
+def _composite_input_providers(root: ET.Element[str]) -> list[dict[str, object]]:
+    providers: list[dict[str, object]] = []
+    for element in root.iter():
+        if element is root:
+            continue
+        if _local_xml_name(element.tag) not in {"inputProvider", "provider", "input"}:
+            continue
+        fields = _xml_fields(element)
+        fields = _normalize_composite_provider_fields(fields)
+        if _first_text(fields, "technicalName", "name", "objectName") is not None:
+            providers.append(fields)
+    return providers
+
+
+def _normalize_composite_provider_fields(fields: dict[str, object]) -> dict[str, object]:
+    provider_id = _first_text(fields, "technicalName", "objectName", "name")
+    provider_type = _first_text(fields, "objectType", "type")
+    alias_id, alias_type = _provider_from_input_alias(_first_text(fields, "alias"))
+    normalized = dict(fields)
+    if provider_id is None and alias_id is not None:
+        normalized["name"] = alias_id
+    if provider_type is None and alias_type is not None:
+        normalized["type"] = alias_type
+    return normalized
+
+
+def _provider_from_input_alias(alias: str | None) -> tuple[str | None, str | None]:
+    if alias is None:
+        return None, None
+    prefix, separator, suffix = alias.strip().rpartition(".")
+    if not separator:
+        alias_id = alias.strip().upper()
+        return alias_id or None, None
+    provider_id = prefix.strip().upper() or None
+    provider_type = _provider_type_from_alias_suffix(suffix.strip())
+    return provider_id, provider_type
+
+
+def _provider_type_from_alias_suffix(suffix: str) -> str | None:
+    normalized = suffix.upper()
+    type_by_suffix = {
+        "AD": "ADSO",
+        "ADSO": "ADSO",
+        "CP": "HCPR",
+        "HCPR": "HCPR",
+        "QUERY": "QUERY",
+        "QRY": "QUERY",
+        "RSDS": "RSDS",
+    }
+    return type_by_suffix.get(normalized)
 
 
 def _xml_items(xml: str) -> list[dict[str, object]]:

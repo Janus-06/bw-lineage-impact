@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import bwli.client as client_module
+import bwli.endpoints as endpoints_module
 from bwli.client import ECLIPSE_USER_AGENT, BwClient
 from bwli.endpoints import (
     ACCEPT_HEADERS,
@@ -40,8 +41,17 @@ def test_bw_client_public_surface_is_get_only_read_api() -> None:
         "write",
         "activate",
         "transport",
+        "run",
+        "push",
+        "move",
+        "unlock",
     }
     assert names.isdisjoint(forbidden)
+    assert not {
+        name
+        for name in names
+        if any(token in name.lower().split("_") for token in forbidden)
+    }
     expected = {
         "fetch_search",
         "fetch_dataflow",
@@ -49,6 +59,13 @@ def test_bw_client_public_surface_is_get_only_read_api() -> None:
         "fetch_hcpr",
         "fetch_adso",
         "fetch_repository_contents",
+        "fetch_process_chain",
+        "fetch_process_variant",
+        "fetch_dtp",
+        "fetch_datasource",
+        "fetch_source_system",
+        "fetch_query",
+        "fetch_composite_provider",
     }
     assert expected.issubset(names)
 
@@ -120,6 +137,87 @@ def test_dataflow_endpoint_supports_rsds_source_system_padding() -> None:
     }
 
 
+def test_build_process_chain_endpoint_path_and_accept() -> None:
+    endpoint = endpoints_module.build_process_chain_endpoint("ZCHAIN_SALES")
+
+    assert endpoint.path == "/sap/bw/modeling/rspc/zchain_sales/m"
+    assert endpoint.params == {}
+    assert endpoint.accept == ACCEPT_HEADERS["process_chain"]
+    assert endpoint.accept == "application/vnd.sap.bw4.modeling.processchain-v1_0_0+json"
+
+
+def test_build_process_variant_endpoint_path_and_accept() -> None:
+    endpoint = endpoints_module.build_process_variant_endpoint("ABAP", "ZVAR_SALES")
+
+    assert (
+        endpoint.path
+        == "/sap/bw4/v1/modeling/processtypes/abap/variants/zvar_sales/m"
+    )
+    assert endpoint.params == {}
+    assert endpoint.accept == ACCEPT_HEADERS["process_variant"]
+    assert endpoint.accept == "application/json"
+
+
+def test_build_dtp_endpoint_path_params_and_accept() -> None:
+    endpoint = endpoints_module.build_dtp_endpoint("ZDTP_SALES")
+
+    assert endpoint.path == "/sap/bw/modeling/dtpa/zdtp_sales/m"
+    assert endpoint.params == {"forceCacheUpdate": "true"}
+    assert endpoint.accept == ACCEPT_HEADERS["dtp"]
+    assert endpoint.accept == "application/vnd.sap.bw.modeling.dtpa-v1_0_0+xml"
+
+
+def test_build_datasource_endpoint_path_and_accept() -> None:
+    endpoint = endpoints_module.build_datasource_endpoint("ZDS_SALES", "s4h")
+
+    assert endpoint.path == "/sap/bw/modeling/rsds/ZDS_SALES/S4H/m"
+    assert endpoint.params == {}
+    assert endpoint.accept == ACCEPT_HEADERS["datasource"]
+    assert (
+        endpoint.accept
+        == "application/vnd.sap.bw.modeling.rsds-v1_0_0+xml, "
+        "application/vnd.sap.bw.modeling.rsds-v1_1_0+xml"
+    )
+
+
+def test_build_source_system_endpoint_path_and_accept() -> None:
+    endpoint = endpoints_module.build_source_system_endpoint("S4H")
+
+    assert endpoint.path == "/sap/bw/modeling/lsys/s4h/a"
+    assert endpoint.params == {}
+    assert endpoint.accept == ACCEPT_HEADERS["source_system"]
+    assert (
+        endpoint.accept
+        == "application/vnd.sap.bw.modeling.lsys-v1_0_0+xml, "
+        "application/vnd.sap.bw.modeling.lsys-v1_1_0+xml"
+    )
+
+
+def test_build_query_endpoint_path_and_versioned_accept() -> None:
+    active = endpoints_module.build_query_endpoint("ZQ_SALES")
+    inactive = endpoints_module.build_query_endpoint("ZQ_SALES", active=False)
+
+    assert active.path == "/sap/bw/modeling/query/zq_sales/a"
+    assert inactive.path == "/sap/bw/modeling/query/zq_sales/m"
+    assert active.params == {}
+    assert inactive.params == {}
+    assert active.accept == ACCEPT_HEADERS["query"]
+    assert active.accept == inactive.accept
+    for version in ("v1_8_0", "v1_9_0", "v1_10_0", "v1_11_0"):
+        assert f"application/vnd.sap.bw.modeling.query-{version}+xml" in active.accept
+
+
+def test_build_composite_provider_endpoint_aliases_hcpr() -> None:
+    endpoint = endpoints_module.build_composite_provider_endpoint("ZCP_SALES")
+    hcpr = build_hcpr_endpoint("ZCP_SALES")
+
+    assert endpoint == hcpr
+    assert endpoint.path == "/sap/bw/modeling/hcpr/zcp_sales/m"
+    assert endpoint.accept == ACCEPT_HEADERS["hcpr"]
+    for version in ("v1_0_0", "v1_10_0", "v1_15_0", "v9_99_9"):
+        assert f"application/vnd.sap.bw.modeling.hcpr-{version}+xml" in endpoint.accept
+
+
 def test_bw_client_fetch_uses_http_get_only() -> None:
     seen_methods: list[str] = []
     seen_paths: list[str] = []
@@ -160,10 +258,17 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
         assert client.fetch_hcpr("ZSALES") == {"ok": True}
         assert client.fetch_adso("ZSALES_ADSO") == {"ok": True}
         assert client.fetch_repository_contents("InfoArea/ZSALES") == {"ok": True}
+        assert client.fetch_process_chain("ZCHAIN_SALES") == {"ok": True}
+        assert client.fetch_process_variant("ABAP", "ZVAR_SALES") == {"ok": True}
+        assert client.fetch_dtp("ZDTP_SALES") == {"ok": True}
+        assert client.fetch_datasource("ZDS_SALES", "S4H") == {"ok": True}
+        assert client.fetch_source_system("S4H") == {"ok": True}
+        assert client.fetch_query("ZQ_SALES") == {"ok": True}
+        assert client.fetch_composite_provider("ZCP_SALES") == {"ok": True}
     finally:
         client.close()
 
-    assert seen_methods == ["GET", "GET", "GET", "GET", "GET", "GET", "GET"]
+    assert seen_methods == ["GET"] * 14
     assert seen_paths == [
         "/sap/bw/modeling/repo/is/systeminfo",
         "/sap/bw/modeling/repo/is/bwsearch",
@@ -172,6 +277,13 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
         "/sap/bw/modeling/hcpr/zsales/m",
         "/sap/bw/modeling/adso/zsales_adso/m",
         "/sap/bw/modeling/repo/infoproviderstructure/infoarea/zsales",
+        "/sap/bw/modeling/rspc/zchain_sales/m",
+        "/sap/bw4/v1/modeling/processtypes/abap/variants/zvar_sales/m",
+        "/sap/bw/modeling/dtpa/zdtp_sales/m",
+        "/sap/bw/modeling/rsds/ZDS_SALES/S4H/m",
+        "/sap/bw/modeling/lsys/s4h/a",
+        "/sap/bw/modeling/query/zq_sales/a",
+        "/sap/bw/modeling/hcpr/zcp_sales/m",
     ]
     assert seen_accepts == [
         "application/xml",
@@ -181,6 +293,13 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
         ACCEPT_HEADERS["hcpr"],
         ACCEPT_HEADERS["adso"],
         ACCEPT_HEADERS["repository"],
+        ACCEPT_HEADERS["process_chain"],
+        ACCEPT_HEADERS["process_variant"],
+        ACCEPT_HEADERS["dtp"],
+        ACCEPT_HEADERS["datasource"],
+        ACCEPT_HEADERS["source_system"],
+        ACCEPT_HEADERS["query"],
+        ACCEPT_HEADERS["hcpr"],
     ]
     assert seen_queries[2]["objecttype"] == "HCPR"
     assert seen_queries[2]["objectname"] == "ZSALES"
@@ -188,6 +307,50 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
     assert seen_queries[3]["objectType"] == "ADSO"
     assert seen_queries[3]["objectName"] == "ZSALES"
     assert "direction" not in seen_queries[3]
+    assert seen_queries[9] == {"forceCacheUpdate": "true"}
+
+
+def test_bw_client_fetch_query_falls_back_to_inactive_metadata_on_404() -> None:
+    seen_paths: list[str] = []
+    seen_methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        seen_methods.append(request.method)
+        if request.url.path == "/sap/bw/modeling/repo/is/systeminfo":
+            return httpx.Response(
+                200,
+                text="<systeminfo />",
+                headers={"x-csrf-token": "csrf-token"},
+            )
+        if request.url.path.endswith("/a"):
+            return httpx.Response(404, text="active query not found")
+        return httpx.Response(
+            200,
+            text='<Qry:queryResource technicalName="ZQ_SALES" />',
+            headers={"content-type": ACCEPT_HEADERS["query"]},
+        )
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username="fixture-user",
+        password="[REDACTED]",
+        sap_client="100",
+        language="EN",
+        transport=httpx.MockTransport(handler),
+    )
+
+    try:
+        assert client.fetch_query("ZQ_SALES") == '<Qry:queryResource technicalName="ZQ_SALES" />'
+    finally:
+        client.close()
+
+    assert seen_methods == ["GET", "GET", "GET"]
+    assert seen_paths == [
+        "/sap/bw/modeling/repo/is/systeminfo",
+        "/sap/bw/modeling/query/zq_sales/a",
+        "/sap/bw/modeling/query/zq_sales/m",
+    ]
 
 
 def test_bw_client_fetch_sends_eclipse_adt_headers() -> None:

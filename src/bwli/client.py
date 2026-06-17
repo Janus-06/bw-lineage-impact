@@ -13,10 +13,17 @@ from bwli.endpoints import (
     DataflowDirection,
     Endpoint,
     build_adso_endpoint,
+    build_composite_provider_endpoint,
     build_dataflow_endpoint,
+    build_datasource_endpoint,
+    build_dtp_endpoint,
     build_hcpr_endpoint,
+    build_process_chain_endpoint,
+    build_process_variant_endpoint,
+    build_query_endpoint,
     build_repository_contents_endpoint,
     build_search_endpoint,
+    build_source_system_endpoint,
     build_xref_endpoint,
 )
 
@@ -122,16 +129,66 @@ class BwClient:
     def fetch_repository_contents(self, path: str | None = None) -> Any:
         return self._fetch(build_repository_contents_endpoint(path))
 
+    def fetch_process_chain(self, chain_name: str) -> Any:
+        return self._fetch(build_process_chain_endpoint(chain_name))
+
+    def fetch_process_variant(self, process_type: str, variant_name: str) -> Any:
+        return self._fetch(build_process_variant_endpoint(process_type, variant_name))
+
+    def fetch_dtp(self, dtp_name: str) -> Any:
+        return self._fetch(build_dtp_endpoint(dtp_name))
+
+    def fetch_datasource(self, datasource_name: str, source_system: str) -> Any:
+        return self._fetch(build_datasource_endpoint(datasource_name, source_system))
+
+    def fetch_source_system(self, source_system: str) -> Any:
+        return self._fetch(build_source_system_endpoint(source_system))
+
+    def fetch_query(self, query_name: str) -> Any:
+        return self._fetch_with_fallback(
+            [
+                build_query_endpoint(query_name, active=True),
+                build_query_endpoint(query_name, active=False),
+            ],
+            fallback_statuses={404},
+        )
+
+    def fetch_composite_provider(self, object_name: str) -> Any:
+        return self._fetch(build_composite_provider_endpoint(object_name))
+
     def close(self) -> None:
         self._client.close()
 
     def _fetch(self, endpoint: Endpoint) -> Any:
+        return self._fetch_with_fallback([endpoint], fallback_statuses=set())
+
+    def _fetch_with_fallback(
+        self,
+        endpoints: list[Endpoint],
+        *,
+        fallback_statuses: set[int],
+    ) -> Any:
         self._ensure_session()
+        response: httpx.Response | None = None
+        for index, endpoint in enumerate(endpoints):
+            response = self._request_read_with_auth_retry(endpoint)
+            is_last = index == len(endpoints) - 1
+            if not is_last and response.status_code in fallback_statuses:
+                continue
+            break
+        if response is None:
+            raise RuntimeError("no BW endpoint was requested")
+        return self._response_payload(response)
+
+    def _request_read_with_auth_retry(self, endpoint: Endpoint) -> httpx.Response:
         response = self._request_read(endpoint)
-        if response.status_code in _AUTH_RETRY_STATUSES:
-            self._clear_session()
-            self._ensure_session()
-            response = self._request_read(endpoint)
+        if response.status_code not in _AUTH_RETRY_STATUSES:
+            return response
+        self._clear_session()
+        self._ensure_session()
+        return self._request_read(endpoint)
+
+    def _response_payload(self, response: httpx.Response) -> Any:
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
         if "json" in content_type.lower():
