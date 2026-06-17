@@ -6,7 +6,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from bwli.fingerprint import object_fingerprint
+from bwli.graph import BwGraph
 
 
 class PayloadMetadata(BaseModel):
@@ -16,6 +19,7 @@ class PayloadMetadata(BaseModel):
     relative_path: str
     sha256: str
     size_bytes: int
+    object_fingerprints: dict[str, str] | None = None
 
 
 class SnapshotManifest(BaseModel):
@@ -58,12 +62,13 @@ class SnapshotWriter:
             relative_path=relative_path,
             sha256=hashlib.sha256(encoded).hexdigest(),
             size_bytes=len(encoded),
+            object_fingerprints=_object_fingerprints_for_payload(payload),
         )
 
     def write_manifest(self, *, mode: str, payloads: list[PayloadMetadata]) -> SnapshotManifest:
         manifest = SnapshotManifest(mode=mode, payloads=payloads)
         path = self.out_dir / "manifest.json"
-        path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+        path.write_text(manifest.model_dump_json(indent=2, exclude_none=True), encoding="utf-8")
         return manifest
 
 
@@ -120,3 +125,20 @@ def _ensure_relative(relative_path: str) -> None:
     path = Path(relative_path)
     if path.is_absolute() or ".." in path.parts:
         raise ValueError(f"unsafe snapshot relative path: {relative_path}")
+
+
+def _object_fingerprints_for_payload(payload: Any) -> dict[str, str] | None:
+    graph: BwGraph
+    if isinstance(payload, BwGraph):
+        graph = payload
+    elif isinstance(payload, dict) and "nodes" in payload and "edges" in payload:
+        try:
+            graph = BwGraph.model_validate(payload)
+        except ValidationError:
+            return None
+    else:
+        return None
+    return {
+        node.id: object_fingerprint(node)
+        for node in sorted(graph.nodes, key=lambda node: node.id)
+    }

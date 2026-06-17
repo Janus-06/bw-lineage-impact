@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
-from bwli.snapshot import SnapshotReader, SnapshotWriter, write_fixture_snapshot
+from bwli.fingerprint import object_fingerprint
+from bwli.graph import BwNode
+from bwli.snapshot import (
+    PayloadMetadata,
+    SnapshotManifest,
+    SnapshotReader,
+    SnapshotWriter,
+    write_fixture_snapshot,
+)
 
 
 def test_snapshot_writer_reader_round_trip(tmp_path) -> None:
@@ -87,3 +96,49 @@ def test_snapshot_reader_keeps_backward_compat_with_json_encoded_xml(tmp_path) -
     reader = SnapshotReader(out_dir)
     loaded = reader.read_payload(metadata)
     assert loaded == legacy_xml
+
+
+def test_snapshot_writer_stores_object_fingerprints_for_graph_payload(tmp_path) -> None:
+    writer = SnapshotWriter(tmp_path / "snap")
+    graph_payload = {"nodes": [{"id": "A", "type": "ADSO"}], "edges": []}
+
+    metadata = writer.write_payload(
+        payload_id="graph",
+        kind="graph",
+        source="fixture://graph.json",
+        payload=graph_payload,
+    )
+    manifest = writer.write_manifest(mode="offline-fixture", payloads=[metadata])
+
+    stored = (tmp_path / "snap" / metadata.relative_path).read_bytes()
+    expected_fingerprint = object_fingerprint(BwNode(id="A", type="ADSO"))
+
+    assert metadata.sha256 == hashlib.sha256(stored).hexdigest()
+    assert metadata.object_fingerprints == {"A": expected_fingerprint}
+    assert manifest.payloads[0].object_fingerprints == {"A": expected_fingerprint}
+    assert json.loads((tmp_path / "snap" / "manifest.json").read_text(encoding="utf-8"))[
+        "payloads"
+    ][0]["object_fingerprints"] == {"A": expected_fingerprint}
+
+
+def test_payload_metadata_accepts_manifests_with_and_without_object_fingerprints() -> None:
+    legacy_payload = {
+        "payload_id": "graph",
+        "kind": "graph",
+        "source": "fixture://graph.json",
+        "relative_path": "payloads/graph.json",
+        "sha256": "a" * 64,
+        "size_bytes": 42,
+    }
+
+    legacy = PayloadMetadata.model_validate(legacy_payload)
+    enriched = PayloadMetadata.model_validate(
+        {**legacy_payload, "object_fingerprints": {"A": "b" * 64}}
+    )
+    manifest = SnapshotManifest.model_validate(
+        {"mode": "offline-fixture", "payloads": [legacy_payload]}
+    )
+
+    assert legacy.object_fingerprints is None
+    assert enriched.object_fingerprints == {"A": "b" * 64}
+    assert manifest.payloads[0].object_fingerprints is None
