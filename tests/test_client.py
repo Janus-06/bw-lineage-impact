@@ -15,7 +15,9 @@ from bwli.endpoints import (
     ACCEPT_HEADERS,
     build_adso_endpoint,
     build_dataflow_endpoint,
+    build_get_request_endpoint,
     build_hcpr_endpoint,
+    build_list_requests_endpoint,
     build_repository_contents_endpoint,
     build_search_endpoint,
     build_xref_endpoint,
@@ -66,8 +68,33 @@ def test_bw_client_public_surface_is_get_only_read_api() -> None:
         "fetch_source_system",
         "fetch_query",
         "fetch_composite_provider",
+        "fetch_list_requests",
+        "fetch_request",
     }
     assert expected.issubset(names)
+
+
+def test_run_dtp_and_activate_request_absent_from_surface() -> None:
+    names = set(public_method_names(BwClient))
+
+    forbidden_terms = (
+        "run_dtp",
+        "activate_request",
+        "activate",
+        "transport",
+        "push",
+        "write",
+        "post",
+        "put",
+        "patch",
+        "delete",
+    )
+
+    assert not [
+        name
+        for name in names
+        if any(term in name.lower() for term in forbidden_terms)
+    ]
 
 
 def test_endpoint_builders_use_expected_read_only_paths() -> None:
@@ -218,6 +245,41 @@ def test_build_composite_provider_endpoint_aliases_hcpr() -> None:
         assert f"application/vnd.sap.bw.modeling.hcpr-{version}+xml" in endpoint.accept
 
 
+def test_endpoints_get_only_for_runtime_request_monitor() -> None:
+    capped = build_list_requests_endpoint("ZADSO_SALES", target_type="ADSO", top=999)
+    defaulted = build_list_requests_endpoint("ZADSO_SALES", target_type="ADSO", top=0)
+    bounded = build_list_requests_endpoint(
+        "ZADSO_SALES",
+        target_type="HCPR",
+        top=5,
+        created_from="2026-01-01T00:00:00Z",
+    )
+    request = build_get_request_endpoint("REQ TSN", storage="AX")
+
+    assert capped.path == "/sap/bc/http/sap/bw4/v1/manage/requests"
+    assert capped.params["tlogo"] == "adso"
+    assert capped.params["datatarget"] == "zadso_sales"
+    assert capped.params["storage"] == "AQ,AX,AT"
+    assert capped.params["latestrequests"] == 20
+    assert capped.params["top"] == 20
+    assert capped.params["status"] == "N,GG,GR,YG,RR,YR,RG,U,Y,X"
+    assert capped.accept == "*/*"
+    assert capped.headers == {"Content-Type": "application/json"}
+
+    assert defaulted.params["latestrequests"] == 3
+    assert defaulted.params["top"] == 3
+
+    assert bounded.params["tlogo"] == "hcpr"
+    assert bounded.params["createdfrom"] == "2026-01-01T00:00:00Z"
+    assert "latestrequests" not in bounded.params
+    assert bounded.params["top"] == 5
+
+    assert request.path == "/sap/bc/http/sap/bw4/v1/manage/requests/REQ%20TSN/ax"
+    assert request.params == {}
+    assert request.accept == "*/*"
+    assert request.headers == {"Content-Type": "application/json"}
+
+
 def test_bw_client_fetch_uses_http_get_only() -> None:
     seen_methods: list[str] = []
     seen_paths: list[str] = []
@@ -308,6 +370,60 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
     assert seen_queries[3]["objectName"] == "ZSALES"
     assert "direction" not in seen_queries[3]
     assert seen_queries[9] == {"forceCacheUpdate": "true"}
+
+
+def test_fetch_list_requests_get_only_with_top_cap() -> None:
+    seen_methods: list[str] = []
+    seen_paths: list[str] = []
+    seen_queries: list[dict[str, str]] = []
+    seen_headers: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_methods.append(request.method)
+        seen_paths.append(request.url.path)
+        seen_queries.append(dict(request.url.params.multi_items()))
+        seen_headers.append(request.headers)
+        if request.url.path == "/sap/bw/modeling/repo/is/systeminfo":
+            return httpx.Response(
+                200,
+                text="<systeminfo />",
+                headers={"x-csrf-token": "csrf-token"},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username="fixture-user",
+        password="[REDACTED]",
+        sap_client="100",
+        language="EN",
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+
+    try:
+        assert client.fetch_list_requests("ZADSO_SALES", top=999) == {"ok": True}
+        assert client.fetch_request("REQ_TSN", storage="AX") == {"ok": True}
+    finally:
+        client.close()
+
+    assert seen_methods == ["GET", "GET", "GET"]
+    assert seen_paths == [
+        "/sap/bw/modeling/repo/is/systeminfo",
+        "/sap/bc/http/sap/bw4/v1/manage/requests",
+        "/sap/bc/http/sap/bw4/v1/manage/requests/REQ_TSN/ax",
+    ]
+    list_query = seen_queries[1]
+    assert list_query["tlogo"] == "adso"
+    assert list_query["datatarget"] == "zadso_sales"
+    assert list_query["storage"] == "AQ,AX,AT"
+    assert list_query["latestrequests"] == "20"
+    assert list_query["top"] == "20"
+    assert list_query["status"] == "N,GG,GR,YG,RR,YR,RG,U,Y,X"
+    assert seen_headers[1]["accept"] == "*/*"
+    assert seen_headers[1]["content-type"] == "application/json"
+    assert seen_headers[2]["accept"] == "*/*"
+    assert seen_headers[2]["content-type"] == "application/json"
 
 
 def test_bw_client_fetch_query_falls_back_to_inactive_metadata_on_404() -> None:

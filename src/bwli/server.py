@@ -21,7 +21,11 @@ from bwli import __version__
 from bwli.client import BwClient
 from bwli.config import ConfigError, LlmRuntimeConfig, validate_local_llm_base_url
 from bwli.dataflow import DataflowOutputFormat, render_dataflow
-from bwli.endpoints import DataflowDirection
+from bwli.endpoints import (
+    REQUEST_MONITOR_TOP_CAP,
+    REQUEST_MONITOR_TOP_DEFAULT,
+    DataflowDirection,
+)
 from bwli.field_lineage import (
     SqlParseResult,
     load_text,
@@ -310,6 +314,12 @@ class LiveCollectRequest(BaseModel):
     object_names: list[str] = Field(default_factory=list)
     include_dataflow: bool = True
     include_xref: bool = True
+    include_request_freshness: bool = False
+    request_freshness_top: int = Field(
+        default=REQUEST_MONITOR_TOP_DEFAULT,
+        ge=1,
+        le=REQUEST_MONITOR_TOP_CAP,
+    )
     xref_direction: Literal["upstream", "downstream"] = "downstream"
     object_type: str = "ADSO"
     source_system: str | None = None
@@ -387,6 +397,12 @@ class V1SnapshotCaptureRequest(BaseModel):
     object_names: list[str] = Field(default_factory=list)
     include_dataflow: bool = True
     include_xref: bool = True
+    include_request_freshness: bool = False
+    request_freshness_top: int = Field(
+        default=REQUEST_MONITOR_TOP_DEFAULT,
+        ge=1,
+        le=REQUEST_MONITOR_TOP_CAP,
+    )
     xref_direction: Literal["upstream", "downstream"] = "downstream"
     object_type: str = "ADSO"
     source_system: str | None = None
@@ -779,6 +795,24 @@ def create_app(
             limit=max(1, min(limit, 100)),
         )
 
+    @app.get("/api/v1/snapshots/{snapshot_id}/objects/{object_id:path}/freshness")
+    def get_snapshot_object_freshness_v1(
+        snapshot_id: str,
+        object_id: str,
+    ) -> dict[str, object]:
+        if catalog_store.get_snapshot(snapshot_id) is None:
+            raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
+        item = catalog_store.get_object(snapshot_id, object_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"object not found: {object_id}")
+        freshness = item.metadata.get("request_freshness")
+        if not isinstance(freshness, dict):
+            raise HTTPException(
+                status_code=404,
+                detail=f"request_freshness not found for object: {object_id}",
+            )
+        return cast(dict[str, object], freshness)
+
     @app.get("/api/v1/snapshots/{snapshot_id}/objects/{object_id:path}")
     def get_snapshot_object_v1(snapshot_id: str, object_id: str) -> dict[str, object]:
         item = catalog_store.get_object(snapshot_id, object_id)
@@ -986,6 +1020,8 @@ def create_app(
                 object_names=request.object_names,
                 include_dataflow=request.include_dataflow,
                 include_xref=request.include_xref,
+                include_request_freshness=request.include_request_freshness,
+                request_freshness_top=request.request_freshness_top,
                 dataflow_object_type=request.object_type,
                 dataflow_source_system=request.source_system,
                 dataflow_direction=request.dataflow_direction,
@@ -1707,6 +1743,8 @@ def _capture_v1_snapshot(
         object_names=object_names,
         include_dataflow=request.include_dataflow,
         include_xref=request.include_xref,
+        include_request_freshness=request.include_request_freshness,
+        request_freshness_top=request.request_freshness_top,
         dataflow_object_type=object_type,
         dataflow_source_system=source_system,
         dataflow_direction=request.dataflow_direction,
@@ -1742,6 +1780,8 @@ def _capture_v1_snapshot(
             xref_direction=request.xref_direction,
             include_dataflow=request.include_dataflow,
             include_xref=request.include_xref,
+            include_request_freshness=request.include_request_freshness,
+            request_freshness_top=request.request_freshness_top,
             operations=result.operations,
         ),
         *_discovered_scope_entries(ingested.objects),
@@ -1770,11 +1810,16 @@ def _build_refresh_capture_request(
     object_names = _unique_texts([entry.object_id for entry in selected])
     include_dataflow = any(entry.operation == "bw_get_dataflow" for entry in selected)
     include_xref = any(entry.operation == "bw_xref" for entry in selected)
+    include_request_freshness = any(
+        entry.operation in {"bw_list_requests", "bw_get_request"} for entry in selected
+    )
     return V1SnapshotCaptureRequest(
         confirm_read_only=confirm_read_only,
         object_names=object_names,
         include_dataflow=include_dataflow,
         include_xref=include_xref,
+        include_request_freshness=include_request_freshness,
+        request_freshness_top=_selected_request_freshness_top(selected),
         xref_direction=_selected_xref_direction(selected),
         object_type=_selected_object_type(selected),
         source_system=_selected_metadata_text(selected, "source_system"),
@@ -1819,6 +1864,8 @@ def _selected_scope_entries(
     xref_direction: Literal["upstream", "downstream"],
     include_dataflow: bool,
     include_xref: bool,
+    include_request_freshness: bool,
+    request_freshness_top: int,
     operations: Sequence[object],
 ) -> list[CaptureScopeRecord]:
     entries: list[CaptureScopeRecord] = []
@@ -1827,6 +1874,7 @@ def _selected_scope_entries(
         dataflow_direction=dataflow_direction,
         dataflow_levels=dataflow_levels,
         xref_direction=xref_direction,
+        request_freshness_top=request_freshness_top,
     )
     for object_name in _unique_texts(object_names):
         if include_dataflow:
@@ -1845,6 +1893,25 @@ def _selected_scope_entries(
                     object_name,
                     object_type=object_type,
                     operation="bw_xref",
+                    operations=operations,
+                    capture_metadata=capture_metadata,
+                )
+            )
+        if include_request_freshness:
+            entries.append(
+                _scope_entry_from_operations(
+                    object_name,
+                    object_type=object_type,
+                    operation="bw_list_requests",
+                    operations=operations,
+                    capture_metadata=capture_metadata,
+                )
+            )
+            entries.append(
+                _scope_entry_from_operations(
+                    object_name,
+                    object_type=object_type,
+                    operation="bw_get_request",
                     operations=operations,
                     capture_metadata=capture_metadata,
                 )
@@ -1961,11 +2028,13 @@ def _capture_scope_metadata(
     dataflow_direction: DataflowDirection,
     dataflow_levels: int,
     xref_direction: Literal["upstream", "downstream"],
+    request_freshness_top: int = REQUEST_MONITOR_TOP_DEFAULT,
 ) -> dict[str, object]:
     metadata: dict[str, object] = {
         "dataflow_direction": dataflow_direction,
         "dataflow_levels": dataflow_levels,
         "xref_direction": xref_direction,
+        "request_freshness_top": request_freshness_top,
     }
     if source_system:
         metadata["source_system"] = source_system
@@ -2039,6 +2108,28 @@ def _selected_dataflow_levels(selected: Sequence[CaptureScopeRecord]) -> int:
             "snapshot selected capture scope uses mixed dataflow level values; rerun live fetch"
         )
     return unique[0] if unique else 3
+
+
+def _selected_request_freshness_top(selected: Sequence[CaptureScopeRecord]) -> int:
+    values: list[int] = []
+    for entry in selected:
+        value = entry.metadata.get("request_freshness_top")
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, int):
+            values.append(value)
+            continue
+        if isinstance(value, str) and value.strip().isdigit():
+            values.append(int(value.strip()))
+    unique = sorted(set(values))
+    if len(unique) > 1:
+        raise ValueError(
+            "snapshot selected capture scope uses mixed request freshness top values; "
+            "rerun live fetch"
+        )
+    if not unique:
+        return REQUEST_MONITOR_TOP_DEFAULT
+    return max(1, min(unique[0], REQUEST_MONITOR_TOP_CAP))
 
 
 def _project_relative_path(root: Path, path: Path) -> str:

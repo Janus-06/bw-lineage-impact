@@ -540,6 +540,94 @@ def test_ingest_manifest_composite_provider_xml_reads_view_node_input_alias(
     ]
 
 
+def test_request_list_detail_ingest_attaches_request_freshness_deterministically(
+    tmp_path: Path,
+) -> None:
+    writer = SnapshotWriter(tmp_path)
+    graph = writer.write_payload(
+        payload_id="graph",
+        kind="graph",
+        source="fixture://graph",
+        payload={
+            "nodes": [{"id": "ZADSO_SALES", "type": "ADSO", "name": "Sales ADSO"}],
+            "edges": [],
+        },
+    )
+    request_list = writer.write_payload(
+        payload_id="requests",
+        kind="bw_list_requests",
+        source="bw://bw_list_requests?objectName=ZADSO_SALES&objectType=ADSO&top=2",
+        payload=[
+            {
+                "requestTsn": "TSN_OLD",
+                "requestTsnExternal": "REQ_OLD",
+                "storage": "AQ",
+                "requestStatus": "R",
+                "lastProcessStatus": "R",
+                "records": 1,
+                "lastTimeStamp": "2026-06-16T12:00:00Z",
+            },
+            {
+                "requestTsn": "TSN_NEW",
+                "requestTsnExternal": "REQ_NEW",
+                "storage": "AQ",
+                "requestStatus": "G",
+                "lastProcessStatus": "G",
+                "records": 42,
+                "lastTimeStamp": "2026-06-17T12:00:00Z",
+            },
+        ],
+    )
+    request_detail = writer.write_payload(
+        payload_id="request-detail",
+        kind="bw_get_request",
+        source=(
+            "bw://bw_get_request?objectName=ZADSO_SALES&objectType=ADSO"
+            "&requestTsn=TSN_NEW&storage=AQ"
+        ),
+        payload={
+            "requestTsn": "TSN_NEW",
+            "requestTsnExternal": "REQ_NEW",
+            "storage": "AQ",
+            "requestStatus": "G",
+            "lastProcessStatus": "G",
+            "records": 43,
+            "lastTimeStamp": "2026-06-17T12:05:00Z",
+            "lastAction": "LOAD",
+        },
+    )
+    writer.write_manifest(
+        mode="live-read-only",
+        payloads=[graph, request_list, request_detail],
+    )
+
+    _, catalog = ingest_manifest(tmp_path / "manifest.json")
+
+    objects = {item.id: item for item in catalog.objects}
+    provider = objects["ZADSO_SALES"]
+    assert provider.type == "ADSO"
+    assert provider.name == "Sales ADSO"
+    freshness = provider.metadata["request_freshness"]
+    assert freshness["target"] == "ZADSO_SALES"
+    assert freshness["target_type"] == "ADSO"
+    assert freshness["latest"] == {
+        "request_tsn": "TSN_NEW",
+        "tsn": "REQ_NEW",
+        "storage": "AQ",
+        "status": "G",
+        "last_process_status": "G",
+        "last_action": "LOAD",
+        "records": 43,
+        "timestamp": "2026-06-17T12:05:00Z",
+    }
+    assert [item["request_tsn"] for item in freshness["requests"]] == [
+        "TSN_NEW",
+        "TSN_OLD",
+    ]
+    assert "requests:request-list" in provider.evidence_ids
+    assert "request-detail:request-detail" in provider.evidence_ids
+
+
 def test_ingest_manifest_indexes_top_level_search_array_payload(tmp_path: Path) -> None:
     manifest_path = _write_manifest_payload(
         tmp_path,

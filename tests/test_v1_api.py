@@ -675,6 +675,92 @@ def test_v1_snapshot_objects_rejects_malformed_cursor(
     assert "cursor" in response.json()["detail"]
 
 
+def test_freshness_endpoint_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "bwli-home"
+    monkeypatch.setenv("BWLI_HOME", str(home))
+    store = CatalogStore(home / "catalog.sqlite")
+    snapshot = store.create_snapshot(mode="test", source="fixture://freshness")
+    freshness = {
+        "target": "ZADSO_SALES",
+        "target_type": "ADSO",
+        "latest": {
+            "request_tsn": "TSN_NEW",
+            "tsn": "REQ_NEW",
+            "status": "G",
+            "records": 43,
+            "timestamp": "2026-06-17T12:05:00Z",
+        },
+    }
+    bic_freshness = {
+        "target": "/BIC/ZADSO",
+        "target_type": "ADSO",
+        "latest": {
+            "request_tsn": "TSN_BIC",
+            "tsn": "REQ_BIC",
+            "status": "G",
+            "records": 7,
+            "timestamp": "2026-06-17T12:10:00Z",
+        },
+    }
+    store.replace_catalog(
+        snapshot.id,
+        objects=[
+            {
+                "id": "ZADSO_SALES",
+                "type": "ADSO",
+                "metadata": {"request_freshness": freshness},
+                "evidence_ids": ["request-detail:request-detail"],
+            },
+            {
+                "id": "/BIC/ZADSO",
+                "type": "ADSO",
+                "metadata": {"request_freshness": bic_freshness},
+                "evidence_ids": ["request-detail:bic-request-detail"],
+            },
+            {"id": "ZNO_FRESHNESS", "type": "ADSO"},
+        ],
+        edges=[],
+    )
+    client = TestClient(create_app(project_root=tmp_path))
+    path = f"/api/v1/snapshots/{snapshot.id}/objects/ZADSO_SALES/freshness"
+
+    response = client.get(path)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == freshness
+
+    bic_response = client.get(
+        f"/api/v1/snapshots/{snapshot.id}/objects/%2FBIC%2FZADSO/freshness"
+    )
+    assert bic_response.status_code == 200, bic_response.text
+    assert bic_response.json() == bic_freshness
+
+    for method in (client.post, client.put, client.patch, client.delete):
+        mutating = method(path)
+        assert mutating.status_code == 405
+
+    missing_freshness = client.get(
+        f"/api/v1/snapshots/{snapshot.id}/objects/ZNO_FRESHNESS/freshness"
+    )
+    assert missing_freshness.status_code == 404
+    assert "request_freshness" in missing_freshness.text
+
+    missing_object = client.get(
+        f"/api/v1/snapshots/{snapshot.id}/objects/ZMISSING/freshness"
+    )
+    assert missing_object.status_code == 404
+    assert "object not found" in missing_object.text
+
+    missing_snapshot = client.get(
+        "/api/v1/snapshots/snap-missing/objects/ZADSO_SALES/freshness"
+    )
+    assert missing_snapshot.status_code == 404
+    assert "snapshot not found" in missing_snapshot.text
+
+
 def test_v1_bounded_lineage_reports_caps_omissions_and_cycles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
