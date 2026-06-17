@@ -2,14 +2,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import quote
+
+_QUERY_ACCEPT = (
+    "application/vnd.sap.bw.modeling.query-v1_8_0+xml, "
+    "application/vnd.sap.bw.modeling.query-v1_9_0+xml, "
+    "application/vnd.sap.bw.modeling.query-v1_10_0+xml, "
+    "application/vnd.sap.bw.modeling.query-v1_11_0+xml"
+)
+
+_HCPR_ACCEPT = ",".join(
+    [
+        "application/vnd.sap.bw.modeling.hcpr-v1_0_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_4_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_7_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_8_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_9_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_10_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_11_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_12_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_13_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_14_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v1_15_0+xml",
+        "application/vnd.sap.bw.modeling.hcpr-v9_99_9+xml",
+    ]
+)
 
 ACCEPT_HEADERS: dict[str, str] = {
     "search": "application/atom+xml;type=feed",
     "xref": "application/xml, application/atom+xml;type=feed",
     "dataflow": "application/vnd.sap.bw.modeling.dmod-v1_0_0+xml",
-    "hcpr": "application/vnd.sap.bw.modeling.hcpr-v1_15_0+xml",
+    "hcpr": _HCPR_ACCEPT,
     "adso": "application/vnd.sap.bw.modeling.adso-v1_5_0+xml",
     "repository": "application/atom+xml",
+    "process_chain": "application/vnd.sap.bw4.modeling.processchain-v1_0_0+json",
+    "process_variant": "application/json",
+    "dtp": "application/vnd.sap.bw.modeling.dtpa-v1_0_0+xml",
+    "datasource": (
+        "application/vnd.sap.bw.modeling.rsds-v1_0_0+xml, "
+        "application/vnd.sap.bw.modeling.rsds-v1_1_0+xml"
+    ),
+    "source_system": (
+        "application/vnd.sap.bw.modeling.lsys-v1_0_0+xml, "
+        "application/vnd.sap.bw.modeling.lsys-v1_1_0+xml"
+    ),
+    "query": _QUERY_ACCEPT,
 }
 
 DataflowDirection = Literal["upwards", "downwards", "both"]
@@ -120,6 +157,65 @@ def build_repository_contents_endpoint(path: str | None = None) -> Endpoint:
     )
 
 
+def build_process_chain_endpoint(chain_name: str) -> Endpoint:
+    return Endpoint(
+        path=f"/sap/bw/modeling/rspc/{_url_lower(chain_name)}/m",
+        params={},
+        accept=ACCEPT_HEADERS["process_chain"],
+    )
+
+
+def build_process_variant_endpoint(process_type: str, variant_name: str) -> Endpoint:
+    return Endpoint(
+        path=(
+            "/sap/bw4/v1/modeling/processtypes/"
+            f"{_url_lower(process_type)}/variants/{_url_lower(variant_name)}/m"
+        ),
+        params={},
+        accept=ACCEPT_HEADERS["process_variant"],
+    )
+
+
+def build_dtp_endpoint(dtp_name: str) -> Endpoint:
+    return Endpoint(
+        path=f"/sap/bw/modeling/dtpa/{_url_lower(dtp_name)}/m",
+        params={"forceCacheUpdate": "true"},
+        accept=ACCEPT_HEADERS["dtp"],
+    )
+
+
+def build_datasource_endpoint(datasource_name: str, source_system: str) -> Endpoint:
+    return Endpoint(
+        path=(
+            "/sap/bw/modeling/rsds/"
+            f"{_url_preserve_case(datasource_name)}/{_url_upper(source_system)}/m"
+        ),
+        params={},
+        accept=ACCEPT_HEADERS["datasource"],
+    )
+
+
+def build_source_system_endpoint(source_system: str) -> Endpoint:
+    return Endpoint(
+        path=f"/sap/bw/modeling/lsys/{_url_lower(source_system)}/a",
+        params={},
+        accept=ACCEPT_HEADERS["source_system"],
+    )
+
+
+def build_query_endpoint(query_name: str, *, active: bool = True) -> Endpoint:
+    suffix = "a" if active else "m"
+    return Endpoint(
+        path=f"/sap/bw/modeling/query/{_url_lower(query_name)}/{suffix}",
+        params={},
+        accept=ACCEPT_HEADERS["query"],
+    )
+
+
+def build_composite_provider_endpoint(object_name: str) -> Endpoint:
+    return build_hcpr_endpoint(object_name)
+
+
 def _dataflow_object_name(
     object_name: str,
     *,
@@ -137,3 +233,15 @@ def _dataflow_object_name(
 def _repository_path(path: str | None) -> str:
     value = (path or "").strip().lower().strip("/")
     return value
+
+
+def _url_lower(value: str) -> str:
+    return quote(value.lower(), safe="")
+
+
+def _url_upper(value: str) -> str:
+    return quote(value.upper(), safe="")
+
+
+def _url_preserve_case(value: str) -> str:
+    return quote(value, safe="")

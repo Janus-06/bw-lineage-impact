@@ -233,6 +233,313 @@ def test_ingest_manifest_merges_duplicate_dataflow_object_names_before_storage(
     assert stored.outgoing_count == 1
 
 
+def test_ingest_manifest_process_chain_json_adds_chain_variants_and_sequence(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_process_chain",
+        payload_id="process-chain-json",
+        payload={
+            "oHeader": {
+                "sProcessChainId": "ZCHAIN_SALES",
+                "sDescription": "Sales load chain",
+            },
+            "aNode": [
+                {
+                    "sProcessType": "DTP_LOAD",
+                    "sProcessVariant": "ZDTP_SALES",
+                    "sVariantDescription": "Load sales DTP",
+                },
+                {
+                    "sProcessType": "ABAP",
+                    "sProcessVariant": "ZABAP_STEP",
+                    "sVariantDescription": "Finalize sales",
+                },
+            ],
+            "aEdge": [{"iNodeIndexFrom": 0, "iNodeIndexTo": 1}],
+        },
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZCHAIN_SALES"].type == "RSPC"
+    assert objects["ZCHAIN_SALES"].name == "Sales load chain"
+    assert objects["ZDTP_SALES"].type == "DTP_LOAD"
+    assert objects["ZABAP_STEP"].type == "ABAP"
+    assert {(edge.source, edge.target, edge.type) for edge in catalog.edges} == {
+        ("ZCHAIN_SALES", "ZABAP_STEP", "contains"),
+        ("ZCHAIN_SALES", "ZDTP_SALES", "contains"),
+        ("ZDTP_SALES", "ZABAP_STEP", "sequence"),
+    }
+
+
+def test_ingest_manifest_process_variant_json_preserves_process_type(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_process_variant",
+        payload_id="process-variant-json",
+        source="bw://bw_get_process_variant?processType=ABAP&variantName=ZVAR_SALES",
+        payload={
+            "bActive": True,
+            "sVariantDescription": "Run sales finalizer",
+            "oDetail": {"PROGRAM": [{"key": "ZSALES_FINALIZE"}]},
+        },
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    assert [(item.id, item.type, item.name) for item in catalog.objects] == [
+        ("ZVAR_SALES", "ABAP", "Run sales finalizer")
+    ]
+    assert catalog.objects[0].metadata["active"] is True
+
+
+def test_ingest_manifest_dtp_xml_adds_dtp_source_target_and_transformation(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_dtp",
+        payload_id="dtp-xml",
+        payload="""
+        <dtpa:dataTransferProcess xmlns:dtpa="urn:sap:bw:dtpa"
+            name="ZDTP_SALES"
+            description="Load sales"
+            sourceObjectName="ZDS_SALES"
+            sourceObjectType="RSDS"
+            sourceSystemName="S4H"
+            targetObjectName="ZADSO_SALES"
+            targetObjectType="ADSO"
+            transformationName="ZTRFN_SALES" />
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZDTP_SALES"].type == "DTPA"
+    assert objects["ZDS_SALES"].type == "RSDS"
+    assert objects["ZDS_SALES"].metadata["source_system"] == "S4H"
+    assert objects["ZADSO_SALES"].type == "ADSO"
+    assert objects["ZTRFN_SALES"].type == "TRFN"
+    edge_triples = {(edge.source, edge.target, edge.type) for edge in catalog.edges}
+    assert ("ZDS_SALES", "ZDTP_SALES", "dataflow") in edge_triples
+    assert ("ZDTP_SALES", "ZADSO_SALES", "dataflow") in edge_triples
+    assert any("ZTRFN_SALES" in (edge.source, edge.target) for edge in catalog.edges)
+
+
+def test_ingest_manifest_dtp_xml_reads_child_source_target_and_overview_transform(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_dtp",
+        payload_id="dtp-child-xml",
+        payload="""
+        <dtpa:dataTransferProcess xmlns:dtpa="urn:sap:bw:dtpa"
+            name="ZDTP_SALES"
+            description="Load sales">
+          <dtpa:source type="RSDS" name="ZDS_SALES" sourceSystemName="S4H" />
+          <dtpa:target type="ADSO" name="ZADSO_SALES" />
+          <dtpa:overview>
+            <dtpa:object name="ZTRFN_SALES" description="Sales transformation" />
+          </dtpa:overview>
+        </dtpa:dataTransferProcess>
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZDTP_SALES"].type == "DTPA"
+    assert objects["ZDS_SALES"].type == "RSDS"
+    assert objects["ZDS_SALES"].metadata["source_system"] == "S4H"
+    assert objects["ZADSO_SALES"].type == "ADSO"
+    assert objects["ZTRFN_SALES"].type == "TRFN"
+    assert objects["ZTRFN_SALES"].name == "Sales transformation"
+    assert {(edge.source, edge.target, edge.type) for edge in catalog.edges} == {
+        ("ZDS_SALES", "ZDTP_SALES", "dataflow"),
+        ("ZDTP_SALES", "ZADSO_SALES", "dataflow"),
+        ("ZDTP_SALES", "ZTRFN_SALES", "uses_transformation"),
+    }
+
+
+def test_ingest_manifest_datasource_xml_preserves_rsds_and_fields(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_datasource",
+        payload_id="datasource-xml",
+        payload="""
+        <rsds:dataSource xmlns:rsds="urn:sap:bw:rsds"
+            name="ZDS_SALES"
+            description="Sales datasource"
+            sourceSystemName="S4H"
+            type="TRANSACTION_DATA">
+          <rsds:field name="CUSTOMER" description="Customer" type="CHAR" length="10" />
+          <rsds:field name="AMOUNT" description="Amount" type="DEC" length="17" />
+        </rsds:dataSource>
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    assert [(item.id, item.type, item.name) for item in catalog.objects] == [
+        ("ZDS_SALES", "RSDS", "Sales datasource")
+    ]
+    metadata = catalog.objects[0].metadata
+    assert metadata["source_system"] == "S4H"
+    assert metadata["datasource_type"] == "TRANSACTION_DATA"
+    assert metadata["fields"] == [
+        {"name": "CUSTOMER", "description": "Customer", "type": "CHAR", "length": "10"},
+        {"name": "AMOUNT", "description": "Amount", "type": "DEC", "length": "17"},
+    ]
+
+
+def test_ingest_manifest_source_system_xml_preserves_lsys(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_source_system",
+        payload_id="source-system-xml",
+        payload="""
+        <lsys:sourceSystem xmlns:lsys="urn:sap:bw:lsys"
+            name="S4H"
+            description="S/4HANA source"
+            type="ODP" />
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    assert [(item.id, item.type, item.name) for item in catalog.objects] == [
+        ("S4H", "LSYS", "S/4HANA source")
+    ]
+    assert catalog.objects[0].metadata["source_system_type"] == "ODP"
+
+
+def test_ingest_manifest_query_xml_adds_provider_from_related_link(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_query",
+        payload_id="query-xml",
+        payload="""
+        <Qry:queryResource xmlns:Qry="urn:sap:bw:query"
+            xmlns:atom="http://www.w3.org/2005/Atom"
+            technicalName="ZQ_SALES"
+            description="Sales query">
+          <atom:link rel="related" href="/sap/bw/modeling/hcpr/zcp_sales/m" />
+        </Qry:queryResource>
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZQ_SALES"].type == "QUERY"
+    assert objects["ZQ_SALES"].name == "Sales query"
+    assert objects["ZCP_SALES"].type == "HCPR"
+    assert [(edge.source, edge.target, edge.type) for edge in catalog.edges] == [
+        ("ZCP_SALES", "ZQ_SALES", "provides")
+    ]
+
+
+def test_ingest_manifest_query_xml_ignores_self_link_provider_edges(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_query",
+        payload_id="query-self-and-related-links",
+        payload="""
+        <Qry:queryResource xmlns:Qry="urn:sap:bw:query"
+            xmlns:atom="http://www.w3.org/2005/Atom"
+            technicalName="ZQ_SALES"
+            description="Sales query">
+          <atom:link rel="self" href="/sap/bw/modeling/query/ZQ_SALES/a" />
+          <atom:link rel="alternate" href="/sap/bw/modeling/query/ZQ_SALES/m" />
+          <atom:link rel="related" href="/sap/bw/modeling/hcpr/ZCP_SALES/m" />
+        </Qry:queryResource>
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert set(objects) == {"ZQ_SALES", "ZCP_SALES"}
+    assert objects["ZQ_SALES"].type == "QUERY"
+    assert objects["ZCP_SALES"].type == "HCPR"
+    assert [(edge.source, edge.target, edge.type) for edge in catalog.edges] == [
+        ("ZCP_SALES", "ZQ_SALES", "provides")
+    ]
+
+
+def test_ingest_manifest_composite_provider_xml_adds_input_provider_edges(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_composite_provider",
+        payload_id="hcpr-xml",
+        payload="""
+        <Composite:compositeView xmlns:Composite="urn:sap:bw:hcpr"
+            technicalName="ZCP_SALES"
+            description="Sales CompositeProvider">
+          <Composite:inputProvider name="ZADSO_SALES" type="ADSO" />
+          <Composite:inputProvider technicalName="ZCP_BASE" objectType="HCPR" />
+        </Composite:compositeView>
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZCP_SALES"].type == "HCPR"
+    assert objects["ZCP_SALES"].name == "Sales CompositeProvider"
+    assert objects["ZADSO_SALES"].type == "ADSO"
+    assert objects["ZCP_BASE"].type == "HCPR"
+    assert {(edge.source, edge.target, edge.type) for edge in catalog.edges} == {
+        ("ZADSO_SALES", "ZCP_SALES", "composite_input"),
+        ("ZCP_BASE", "ZCP_SALES", "composite_input"),
+    }
+
+
+def test_ingest_manifest_composite_provider_xml_reads_view_node_input_alias(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_composite_provider",
+        payload_id="hcpr-view-node-input-xml",
+        payload="""
+        <Composite:compositeView xmlns:Composite="urn:sap:bw:hcpr"
+            technicalName="ZCP_SALES"
+            description="Sales CompositeProvider">
+          <Composite:viewNode name="Projection_1">
+            <Composite:input name="ZADSO_SALES" alias="ZADSO_SALES.ADSO" />
+          </Composite:viewNode>
+        </Composite:compositeView>
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZCP_SALES"].type == "HCPR"
+    assert objects["ZADSO_SALES"].type == "ADSO"
+    assert [(edge.source, edge.target, edge.type) for edge in catalog.edges] == [
+        ("ZADSO_SALES", "ZCP_SALES", "composite_input")
+    ]
+
+
 def test_ingest_manifest_indexes_top_level_search_array_payload(tmp_path: Path) -> None:
     manifest_path = _write_manifest_payload(
         tmp_path,

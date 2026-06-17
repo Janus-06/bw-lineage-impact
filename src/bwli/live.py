@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict
 
 from bwli.endpoints import DataflowDirection
 from bwli.redact import redact_text
-from bwli.snapshot import SnapshotManifest, SnapshotWriter
+from bwli.snapshot import PayloadMetadata, SnapshotManifest, SnapshotWriter
 
 
 class BwReadClient(Protocol):
@@ -35,6 +35,20 @@ class BwReadClient(Protocol):
     ) -> Any: ...
 
     def fetch_repository_contents(self, path: str | None = None) -> Any: ...
+
+    def fetch_process_chain(self, chain_name: str) -> Any: ...
+
+    def fetch_process_variant(self, process_type: str, variant_name: str) -> Any: ...
+
+    def fetch_dtp(self, dtp_name: str) -> Any: ...
+
+    def fetch_datasource(self, datasource_name: str, source_system: str) -> Any: ...
+
+    def fetch_source_system(self, source_system: str) -> Any: ...
+
+    def fetch_query(self, query_name: str) -> Any: ...
+
+    def fetch_composite_provider(self, composite_provider_name: str) -> Any: ...
 
     def close(self) -> None: ...
 
@@ -166,6 +180,13 @@ def collect_live_snapshot(
     client_factory: ClientFactory,
     search_terms: Sequence[str] = (),
     object_names: Sequence[str] = (),
+    process_chains: Sequence[str] = (),
+    process_variants: Sequence[tuple[str, str]] = (),
+    dtps: Sequence[str] = (),
+    datasources: Sequence[tuple[str, str]] = (),
+    source_systems: Sequence[str] = (),
+    queries: Sequence[str] = (),
+    composite_providers: Sequence[str] = (),
     include_dataflow: bool = True,
     include_xref: bool = True,
     dataflow_object_type: str = "ADSO",
@@ -180,11 +201,26 @@ def collect_live_snapshot(
     Each fetch is wrapped: successful payloads are persisted, failed ones are
     recorded as redacted operation summaries. Raises only when nothing succeeded.
     """
-    if not search_terms and not object_names:
-        raise ValueError("at least one search term or object name is required for live collection")
+    if not any(
+        (
+            search_terms,
+            object_names,
+            process_chains,
+            process_variants,
+            dtps,
+            datasources,
+            source_systems,
+            queries,
+            composite_providers,
+        )
+    ):
+        raise ValueError(
+            "at least one search term, object name, or metadata name is required "
+            "for live collection"
+        )
 
     writer = SnapshotWriter(out_dir)
-    payloads = []
+    payloads: list[PayloadMetadata] = []
     operations: list[LiveOperationSummary] = []
     client = client_factory()
     try:
@@ -288,6 +324,134 @@ def collect_live_snapshot(
                         )
                     )
                     operations.append(_success_summary("bw_xref", label, payload))
+
+        for index, chain_name in enumerate(process_chains):
+            _capture_live_payload(
+                writer=writer,
+                payloads=payloads,
+                operations=operations,
+                payload_id=f"process-chain-{index}-{_safe_fragment(chain_name)}",
+                kind="bw_get_process_chain",
+                label=(
+                    "bw://bw_get_process_chain?"
+                    f"chainName={quote(chain_name, safe='')}"
+                ),
+                func=_zero_arg_call(client.fetch_process_chain, chain_name),
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+
+        for index, (process_type, variant_name) in enumerate(process_variants):
+            _capture_live_payload(
+                writer=writer,
+                payloads=payloads,
+                operations=operations,
+                payload_id=(
+                    f"process-variant-{index}-{_safe_fragment(process_type)}-"
+                    f"{_safe_fragment(variant_name)}"
+                ),
+                kind="bw_get_process_variant",
+                label=(
+                    "bw://bw_get_process_variant?"
+                    f"processType={quote(process_type, safe='')}&"
+                    f"variantName={quote(variant_name, safe='')}"
+                ),
+                func=_zero_arg_call(
+                    client.fetch_process_variant,
+                    process_type,
+                    variant_name,
+                ),
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+
+        for index, dtp_name in enumerate(dtps):
+            _capture_live_payload(
+                writer=writer,
+                payloads=payloads,
+                operations=operations,
+                payload_id=f"dtp-{index}-{_safe_fragment(dtp_name)}",
+                kind="bw_get_dtp",
+                label=f"bw://bw_get_dtp?dtpName={quote(dtp_name, safe='')}",
+                func=_zero_arg_call(client.fetch_dtp, dtp_name),
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+
+        for index, (datasource_name, source_system) in enumerate(datasources):
+            _capture_live_payload(
+                writer=writer,
+                payloads=payloads,
+                operations=operations,
+                payload_id=(
+                    f"datasource-{index}-{_safe_fragment(datasource_name)}-"
+                    f"{_safe_fragment(source_system)}"
+                ),
+                kind="bw_get_datasource",
+                label=(
+                    "bw://bw_get_datasource?"
+                    f"datasourceName={quote(datasource_name, safe='')}&"
+                    f"sourceSystem={quote(source_system, safe='')}"
+                ),
+                func=_zero_arg_call(
+                    client.fetch_datasource,
+                    datasource_name,
+                    source_system,
+                ),
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+
+        for index, source_system in enumerate(source_systems):
+            _capture_live_payload(
+                writer=writer,
+                payloads=payloads,
+                operations=operations,
+                payload_id=f"source-system-{index}-{_safe_fragment(source_system)}",
+                kind="bw_get_source_system",
+                label=(
+                    "bw://bw_get_source_system?"
+                    f"sourceSystem={quote(source_system, safe='')}"
+                ),
+                func=_zero_arg_call(client.fetch_source_system, source_system),
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+
+        for index, query_name in enumerate(queries):
+            _capture_live_payload(
+                writer=writer,
+                payloads=payloads,
+                operations=operations,
+                payload_id=f"query-{index}-{_safe_fragment(query_name)}",
+                kind="bw_get_query",
+                label=f"bw://bw_get_query?queryName={quote(query_name, safe='')}",
+                func=_zero_arg_call(client.fetch_query, query_name),
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+
+        for index, composite_provider_name in enumerate(composite_providers):
+            _capture_live_payload(
+                writer=writer,
+                payloads=payloads,
+                operations=operations,
+                payload_id=(
+                    "composite-provider-"
+                    f"{index}-{_safe_fragment(composite_provider_name)}"
+                ),
+                kind="bw_get_composite_provider",
+                label=(
+                    "bw://bw_get_composite_provider?"
+                    f"name={quote(composite_provider_name, safe='')}"
+                ),
+                func=_zero_arg_call(
+                    client.fetch_composite_provider,
+                    composite_provider_name,
+                ),
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
     finally:
         client.close()
 
@@ -310,6 +474,49 @@ def collect_live_snapshot(
         succeeded=succeeded,
         failed=failed,
     )
+
+
+def _zero_arg_call(func: Callable[..., Any], *args: object) -> Callable[[], Any]:
+    def call() -> Any:
+        return func(*args)
+
+    return call
+
+
+def _capture_live_payload(
+    *,
+    writer: SnapshotWriter,
+    payloads: list[PayloadMetadata],
+    operations: list[LiveOperationSummary],
+    payload_id: str,
+    kind: str,
+    label: str,
+    func: Callable[[], Any],
+    secret_values: Sequence[str],
+    secret_urls: Sequence[str],
+) -> None:
+    try:
+        payload = func()
+    except Exception as exc:
+        operations.append(
+            _failure_summary(
+                name=kind,
+                label=label,
+                exc=exc,
+                secret_values=secret_values,
+                secret_urls=secret_urls,
+            )
+        )
+        return
+    payloads.append(
+        writer.write_payload(
+            payload_id=payload_id,
+            kind=kind,
+            source=label,
+            payload=payload,
+        )
+    )
+    operations.append(_success_summary(kind, label, payload))
 
 
 def _xref_label(

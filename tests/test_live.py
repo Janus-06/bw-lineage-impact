@@ -46,6 +46,27 @@ class RecordingLiveClient:
             "source_system": source_system,
         }
 
+    def fetch_process_chain(self, chain_name: str) -> dict[str, Any]:
+        return {"chain": chain_name}
+
+    def fetch_process_variant(self, process_type: str, variant_name: str) -> dict[str, Any]:
+        return {"process_type": process_type, "variant": variant_name}
+
+    def fetch_dtp(self, dtp_name: str) -> dict[str, Any]:
+        return {"dtp": dtp_name}
+
+    def fetch_datasource(self, datasource_name: str, source_system: str) -> dict[str, Any]:
+        return {"datasource": datasource_name, "source_system": source_system}
+
+    def fetch_source_system(self, source_system: str) -> dict[str, Any]:
+        return {"source_system": source_system}
+
+    def fetch_query(self, query_name: str) -> dict[str, Any]:
+        return {"query": query_name}
+
+    def fetch_composite_provider(self, composite_provider_name: str) -> dict[str, Any]:
+        return {"composite_provider": composite_provider_name}
+
     def close(self) -> None:
         self.closed = True
 
@@ -94,6 +115,18 @@ class XmlDataflowClient(RecordingLiveClient):
         levels: int = 3,
     ) -> str:
         return self._xml
+
+
+class MetadataFlakyLiveClient(RecordingLiveClient):
+    def __init__(self, leak_value: str) -> None:
+        super().__init__()
+        self._leak_value = leak_value
+
+    def fetch_source_system(self, source_system: str) -> Any:
+        raise RuntimeError(
+            "source system failed "
+            f"token={self._leak_value} url=https://bw.example.invalid/sap/bw"
+        )
 
 
 def test_collect_live_snapshot_uses_unique_payload_paths_for_colliding_labels(tmp_path) -> None:
@@ -162,6 +195,51 @@ def test_collect_live_snapshot_writes_xml_payload_as_xml_file(tmp_path) -> None:
     loaded = reader.read_payload(payload)
     assert isinstance(loaded, str)
     assert loaded == xml
+
+
+def test_collect_live_snapshot_captures_explicit_metadata_reads_and_isolates_failures(
+    tmp_path,
+) -> None:
+    client = MetadataFlakyLiveClient(leak_value="redaction-target-secret")
+
+    result = collect_live_snapshot(
+        out_dir=tmp_path,
+        client_factory=lambda: client,
+        process_chains=["ZCHAIN_SALES"],
+        process_variants=[("ABAP", "ZVAR_SALES")],
+        dtps=["ZDTP_SALES"],
+        datasources=[("ZDS_SALES", "S4H")],
+        source_systems=["S4H"],
+        queries=["ZQ_SALES"],
+        composite_providers=["ZCP_SALES"],
+        secret_values=["redaction-target-secret"],
+        secret_urls=["https://bw.example.invalid/sap/bw"],
+    )
+
+    assert client.closed is True
+    assert result.succeeded == 6
+    assert result.failed == 1
+    assert {payload.kind for payload in result.manifest.payloads} == {
+        "bw_get_process_chain",
+        "bw_get_process_variant",
+        "bw_get_dtp",
+        "bw_get_datasource",
+        "bw_get_query",
+        "bw_get_composite_provider",
+    }
+    assert {op.name for op in result.operations if op.ok} == {
+        "bw_get_process_chain",
+        "bw_get_process_variant",
+        "bw_get_dtp",
+        "bw_get_datasource",
+        "bw_get_query",
+        "bw_get_composite_provider",
+    }
+    failed_ops = [op for op in result.operations if not op.ok]
+    assert [op.name for op in failed_ops] == ["bw_get_source_system"]
+    assert "redaction-target-secret" not in failed_ops[0].error
+    assert "[REDACTED]" in failed_ops[0].error
+    assert "bw.example.invalid" not in failed_ops[0].error
 
 
 def test_collect_live_snapshot_raises_when_all_calls_fail(tmp_path) -> None:
