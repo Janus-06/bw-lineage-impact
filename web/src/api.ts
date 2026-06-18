@@ -11,6 +11,7 @@ export type ChangeType =
   | 'routine_changed'
   | 'dtp_filter_changed'
   | 'compositeprovider_mapping_changed';
+export type TourStatus = 'ok' | 'disabled' | string;
 
 export interface HealthResponse {
   status: string;
@@ -113,6 +114,53 @@ export interface GlossaryTerm {
   metadata: Record<string, unknown>;
 }
 
+export interface RequestFreshnessEntry {
+  request_tsn?: string | null;
+  tsn?: string | null;
+  status?: string | null;
+  records?: number | null;
+  timestamp?: string | null;
+  [key: string]: unknown;
+}
+
+export interface RequestFreshnessResponse {
+  target?: string | null;
+  target_type?: string | null;
+  latest?: RequestFreshnessEntry | null;
+  requests?: RequestFreshnessEntry[];
+  [key: string]: unknown;
+}
+
+export interface DomainSummary {
+  node_count?: number;
+  edge_count?: number;
+  object_types?: string[];
+  layer_counts?: Record<string, number>;
+  [key: string]: unknown;
+}
+
+export interface GuidedTourStep {
+  id: string;
+  title: string;
+  description: string;
+  node_ids: string[];
+  edge_ids: string[];
+  [key: string]: unknown;
+}
+
+interface GuidedTourResponseBase {
+  schema_version: string;
+  status: TourStatus;
+  advisory: boolean;
+  config_required: boolean;
+  message: string;
+  summary: string;
+  tour: GuidedTourStep[];
+  citations: string[];
+  domain_summary: DomainSummary;
+  llm_audit?: Record<string, unknown>;
+}
+
 export interface RepositoryNode {
   id: string;
   parent_path: string;
@@ -187,6 +235,10 @@ export interface CatalogObject {
   name: string | null;
   type: string;
   label: string | null;
+  summary?: string | null;
+  tags?: string[];
+  complexity?: number | null;
+  layer?: string | null;
   metadata: Record<string, unknown>;
   evidence_ids: string[];
 }
@@ -204,6 +256,10 @@ export interface ObjectListResponse {
 }
 
 export interface LineageNode extends CatalogObject {
+  summary?: string | null;
+  tags?: string[];
+  complexity?: number | null;
+  layer?: string | null;
   evidence_ids: string[];
 }
 
@@ -252,6 +308,10 @@ export interface LineageAdviceResponse {
   lineage: LineageResponse;
 }
 
+export interface LineageTourResponse extends GuidedTourResponseBase {
+  lineage: LineageResponse;
+}
+
 export interface ImpactScenarioResponse {
   schema_version: string;
   snapshot_id: string;
@@ -297,6 +357,10 @@ export interface ImpactAdviceResponse {
   advice: string;
   citations: string[];
   llm_audit?: Record<string, unknown>;
+  impact: ImpactScenarioResponse;
+}
+
+export interface ImpactTourResponse extends GuidedTourResponseBase {
   impact: ImpactScenarioResponse;
 }
 
@@ -412,6 +476,8 @@ export async function captureLiveSnapshot(options: {
   sourceSystem?: string;
   dataflowDirection?: DataflowDirection;
   dataflowLevels?: number;
+  includeRequestFreshness?: boolean;
+  requestFreshnessTop?: number;
 }): Promise<SnapshotSummary> {
   return postJson<SnapshotSummary>('/api/v1/snapshots/capture', {
     confirm_read_only: options.confirmReadOnly,
@@ -419,6 +485,8 @@ export async function captureLiveSnapshot(options: {
     object_names: options.objectNames,
     include_dataflow: true,
     include_xref: true,
+    include_request_freshness: options.includeRequestFreshness ?? false,
+    request_freshness_top: options.requestFreshnessTop,
     object_type: options.objectType,
     source_system: options.sourceSystem,
     dataflow_direction: options.dataflowDirection,
@@ -454,6 +522,15 @@ export async function getObject(
   );
 }
 
+export async function getObjectFreshness(
+  snapshotId: string,
+  objectId: string,
+): Promise<RequestFreshnessResponse> {
+  return getJson<RequestFreshnessResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/objects/${encodeURIComponent(objectId)}/freshness`,
+  );
+}
+
 export async function postLineage(
   snapshotId: string,
   body: {
@@ -479,6 +556,23 @@ export async function postLineageAdvice(
 ): Promise<LineageAdviceResponse> {
   return postJson<LineageAdviceResponse>(
     `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/lineage/advice`,
+    body,
+  );
+}
+
+export async function postLineageTour(
+  snapshotId: string,
+  body: {
+    object_id: string;
+    direction: Direction;
+    depth: number;
+    node_cap: number;
+    edge_cap: number;
+    include_korean_summary?: boolean;
+  },
+): Promise<LineageTourResponse> {
+  return postJson<LineageTourResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/lineage/tour`,
     body,
   );
 }
@@ -517,6 +611,26 @@ export async function postImpactAdvice(
 ): Promise<ImpactAdviceResponse> {
   return postJson<ImpactAdviceResponse>(
     `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/advice`,
+    body,
+  );
+}
+
+export async function postImpactTour(
+  snapshotId: string,
+  body: {
+    object_id: string;
+    change_type: ChangeType;
+    field?: string | null;
+    value_description?: string | null;
+    description?: string | null;
+    depth: number;
+    node_cap: number;
+    edge_cap: number;
+    include_korean_summary?: boolean;
+  },
+): Promise<ImpactTourResponse> {
+  return postJson<ImpactTourResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/tour`,
     body,
   );
 }

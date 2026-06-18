@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   captureFixtureSnapshot,
   captureLiveSnapshot,
@@ -8,6 +8,7 @@ import {
   getCaptureScope,
   getGlossary,
   getObject,
+  getObjectFreshness,
   getRepository,
   getRuntimeConfig,
   listObjects,
@@ -15,8 +16,10 @@ import {
   postConnectionTest,
   postImpactAdvice,
   postImpactScenario,
+  postImpactTour,
   postLineage,
   postLineageAdvice,
+  postLineageTour,
   putRuntimeConfig,
   refreshSnapshotFromBw,
   searchBwObjects,
@@ -32,16 +35,33 @@ import {
   type GlossaryTerm,
   type ImpactAdviceResponse,
   type ImpactScenarioResponse,
+  type ImpactTourResponse,
   type LineageAdviceResponse,
   type LineageResponse,
+  type LineageTourResponse,
   type LiveCaptureSummary,
   type LiveSmokeResult,
+  type RequestFreshnessResponse,
   type RepositoryNode,
   type RuntimeConfigResponse,
   type SnapshotSummary,
   type SqlDraftResponse,
   type SqlExplainResponse,
 } from './api';
+import {
+  DISPLAY_LAYER_ORDER,
+  clampTourIndex,
+  classifyFreshness,
+  compareDisplayLayers,
+  deriveImpactSummary,
+  freshnessFromMetadata,
+  groupNodesByDisplayLayer,
+  inferDisplayLayer,
+  normalizeGuidedTourSteps,
+  type DisplayLayer,
+  type FreshnessDisplay,
+  type NormalizedTourStep,
+} from './sliceG';
 
 const fixtureGraphPath = 'tests/fixtures/sample-graph.json';
 const fixtureSqlPath = 'tests/fixtures/native_sql_view.sql';
@@ -99,15 +119,34 @@ interface SetupForm {
   llmApiKey: string;
 }
 
+interface ObjectFreshnessState {
+  snapshotId: string;
+  objectId: string;
+  value: RequestFreshnessResponse | null;
+}
+
+interface ObjectDetailState {
+  snapshotId: string;
+  objectId: string;
+  value: CatalogObjectDetail;
+}
+
+interface ReloadSnapshotsOptions {
+  preserveAnalysisSelection?: boolean;
+  isStale?: () => boolean;
+}
+
 export default function App() {
   const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null);
   const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState('');
   const [objects, setObjects] = useState<CatalogObject[]>([]);
+  const [objectsSnapshotId, setObjectsSnapshotId] = useState('');
   const [objectNextCursor, setObjectNextCursor] = useState<string | null>(null);
   const [selectedObjectId, setSelectedObjectId] = useState('');
   const [allowHiddenSelection, setAllowHiddenSelection] = useState(false);
-  const [objectDetail, setObjectDetail] = useState<CatalogObjectDetail | null>(null);
+  const [objectDetail, setObjectDetail] = useState<ObjectDetailState | null>(null);
+  const [objectFreshness, setObjectFreshness] = useState<ObjectFreshnessState | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>('lineage');
   const [catalogQuery, setCatalogQuery] = useState('');
   const [objectType, setObjectType] = useState('');
@@ -125,8 +164,12 @@ export default function App() {
   const [sqlQuestion, setSqlQuestion] = useState('이 뷰의 주요 소스와 집계 로직을 설명하는 조회 초안');
   const [lineage, setLineage] = useState<LineageResponse | null>(null);
   const [lineageAdvice, setLineageAdvice] = useState<LineageAdviceResponse | null>(null);
+  const [lineageTour, setLineageTour] = useState<LineageTourResponse | null>(null);
+  const [lineageTourStepIndex, setLineageTourStepIndex] = useState(0);
   const [impact, setImpact] = useState<ImpactScenarioResponse | null>(null);
   const [impactAdvice, setImpactAdvice] = useState<ImpactAdviceResponse | null>(null);
+  const [impactTour, setImpactTour] = useState<ImpactTourResponse | null>(null);
+  const [impactTourStepIndex, setImpactTourStepIndex] = useState(0);
   const [sqlExplain, setSqlExplain] = useState<SqlExplainResponse | null>(null);
   const [sqlDraft, setSqlDraft] = useState<SqlDraftResponse | null>(null);
   const [busy, setBusy] = useState('');
@@ -169,33 +212,64 @@ export default function App() {
   const [bwSearchType, setBwSearchType] = useState('');
   const [bwSearchResults, setBwSearchResults] = useState<BwSearchItem[]>([]);
   const [bwSearchTruncated, setBwSearchTruncated] = useState(false);
+  const selectionRef = useRef({ snapshotId: '', objectId: '' });
+  const analysisRequestRef = useRef(0);
+  const objectListRequestRef = useRef(0);
 
   const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
-  const selectedObject = objects.find((item) => item.id === selectedObjectId)
-    ?? (allowHiddenSelection && objectDetail?.id === selectedObjectId ? objectDetail : null);
+  const currentObjects = useMemo(
+    () => (objectsSnapshotId === selectedSnapshotId ? objects : []),
+    [objects, objectsSnapshotId, selectedSnapshotId],
+  );
+  const currentObjectNextCursor = objectsSnapshotId === selectedSnapshotId ? objectNextCursor : null;
+  const selectedObjectFromCurrentObjects = currentObjects.find((item) => item.id === selectedObjectId) ?? null;
+  const selectedObjectDetail =
+    objectDetail?.snapshotId === selectedSnapshotId
+    && objectDetail.objectId === selectedObjectId
+    && objectDetail.value.id === selectedObjectId
+      ? objectDetail.value
+      : null;
+  const selectedObject = selectedObjectFromCurrentObjects
+    ?? (allowHiddenSelection && selectedObjectDetail ? selectedObjectDetail : null);
   const runtimeMissing = runtime ? !runtime.bw.configured : true;
   const connectionReady = runtime?.connection_status === 'ok' || connectionTestOk;
   const liveObjectNameTokens = useMemo(() => parseObjectNamesText(liveObjectNames), [liveObjectNames]);
   const liveSearchTermTokens = useMemo(() => parseObjectNamesText(liveSearchTerms), [liveSearchTerms]);
   const liveCaptureTargetReady = liveObjectNameTokens.length > 0 || liveSearchTermTokens.length > 0;
-  const snapshotPickObjects = useMemo(() => objects.slice(0, 16), [objects]);
+  const snapshotPickObjects = useMemo(() => currentObjects.slice(0, 16), [currentObjects]);
   const bwSavedForTesting = Boolean(runtime?.bw.configured && !bwSetupTouched);
   const bwTestedForCapture = Boolean(connectionReady && !bwSetupTouched);
   const refreshableAnalysisBasis = Boolean(
     selectedSnapshot?.mode === 'live-read-only' && captureScope.some((item) => item.role === 'selected'),
   );
   const selectedObjectGlossary = useMemo(
-    () => objectDetail?.glossary_terms ?? glossaryTerms.filter((term) => term.object_id === selectedObjectId).slice(0, 12),
-    [glossaryTerms, objectDetail, selectedObjectId],
+    () => selectedObjectDetail?.glossary_terms ?? glossaryTerms.filter((term) => term.object_id === selectedObjectId).slice(0, 12),
+    [glossaryTerms, selectedObjectDetail, selectedObjectId],
   );
+  const selectedFreshness = useMemo<RequestFreshnessResponse | null>(() => {
+    const selectedObjectFreshness = objectFreshness?.snapshotId === selectedSnapshotId && objectFreshness.objectId === selectedObjectId
+      ? objectFreshness.value
+      : null;
+    const value = selectedObjectFreshness
+      ?? freshnessFromMetadata(selectedObjectDetail?.metadata)
+      ?? freshnessFromMetadata(selectedObjectFromCurrentObjects?.metadata);
+    return value && typeof value === 'object' ? value as RequestFreshnessResponse : null;
+  }, [objectFreshness, selectedObjectDetail, selectedObjectFromCurrentObjects, selectedObjectId, selectedSnapshotId]);
 
   useEffect(() => {
     void refreshAll();
   }, []);
 
   useEffect(() => {
+    selectionRef.current = { snapshotId: selectedSnapshotId, objectId: selectedObjectId };
+  }, [selectedSnapshotId, selectedObjectId]);
+
+  useEffect(() => {
     if (!selectedSnapshotId && snapshots.length > 0) {
-      setSelectedSnapshotId(snapshots[0].id);
+      const nextSnapshotId = snapshots[0].id;
+      selectionRef.current = { snapshotId: nextSnapshotId, objectId: selectionRef.current.objectId };
+      markObjectsStaleForSnapshot(nextSnapshotId);
+      setSelectedSnapshotId(nextSnapshotId);
     }
   }, [selectedSnapshotId, snapshots]);
 
@@ -203,8 +277,7 @@ export default function App() {
     if (selectedSnapshotId) {
       void refreshSnapshotContext(selectedSnapshotId);
     } else {
-      setObjects([]);
-      setObjectNextCursor(null);
+      markObjectsStaleForSnapshot('');
       setSelectedObjectId('');
       setCaptureScope([]);
       setGlossaryTerms([]);
@@ -218,25 +291,36 @@ export default function App() {
   }, [selectedSnapshotId, catalogQuery, objectType]);
 
   useEffect(() => {
-    if (!selectedObjectId && objects.length > 0) {
-      setSelectedObjectId(objects[0].id);
+    if (currentObjects.length === 0) return;
+    if (!selectedObjectId) {
+      setSelectedObjectId(currentObjects[0].id);
       setAllowHiddenSelection(false);
     }
-    if (selectedObjectId && !objects.some((item) => item.id === selectedObjectId) && !allowHiddenSelection) {
-      setSelectedObjectId(objects[0]?.id ?? '');
+    if (selectedObjectId && !currentObjects.some((item) => item.id === selectedObjectId) && !allowHiddenSelection) {
+      setSelectedObjectId(currentObjects[0]?.id ?? '');
       setLineage(null);
       setLineageAdvice(null);
+      setLineageTour(null);
+      setLineageTourStepIndex(0);
       setImpact(null);
       setImpactAdvice(null);
+      setImpactTour(null);
+      setImpactTourStepIndex(0);
+      setObjectFreshness(null);
     }
-  }, [allowHiddenSelection, objects, selectedObjectId]);
+  }, [allowHiddenSelection, currentObjects, selectedObjectId]);
 
   useEffect(() => {
+    let cancelled = false;
     if (selectedSnapshotId && selectedObjectId) {
-      void loadObjectDetail(selectedSnapshotId, selectedObjectId);
+      setObjectDetail(null);
+      setObjectFreshness(null);
+      void loadObjectDetail(selectedSnapshotId, selectedObjectId, () => cancelled);
     } else {
       setObjectDetail(null);
+      setObjectFreshness(null);
     }
+    return () => { cancelled = true; };
   }, [selectedSnapshotId, selectedObjectId]);
 
   const latestSnapshotLabel = selectedSnapshot
@@ -249,20 +333,81 @@ export default function App() {
     return `${lineage.nodes.length} nodes · ${lineage.edges.length} edges · ${capText}`;
   }, [lineage]);
 
+  function nextAnalysisRequestId(): number {
+    analysisRequestRef.current += 1;
+    return analysisRequestRef.current;
+  }
+
+  function invalidateAnalysisRequests() {
+    analysisRequestRef.current += 1;
+    setBusy((current) => (
+      ['lineage', 'lineage-advice', 'lineage-tour', 'impact', 'impact-advice', 'impact-tour', 'live-analyze', 'refresh-bw'].includes(current)
+        ? ''
+        : current
+    ));
+  }
+
+  function isCurrentAnalysisRequest(requestId: number, snapshotId: string, objectId: string): boolean {
+    return analysisRequestRef.current === requestId
+      && selectionRef.current.snapshotId === snapshotId
+      && selectionRef.current.objectId === objectId;
+  }
+
+  function nextObjectListRequestId(): number {
+    objectListRequestRef.current += 1;
+    return objectListRequestRef.current;
+  }
+
+  function isCurrentObjectListRequest(requestId: number, snapshotId: string): boolean {
+    return objectListRequestRef.current === requestId
+      && selectionRef.current.snapshotId === snapshotId;
+  }
+
+  function markObjectsStaleForSnapshot(snapshotId: string) {
+    nextObjectListRequestId();
+    setObjectsSnapshotId(snapshotId);
+    setObjects([]);
+    setObjectNextCursor(null);
+    setBusy((current) => current === 'catalog' ? '' : current);
+  }
+
   function clearAnalysisState() {
+    invalidateAnalysisRequests();
     setLineage(null);
     setLineageAdvice(null);
+    setLineageTour(null);
+    setLineageTourStepIndex(0);
     setImpact(null);
     setImpactAdvice(null);
+    setImpactTour(null);
+    setImpactTourStepIndex(0);
     setSqlExplain(null);
     setSqlDraft(null);
     setObjectDetail(null);
+    setObjectFreshness(null);
+  }
+
+  function clearRenderedAnalysisStateForRefresh() {
+    // Guarded refresh reruns keep the current request token alive until the rerun is started.
+    // Clear only rendered snapshot/object-scoped state here; do not touch the request token.
+    setLineage(null);
+    setLineageAdvice(null);
+    setLineageTour(null);
+    setLineageTourStepIndex(0);
+    setImpact(null);
+    setImpactAdvice(null);
+    setImpactTour(null);
+    setImpactTourStepIndex(0);
+    setObjectDetail(null);
+    setObjectFreshness(null);
+    setGlossaryTerms([]);
   }
 
   function chooseSnapshot(snapshotId: string) {
+    selectionRef.current = { snapshotId, objectId: '' };
+    markObjectsStaleForSnapshot(snapshotId);
     setSelectedSnapshotId(snapshotId);
     setSelectedObjectId('');
-    setObjectNextCursor(null);
     setAllowHiddenSelection(false);
     clearAnalysisState();
   }
@@ -372,6 +517,7 @@ export default function App() {
   }
 
   async function refreshObjects(snapshotId: string, cursor?: string | null) {
+    const requestId = nextObjectListRequestId();
     setBusy('catalog');
     try {
       const response = await listObjects(snapshotId, {
@@ -380,13 +526,19 @@ export default function App() {
         limit: 80,
         cursor,
       });
-      setObjects((current) => (cursor ? [...current, ...response.items] : response.items));
+      if (!isCurrentObjectListRequest(requestId, snapshotId)) return;
+      setObjects((current) => (cursor && objectsSnapshotId === snapshotId ? [...current, ...response.items] : response.items));
+      setObjectsSnapshotId(snapshotId);
       setObjectNextCursor(response.next_cursor);
       setError('');
     } catch (err) {
-      setError(errorText(err));
+      if (isCurrentObjectListRequest(requestId, snapshotId)) {
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      if (objectListRequestRef.current === requestId) {
+        setBusy((current) => current === 'catalog' ? '' : current);
+      }
     }
   }
 
@@ -435,11 +587,32 @@ export default function App() {
     }
   }
 
-  async function loadObjectDetail(snapshotId: string, objectId: string) {
+  async function loadObjectDetail(snapshotId: string, objectId: string, isStale = () => false) {
     try {
-      setObjectDetail(await getObject(snapshotId, objectId));
+      const detail = await getObject(snapshotId, objectId);
+      if (isStale()) return;
+      setObjectDetail({ snapshotId, objectId, value: detail });
+      const metadataFreshness = freshnessFromMetadata(detail.metadata);
+      setObjectFreshness({
+        snapshotId,
+        objectId,
+        value: metadataFreshness && typeof metadataFreshness === 'object' ? metadataFreshness as RequestFreshnessResponse : null,
+      });
+      try {
+        const freshness = await getObjectFreshness(snapshotId, objectId);
+        if (!isStale()) {
+          setObjectFreshness({ snapshotId, objectId, value: freshness });
+        }
+      } catch (err) {
+        if (!isFreshnessMissingError(err)) {
+          // Freshness is supplemental Slice G context; object details remain usable.
+          console.warn('freshness lookup failed; continuing without supplemental request evidence');
+        }
+      }
     } catch (err) {
+      if (isStale()) return;
       setObjectDetail(null);
+      setObjectFreshness(null);
       setError(errorText(err));
     }
   }
@@ -532,6 +705,8 @@ export default function App() {
       sourceSystem: liveSourceSystem.trim() || undefined,
       dataflowDirection: liveDataflowDirection,
       dataflowLevels: liveDataflowLevels,
+      includeRequestFreshness: true,
+      requestFreshnessTop: 3,
     });
   }
 
@@ -597,76 +772,119 @@ export default function App() {
       setError('먼저 Settings에서 BW 연결 테스트를 성공시켜야 BW에서 가져오기를 사용할 수 있습니다.');
       return;
     }
+    const captureRequestId = nextAnalysisRequestId();
     setActiveTab('lineage');
     setAllowHiddenSelection(true);
     setSelectedObjectId(item.object_id);
     setLineage(null);
     setLineageAdvice(null);
+    setLineageTour(null);
+    setLineageTourStepIndex(0);
     setImpact(null);
     setImpactAdvice(null);
+    setImpactTour(null);
+    setImpactTourStepIndex(0);
     setObjectDetail(null);
+    setObjectFreshness(null);
     setBusy('live-analyze');
     try {
       const snapshot = await captureLiveWithTargets({
         objectNames: [item.object_id],
         objectType: item.object_type,
       });
-      await reloadSnapshots(snapshot.id, snapshot);
+      if (analysisRequestRef.current !== captureRequestId) return;
+      const captureSnapshotId = await reloadSnapshots(snapshot.id, snapshot, {
+        preserveAnalysisSelection: true,
+        isStale: () => analysisRequestRef.current !== captureRequestId,
+      });
+      if (!captureSnapshotId || analysisRequestRef.current !== captureRequestId) return;
+      const lineageRequestId = nextAnalysisRequestId();
+      selectionRef.current = { snapshotId: captureSnapshotId, objectId: item.object_id };
       setActiveTab('lineage');
       setAllowHiddenSelection(true);
       setSelectedObjectId(item.object_id);
-      const response = await postLineage(snapshot.id, {
+      const response = await postLineage(captureSnapshotId, {
         object_id: item.object_id,
         direction,
         depth,
         node_cap: nodeCap,
         edge_cap: edgeCap,
       });
+      if (!isCurrentAnalysisRequest(lineageRequestId, captureSnapshotId, item.object_id)) return;
       setLineage(response);
       setLineageAdvice(null);
+      setLineageTour(null);
+      setLineageTourStepIndex(0);
       setImpact(null);
       setImpactAdvice(null);
+      setImpactTour(null);
+      setImpactTourStepIndex(0);
       setError('');
     } catch (err) {
-      setError(errorText(err));
+      if (analysisRequestRef.current === captureRequestId || selectionRef.current.objectId === item.object_id) {
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      setBusy((current) => current === 'live-analyze' ? '' : current);
     }
   }
 
   async function refreshAnalysisBasis() {
     if (!selectedSnapshotId) return;
+    const snapshotToRefresh = selectedSnapshotId;
     const objectToRerun = selectedObjectId;
+    const tabToRerun = activeTab;
+    const impactBody = objectToRerun ? { ...impactRequestBody(), object_id: objectToRerun } : null;
+    let activeRequestId = nextAnalysisRequestId();
     setBusy('refresh-bw');
     try {
-      const snapshot = await refreshSnapshotFromBw(selectedSnapshotId);
-      await reloadSnapshots(snapshot.id, snapshot);
+      const snapshot = await refreshSnapshotFromBw(snapshotToRefresh);
+      if (analysisRequestRef.current !== activeRequestId) return;
+      const refreshedSnapshotId = await reloadSnapshots(snapshot.id, snapshot, {
+        preserveAnalysisSelection: true,
+        isStale: () => analysisRequestRef.current !== activeRequestId,
+      });
+      if (!refreshedSnapshotId || analysisRequestRef.current !== activeRequestId) return;
+      clearRenderedAnalysisStateForRefresh();
+      const rerunRequestId = nextAnalysisRequestId();
+      activeRequestId = rerunRequestId;
       if (objectToRerun) {
+        selectionRef.current = { snapshotId: refreshedSnapshotId, objectId: objectToRerun };
         setAllowHiddenSelection(true);
         setSelectedObjectId(objectToRerun);
       }
-      if (activeTab === 'lineage' && objectToRerun) {
-        const response = await postLineage(snapshot.id, {
+      if (tabToRerun === 'lineage' && objectToRerun) {
+        const response = await postLineage(refreshedSnapshotId, {
           object_id: objectToRerun,
           direction,
           depth,
           node_cap: nodeCap,
           edge_cap: edgeCap,
         });
+        if (!isCurrentAnalysisRequest(rerunRequestId, refreshedSnapshotId, objectToRerun)) return;
         setLineage(response);
         setLineageAdvice(null);
-      } else if (activeTab === 'impact' && objectToRerun) {
-        setImpact(await postImpactScenario(snapshot.id, { ...impactRequestBody(), object_id: objectToRerun }));
+        setLineageTour(null);
+        setLineageTourStepIndex(0);
+      } else if (tabToRerun === 'impact' && objectToRerun && impactBody) {
+        const response = await postImpactScenario(refreshedSnapshotId, impactBody);
+        if (!isCurrentAnalysisRequest(rerunRequestId, refreshedSnapshotId, objectToRerun)) return;
+        setImpact(response);
         setImpactAdvice(null);
-      } else if (activeTab === 'glossary') {
-        const response = await getGlossary(snapshot.id, glossaryQuery.trim() || undefined);
+        setImpactTour(null);
+        setImpactTourStepIndex(0);
+      } else if (tabToRerun === 'glossary') {
+        const response = await getGlossary(refreshedSnapshotId, glossaryQuery.trim() || undefined);
+        if (analysisRequestRef.current !== rerunRequestId) return;
         setGlossaryTerms(response.items);
       }
       setError('');
     } catch (err) {
-      setError(errorText(err));
+      if (analysisRequestRef.current === activeRequestId) {
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      setBusy((current) => current === 'refresh-bw' ? '' : current);
     }
   }
 
@@ -711,54 +929,118 @@ export default function App() {
     }
   }
 
-  async function reloadSnapshots(preferredId?: string, capturedSnapshot?: SnapshotSummary) {
+  async function reloadSnapshots(
+    preferredId?: string,
+    capturedSnapshot?: SnapshotSummary,
+    options: ReloadSnapshotsOptions = {},
+  ): Promise<string | null> {
     const snapshotResponse = await listSnapshots();
+    if (options.isStale?.()) return null;
+
     const nextSnapshots = mergeSnapshotCapture(snapshotResponse.snapshots, capturedSnapshot);
     const nextSnapshotId = preferredId ?? nextSnapshots[0]?.id ?? '';
     setSnapshots(nextSnapshots);
-    chooseSnapshot(nextSnapshotId);
+    if (options.preserveAnalysisSelection) {
+      selectionRef.current = { snapshotId: nextSnapshotId, objectId: selectionRef.current.objectId };
+      markObjectsStaleForSnapshot(nextSnapshotId);
+      setSelectedSnapshotId(nextSnapshotId);
+    } else {
+      chooseSnapshot(nextSnapshotId);
+    }
+    return nextSnapshotId;
   }
 
   async function runLineage(startId = selectedObjectId) {
     if (!selectedSnapshotId || !startId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestObjectId = startId;
+    const requestId = nextAnalysisRequestId();
     setBusy('lineage');
     try {
-      const response = await postLineage(selectedSnapshotId, {
-        object_id: startId,
+      const response = await postLineage(requestSnapshotId, {
+        object_id: requestObjectId,
         direction,
         depth,
         node_cap: nodeCap,
         edge_cap: edgeCap,
       });
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
       setLineage(response);
       setLineageAdvice(null);
-      setSelectedObjectId(startId);
+      setLineageTour(null);
+      setLineageTourStepIndex(0);
+      setSelectedObjectId(requestObjectId);
       setError('');
     } catch (err) {
-      setError(errorText(err));
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setBusy('');
+      }
     }
   }
 
   async function runLineageAdvice() {
     if (!selectedSnapshotId || !selectedObjectId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestObjectId = selectedObjectId;
+    const requestId = nextAnalysisRequestId();
     setBusy('lineage-advice');
     try {
-      const response = await postLineageAdvice(selectedSnapshotId, {
-        object_id: selectedObjectId,
+      const response = await postLineageAdvice(requestSnapshotId, {
+        object_id: requestObjectId,
         direction,
         depth,
         node_cap: nodeCap,
         edge_cap: edgeCap,
       });
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
       setLineage(response.lineage);
       setLineageAdvice(response);
+      setLineageTour(null);
+      setLineageTourStepIndex(0);
       setError('');
     } catch (err) {
-      setError(errorText(err));
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setBusy('');
+      }
+    }
+  }
+
+  async function runLineageTour() {
+    if (!selectedSnapshotId || !selectedObjectId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestObjectId = selectedObjectId;
+    const requestId = nextAnalysisRequestId();
+    setBusy('lineage-tour');
+    try {
+      const response = await postLineageTour(requestSnapshotId, {
+        object_id: requestObjectId,
+        direction,
+        depth,
+        node_cap: nodeCap,
+        edge_cap: edgeCap,
+        include_korean_summary: true,
+      });
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
+      setLineage(response.lineage);
+      setLineageTour(response);
+      setLineageTourStepIndex(0);
+      setError('');
+    } catch (err) {
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setError(errorText(err));
+      }
+    } finally {
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setBusy('');
+      }
     }
   }
 
@@ -776,30 +1058,79 @@ export default function App() {
 
   async function runImpact() {
     if (!selectedSnapshotId || !selectedObjectId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestObjectId = selectedObjectId;
+    const requestId = nextAnalysisRequestId();
     setBusy('impact');
     try {
-      setImpact(await postImpactScenario(selectedSnapshotId, impactRequestBody()));
+      const response = await postImpactScenario(requestSnapshotId, { ...impactRequestBody(), object_id: requestObjectId });
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
+      setImpact(response);
       setImpactAdvice(null);
+      setImpactTour(null);
+      setImpactTourStepIndex(0);
       setError('');
     } catch (err) {
-      setError(errorText(err));
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setBusy('');
+      }
     }
   }
 
   async function runImpactAdvice() {
     if (!selectedSnapshotId || !selectedObjectId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestObjectId = selectedObjectId;
+    const requestId = nextAnalysisRequestId();
     setBusy('impact-advice');
     try {
-      const response = await postImpactAdvice(selectedSnapshotId, impactRequestBody());
+      const response = await postImpactAdvice(requestSnapshotId, { ...impactRequestBody(), object_id: requestObjectId });
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
       setImpact(response.impact);
       setImpactAdvice(response);
+      setImpactTour(null);
+      setImpactTourStepIndex(0);
       setError('');
     } catch (err) {
-      setError(errorText(err));
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setBusy('');
+      }
+    }
+  }
+
+  async function runImpactTour() {
+    if (!selectedSnapshotId || !selectedObjectId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestObjectId = selectedObjectId;
+    const requestId = nextAnalysisRequestId();
+    setBusy('impact-tour');
+    try {
+      const response = await postImpactTour(requestSnapshotId, {
+        ...impactRequestBody(),
+        object_id: requestObjectId,
+        include_korean_summary: true,
+      });
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
+      setImpact(response.impact);
+      setImpactTour(response);
+      setImpactTourStepIndex(0);
+      setError('');
+    } catch (err) {
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setError(errorText(err));
+      }
+    } finally {
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setBusy('');
+      }
     }
   }
 
@@ -847,14 +1178,15 @@ export default function App() {
       <header className="topStatus">
         <div className="brandBlock">
           <div>
-            <strong>Live BW Workbench</strong>
-            <span>Find in BW · Lineage · Impact · SQL · Glossary</span>
+            <strong>BW Lineage Impact Workbench · Slice G</strong>
+            <span>Layer lanes · Guided tours · Read-only metadata</span>
           </div>
         </div>
         <div className="statusStrip">
           <StatusPill label="BW" value={bwStatus(runtime)} tone={runtime?.connection_status === 'ok' ? 'ok' : runtime?.bw.configured ? 'warn' : 'warn'} />
           <StatusPill label="Basis" value={latestSnapshotLabel} tone={selectedSnapshot ? 'info' : 'warn'} />
           <StatusPill label="LLM" value={runtime?.llm.configured ? 'local 설정됨' : 'disabled'} tone="neutral" />
+          <StatusPill label="Safety" value="read-only · no rows" tone="ok" />
         </div>
         <button className="ghostButton" onClick={() => setDiagnosticsOpen((value) => !value)}>
           Settings
@@ -1373,34 +1705,43 @@ export default function App() {
           </div>
 
           <div className="objectList" aria-busy={busy === 'catalog'}>
-            {objects.length === 0 ? (
+            {currentObjects.length === 0 ? (
               <div className="emptyState">Snapshot을 capture하세요.</div>
             ) : (
-              objects.map((item) => (
+              currentObjects.map((item) => (
                 <button
                   key={item.id}
                   className={item.id === selectedObjectId ? 'objectItem active' : 'objectItem'}
                   onClick={() => {
+                    invalidateAnalysisRequests();
                     setAllowHiddenSelection(false);
                     setSelectedObjectId(item.id);
                     setLineage(null);
                     setLineageAdvice(null);
+                    setLineageTour(null);
+                    setLineageTourStepIndex(0);
                     setImpact(null);
                     setImpactAdvice(null);
+                    setImpactTour(null);
+                    setImpactTourStepIndex(0);
+                    setObjectFreshness(null);
                   }}
                 >
                   <span className="objectType">{item.type}</span>
                   <strong>{item.id}</strong>
                   <small>{item.name || item.label || '—'}</small>
+                  {freshnessFromMetadata(item.metadata) ? (
+                    <FreshnessBadge display={classifyFreshness(freshnessFromMetadata(item.metadata))} compact />
+                  ) : null}
                 </button>
               ))
             )}
           </div>
-            {objectNextCursor ? (
+            {currentObjectNextCursor ? (
               <button
                 className="secondaryButton fullWidth"
                 disabled={busy === 'catalog'}
-                onClick={() => void refreshObjects(selectedSnapshotId, objectNextCursor)}
+                onClick={() => void refreshObjects(selectedSnapshotId, currentObjectNextCursor)}
               >
                 objects 더 보기
               </button>
@@ -1418,9 +1759,11 @@ export default function App() {
           {activeTab === 'lineage' ? (
             <LineageTab
               selectedObject={selectedObject}
-              objectDetail={objectDetail}
+              objectDetail={selectedObjectDetail}
+              objectFreshness={selectedFreshness}
               lineage={lineage}
               lineageAdvice={lineageAdvice}
+              lineageTour={lineageTour}
               objectGlossary={selectedObjectGlossary}
               graphStats={graphStats}
               direction={direction}
@@ -1433,22 +1776,34 @@ export default function App() {
               setEdgeCap={setEdgeCap}
               onRun={() => void runLineage()}
               onAdvice={() => void runLineageAdvice()}
+              onTour={() => void runLineageTour()}
+              tourStepIndex={lineageTourStepIndex}
+              setTourStepIndex={setLineageTourStepIndex}
               onSelect={(id) => {
+                invalidateAnalysisRequests();
                 setAllowHiddenSelection(true);
                 setSelectedObjectId(id);
                 setLineageAdvice(null);
+                setLineageTour(null);
+                setLineageTourStepIndex(0);
                 setImpact(null);
                 setImpactAdvice(null);
+                setImpactTour(null);
               }}
               onExpand={(id) => {
+                invalidateAnalysisRequests();
                 setAllowHiddenSelection(true);
                 setLineageAdvice(null);
+                setLineageTour(null);
+                setLineageTourStepIndex(0);
                 setImpact(null);
                 setImpactAdvice(null);
+                setImpactTour(null);
                 void runLineage(id);
               }}
               busy={busy === 'lineage'}
               adviceBusy={busy === 'lineage-advice'}
+              tourBusy={busy === 'lineage-tour'}
             />
           ) : null}
 
@@ -1467,8 +1822,14 @@ export default function App() {
               onAdvice={() => void runImpactAdvice()}
               impact={impact}
               impactAdvice={impactAdvice}
+              impactTour={impactTour}
+              objectFreshness={selectedFreshness}
               busy={busy === 'impact'}
               adviceBusy={busy === 'impact-advice'}
+              tourBusy={busy === 'impact-tour'}
+              onTour={() => void runImpactTour()}
+              tourStepIndex={impactTourStepIndex}
+              setTourStepIndex={setImpactTourStepIndex}
             />
           ) : null}
 
@@ -1499,12 +1860,19 @@ export default function App() {
               terms={glossaryTerms}
               onSearch={() => void searchGlossary()}
               onSelectObject={(objectId) => {
+                invalidateAnalysisRequests();
                 setAllowHiddenSelection(true);
                 setSelectedObjectId(objectId);
+                setObjectDetail(null);
                 setLineage(null);
                 setLineageAdvice(null);
+                setLineageTour(null);
+                setLineageTourStepIndex(0);
                 setImpact(null);
                 setImpactAdvice(null);
+                setImpactTour(null);
+                setImpactTourStepIndex(0);
+                setObjectFreshness(null);
                 setActiveTab('lineage');
               }}
               onAddTarget={addLiveObjectName}
@@ -1520,8 +1888,10 @@ export default function App() {
 function LineageTab(props: {
   selectedObject: CatalogObject | null;
   objectDetail: CatalogObjectDetail | null;
+  objectFreshness: RequestFreshnessResponse | null;
   lineage: LineageResponse | null;
   lineageAdvice: LineageAdviceResponse | null;
+  lineageTour: LineageTourResponse | null;
   objectGlossary: GlossaryTerm[];
   graphStats: string;
   direction: Direction;
@@ -1534,18 +1904,62 @@ function LineageTab(props: {
   setEdgeCap: (value: number) => void;
   onRun: () => void;
   onAdvice: () => void;
+  onTour: () => void;
+  tourStepIndex: number;
+  setTourStepIndex: (value: number) => void;
   onSelect: (id: string) => void;
   onExpand: (id: string) => void;
   busy: boolean;
   adviceBusy: boolean;
+  tourBusy: boolean;
 }) {
+  const layerGroups = props.lineage ? groupNodesByDisplayLayer(props.lineage.nodes) : [];
+  const activeLayerGroups = DISPLAY_LAYER_ORDER
+    .filter((layer) => layer !== 'Unknown' || layerGroups.some((group) => group.layer === 'Unknown'))
+    .map((layer) => ({
+      layer,
+      count: layerGroups.find((group) => group.layer === layer)?.nodes.length ?? 0,
+    }));
+  const freshnessSummary = props.lineage ? summarizeFreshness(props.lineage.nodes, props.objectDetail?.id ?? null, props.objectFreshness) : null;
+  const selectedLayer = inferDisplayLayer(props.objectDetail ?? props.selectedObject ?? {}).label;
+  const selectedFreshnessDisplay = classifyFreshness(props.objectFreshness ?? freshnessFromMetadata(props.objectDetail?.metadata) ?? freshnessFromMetadata(props.selectedObject?.metadata));
+  const tourSteps = normalizeGuidedTourSteps(props.lineageTour);
+  const currentTourIndex = clampTourIndex(props.tourStepIndex, tourSteps);
+
   return (
-    <div className="workspaceGrid">
+    <div className="workspaceGrid sliceGWorkspaceGrid">
+      <section className="lineageSummaryStrip" aria-label="Slice G lineage status summary">
+        <div className="summaryHero">
+          <span className="eyebrow">Slice G Workbench</span>
+          <strong>{props.selectedObject?.id ?? 'Select a BW object'}</strong>
+          <small>Read-only lineage lanes · metadata and citations only · no data rows</small>
+        </div>
+        <div className="laneMiniStrip" aria-label="layer lane counts">
+          {activeLayerGroups.map((group) => (
+            <span key={group.layer} className={group.count > 0 ? 'laneMini active' : 'laneMini'}>
+              <b>{group.layer}</b><em>{group.count}</em>
+            </span>
+          ))}
+        </div>
+        <div className="freshnessMiniStrip" aria-label="freshness status counts">
+          {freshnessSummary ? (
+            <>
+              <FreshnessCount label="Fresh" count={freshnessSummary.fresh} state="fresh" />
+              <FreshnessCount label="Stale" count={freshnessSummary.stale} state="stale" />
+              <FreshnessCount label="No req" count={freshnessSummary.none} state="none" />
+              <FreshnessCount label="Unknown" count={freshnessSummary.unknown} state="unknown" />
+            </>
+          ) : (
+            <span className="mutedSmall">Run lineage to populate lane/freshness context.</span>
+          )}
+        </div>
+      </section>
+
       <section className="controlCard">
         <div className="sectionTitle">
           <span className="eyebrow">Lineage</span>
           <h1>{props.selectedObject?.id ?? '객체 선택'}</h1>
-          <p className="tabPurpose">데이터 흐름 지도: 이 객체의 데이터가 어디서 와서 어디로 가는지 확인합니다.</p>
+          <p className="tabPurpose">Layer lanes show Source → Transform → Model → Semantic → Runtime with request freshness context.</p>
           <p>{props.graphStats}</p>
         </div>
         <div className="compactForm three">
@@ -1560,10 +1974,13 @@ function LineageTab(props: {
           <NumberField label="Node cap" value={props.nodeCap} min={1} max={500} onChange={props.setNodeCap} />
           <NumberField label="Edge cap" value={props.edgeCap} min={0} max={1000} onChange={props.setEdgeCap} />
         </div>
-        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
           Lineage 실행
         </button>
-        <button className="secondaryButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
+        <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
+          Guided tour
+        </button>
+        <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
           LLM notes
         </button>
         {props.lineage ? (
@@ -1574,21 +1991,42 @@ function LineageTab(props: {
           </div>
         ) : null}
       </section>
-      <section className="graphCard">
-        <LineageGraph lineage={props.lineage} onSelect={props.onSelect} selectedId={props.objectDetail?.id ?? null} />
+      <section className="graphCard sliceGraphCard">
+        <LineageGraph
+          lineage={props.lineage}
+          onSelect={props.onSelect}
+          selectedId={props.objectDetail?.id ?? null}
+          selectedFreshness={props.objectFreshness}
+        />
       </section>
-      <aside className="detailsDrawer">
+      <aside className="detailsDrawer sliceGDrawer">
+        <GuidedTourPanel
+          title="Guided tour"
+          response={props.lineageTour}
+          steps={tourSteps}
+          currentIndex={currentTourIndex}
+          onStepIndex={props.setTourStepIndex}
+          onRun={props.onTour}
+          busy={props.tourBusy}
+        />
         <span className="eyebrow">Details</span>
         <h2>{props.objectDetail?.id ?? '선택된 node 없음'}</h2>
         {props.objectDetail ? (
           <>
-            <p>{props.objectDetail.name || props.objectDetail.label || '설명 없음'}</p>
+            <p>{props.objectDetail.summary || props.objectDetail.name || props.objectDetail.label || '설명 없음'}</p>
             <div className="detailRows">
               <span>Type</span><strong>{props.objectDetail.type}</strong>
+              <span>Layer</span><strong>{selectedLayer}</strong>
+              <span>Freshness</span><strong><FreshnessBadge display={selectedFreshnessDisplay} /></strong>
               <span>Incoming</span><strong>{props.objectDetail.incoming_count}</strong>
               <span>Outgoing</span><strong>{props.objectDetail.outgoing_count}</strong>
               <span>Evidence</span><strong>{props.objectDetail.evidence_ids.length}</strong>
             </div>
+            {props.objectDetail.tags && props.objectDetail.tags.length > 0 ? (
+              <div className="tagList" aria-label="object tags">
+                {props.objectDetail.tags.slice(0, 8).map((tag) => <span key={tag}>{tag}</span>)}
+              </div>
+            ) : null}
             <GlossaryList terms={props.objectGlossary} title="Glossary" emptyText="Glossary 용어 없음" />
             <button className="secondaryButton wide" onClick={() => props.onExpand(props.objectDetail!.id)}>
               Expand from node
@@ -1603,6 +2041,7 @@ function LineageTab(props: {
             <small>Citations: {props.lineageAdvice.citations.join(', ') || 'none'}</small>
           </div>
         ) : null}
+        <SafetyCopy />
       </aside>
     </div>
   );
@@ -1620,17 +2059,28 @@ function ImpactTab(props: {
   setImpactDepth: (value: number) => void;
   onRun: () => void;
   onAdvice: () => void;
+  onTour: () => void;
   impact: ImpactScenarioResponse | null;
   impactAdvice: ImpactAdviceResponse | null;
+  impactTour: ImpactTourResponse | null;
+  objectFreshness: RequestFreshnessResponse | null;
   busy: boolean;
   adviceBusy: boolean;
+  tourBusy: boolean;
+  tourStepIndex: number;
+  setTourStepIndex: (value: number) => void;
 }) {
+  const impactSummary = deriveImpactSummary(props.impact);
+  const freshnessDisplay = classifyFreshness(props.objectFreshness ?? freshnessFromMetadata(props.selectedObject?.metadata));
+  const tourSteps = normalizeGuidedTourSteps(props.impactTour);
+  const currentTourIndex = clampTourIndex(props.tourStepIndex, tourSteps);
+
   return (
-    <div className="impactLayout">
+    <div className="impactLayout sliceGImpactLayout">
       <section className="controlCard">
         <span className="eyebrow">Impact</span>
         <h1>변경 영향</h1>
-        <p className="tabPurpose">변경 사전 시뮬레이션: 이 객체를 바꾸면 무엇이 영향받는지 심각도순으로 확인합니다.</p>
+        <p className="tabPurpose">Change grade panel combines deterministic severity, bounded traversal, evidence IDs, and freshness context.</p>
         <div className="scenarioObject">선택 object: <strong>{props.selectedObject?.id ?? '없음'}</strong></div>
         <label>Change type
           <select value={props.changeType} onChange={(event) => props.setChangeType(event.target.value as ChangeType)}>
@@ -1644,14 +2094,52 @@ function ImpactTab(props: {
           <textarea value={props.description} onChange={(event) => props.setDescription(event.target.value)} rows={4} />
         </label>
         <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
-        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
           Impact 실행
         </button>
-        <button className="secondaryButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy}>
+        <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
+          Impact tour
+        </button>
+        <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
           LLM notes
         </button>
       </section>
-      <section className="resultCard">
+      <section className="resultCard impactWorkbenchPanel">
+        <div className="impactSummaryPanel" aria-label="change grade impact summary">
+          <div className={`gradeBadge grade-${impactSummary.grade.toString().toLowerCase()}`}>
+            <span>Change grade</span>
+            <strong>{impactSummary.gradeLabel}</strong>
+          </div>
+          <div className="impactHeadline">
+            <strong>{impactSummary.headline}</strong>
+            <small>Freshness context: <FreshnessBadge display={freshnessDisplay} /></small>
+          </div>
+          <div className="impactMetricGrid">
+            <Metric label="Affected" value={String(impactSummary.affectedCount)} />
+            <Metric label="Evidence" value={String(impactSummary.evidenceCount)} />
+            <Metric label="Manual checks" value={String(impactSummary.manualVerificationCount)} />
+            <Metric label="Bounds" value={impactSummary.truncated ? 'Truncated' : 'Complete'} />
+          </div>
+          <div className="severityBars" aria-label="severity distribution">
+            {(['HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'] as const).map((severity) => (
+              <div key={severity} className={`severityBar severity-${severity.toLowerCase()}`}>
+                <span>{severity}</span>
+                <b>{impactSummary.severityCounts[severity]}</b>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <GuidedTourPanel
+          title="Impact tour"
+          response={props.impactTour}
+          steps={tourSteps}
+          currentIndex={currentTourIndex}
+          onStepIndex={props.setTourStepIndex}
+          onRun={props.onTour}
+          busy={props.tourBusy}
+        />
+
         <span className="eyebrow">Affected</span>
         {props.impactAdvice ? (
           <div className={`llmAdviceBox ${props.impactAdvice.status}`}>
@@ -2000,35 +2488,132 @@ function TermsOverview(props: { terms: GlossaryTerm[]; onOpen: () => void }) {
   );
 }
 
-function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: string) => void; selectedId: string | null }) {
+function GuidedTourPanel(props: {
+  title: string;
+  response: LineageTourResponse | ImpactTourResponse | null;
+  steps: NormalizedTourStep[];
+  currentIndex: number;
+  onStepIndex: (value: number) => void;
+  onRun: () => void;
+  busy: boolean;
+}) {
+  const current = props.steps[props.currentIndex] ?? null;
+  const isDisabled = props.response?.status === 'disabled';
+  return (
+    <section className="guidedTourCard" aria-label={props.title}>
+      <div className="guidedTourTitle">
+        <div>
+          <span className="eyebrow">{props.title}</span>
+          <h3>{current ? `Step ${current.index}/${current.total} · ${current.title}` : 'No tour loaded'}</h3>
+        </div>
+        {current?.evidenceIds[0] ? <span className="evidencePill">{current.evidenceIds[0]}</span> : null}
+      </div>
+      {props.response?.summary ? <p className="tourSummary">{props.response.summary}</p> : null}
+      {current ? (
+        <>
+          <p>{current.description || props.response?.message || 'Guided tour step has no description.'}</p>
+          <div className="tourEvidenceList" aria-label="guided tour evidence ids">
+            {current.evidenceIds.length > 0 ? current.evidenceIds.slice(0, 6).map((id) => <code key={id}>{id}</code>) : <span>No evidence IDs returned</span>}
+          </div>
+          <div className="tourControls">
+            <button className="secondaryButton" onClick={() => props.onStepIndex(props.currentIndex - 1)} disabled={!current.canPrevious}>Previous</button>
+            <button className="primaryButton" onClick={() => props.onStepIndex(props.currentIndex + 1)} disabled={!current.canNext}>Next</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <p>{isDisabled ? props.response?.message : 'Generate a citation-bound guided tour for the selected bounded analysis.'}</p>
+          {props.response?.citations.length ? <small>Citations: {props.response.citations.join(', ')}</small> : null}
+          <button className="secondaryButton wide" onClick={props.onRun} disabled={props.busy}>{props.busy ? 'Generating…' : 'Generate guided tour'}</button>
+        </>
+      )}
+    </section>
+  );
+}
+
+function SafetyCopy() {
+  return (
+    <section className="safetyCopy" aria-label="read-only safety boundaries">
+      <strong>Safety copy · read-only local-first</strong>
+      <ul>
+        <li>No SAP write, run, activate, or transport actions.</li>
+        <li>No data rows or data-preview UI; metadata, request timestamps, and citations only.</li>
+        <li>No secrets, credentials, hostnames, API keys, cookies, or raw connection details are displayed here.</li>
+      </ul>
+    </section>
+  );
+}
+
+function FreshnessBadge(props: { display: FreshnessDisplay; compact?: boolean }) {
+  return (
+    <span className={`freshnessBadge ${props.display.state} ${props.compact ? 'compact' : ''}`} title={props.display.timestamp ?? props.display.label}>
+      <span aria-hidden="true" />{props.display.label}
+    </span>
+  );
+}
+
+function FreshnessCount(props: { label: string; count: number; state: FreshnessDisplay['state'] }) {
+  return <span className={`freshnessCount ${props.state}`}><b>{props.label}</b><em>{props.count}</em></span>;
+}
+
+function summarizeFreshness(
+  nodes: LineageResponse['nodes'],
+  selectedId: string | null,
+  selectedFreshness: RequestFreshnessResponse | null,
+): Record<FreshnessDisplay['state'], number> {
+  return nodes.reduce<Record<FreshnessDisplay['state'], number>>(
+    (counts, node) => {
+      const state = freshnessForLineageNode(node, selectedId, selectedFreshness).state;
+      counts[state] += 1;
+      return counts;
+    },
+    { fresh: 0, stale: 0, none: 0, unknown: 0 },
+  );
+}
+
+function freshnessForLineageNode(
+  node: LineageResponse['nodes'][number],
+  selectedId: string | null,
+  selectedFreshness: RequestFreshnessResponse | null,
+): FreshnessDisplay {
+  if (node.id === selectedId && selectedFreshness) return classifyFreshness(selectedFreshness);
+  return classifyFreshness(freshnessFromMetadata(node.metadata));
+}
+
+function isFreshnessMissingError(err: unknown): boolean {
+  const text = errorText(err).toLowerCase();
+  return text.includes('404') || text.includes('request_freshness not found');
+}
+
+function LineageGraph(props: {
+  lineage: LineageResponse | null;
+  onSelect: (id: string) => void;
+  selectedId: string | null;
+  selectedFreshness: RequestFreshnessResponse | null;
+}) {
   if (!props.lineage) {
     return <div className="emptyState graphEmpty">왼쪽에서 객체를 찾고 선택한 뒤 Lineage를 실행하세요. 객체명을 몰라도 Find in BW 또는 Glossary로 검색할 수 있습니다.</div>;
   }
-  const levelValues = Object.values(props.lineage.levels);
-  const minLevel = Math.min(0, ...levelValues);
-  const maxLevel = Math.max(0, ...levelValues);
-  const positions = layoutPositions(props.lineage, minLevel);
-  const maxRows = Math.max(
-    1,
-    ...Array.from(
-      Object.values(props.lineage.levels).reduce((counts, level) => {
-        counts.set(level, (counts.get(level) ?? 0) + 1);
-        return counts;
-      }, new Map<number, number>()).values(),
-    ),
-  );
-  const width = Math.max(900, (maxLevel - minLevel + 1) * 220 + 188);
-  const height = Math.max(340, maxRows * 84 + 124);
-  const nodeTypes = Array.from(new Set(props.lineage.nodes.map((node) => node.type))).slice(0, 8);
+  const groups = groupNodesByDisplayLayer(props.lineage.nodes);
+  const visibleLayers = DISPLAY_LAYER_ORDER
+    .filter((layer) => layer !== 'Unknown' || groups.some((group) => group.layer === 'Unknown'))
+    .sort(compareDisplayLayers);
+  const positions = layoutLayerPositions(props.lineage, visibleLayers);
+  const maxRows = Math.max(1, ...visibleLayers.map((layer) => groups.find((group) => group.layer === layer)?.nodes.length ?? 0));
+  const width = Math.max(940, visibleLayers.length * 214 + 84);
+  const height = Math.max(390, maxRows * 92 + 128);
   return (
-    <div className="graphSurface">
+    <div className="graphSurface sliceGGraphSurface">
       <div className="graphToolbar">
         <div>
-          <strong>Lineage graph</strong>
-          <span>{props.lineage.nodes.length} nodes · {props.lineage.edges.length} edges</span>
+          <strong>Layer-lane lineage graph</strong>
+          <span>Source → Transform → Model → Semantic → Runtime · {props.lineage.nodes.length} nodes · {props.lineage.edges.length} edges</span>
         </div>
-        <div className="legendList">
-          {nodeTypes.map((type) => <span key={type} className={`legendPill ${nodeTypeClass(type)}`}>{type}</span>)}
+        <div className="legendList freshnessLegend">
+          <FreshnessBadge display={{ state: 'fresh', label: 'Fresh < 2h' }} compact />
+          <FreshnessBadge display={{ state: 'stale', label: 'Stale 3d' }} compact />
+          <FreshnessBadge display={{ state: 'none', label: 'No requests' }} compact />
+          <FreshnessBadge display={{ state: 'unknown', label: 'Unknown' }} compact />
         </div>
       </div>
       {props.lineage.truncated ? (
@@ -2037,18 +2622,20 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
         </div>
       ) : null}
       <div className="graphCanvas">
-        <svg className="lineageSvg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="SAP BW Lineage graph">
+        <svg className="lineageSvg laneLineageSvg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="SAP BW layer-lane lineage graph">
           <defs>
             <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
               <path d="M 0 0 L 10 5 L 0 10 z" />
             </marker>
           </defs>
-          {Array.from(new Set(Object.values(props.lineage.levels))).sort((a, b) => a - b).map((level) => {
-            const x = 112 + (level - minLevel) * 220;
+          {visibleLayers.map((layer, index) => {
+            const x = 38 + index * 214;
+            const count = groups.find((group) => group.layer === layer)?.nodes.length ?? 0;
             return (
-              <g key={`level-${level}`}>
-                <line x1={x} y1="64" x2={x} y2={height - 38} className="levelGuide" />
-                <text x={x - 30} y="38" className="levelLabel">Level {level}</text>
+              <g key={layer} className={`layerLaneSvg layer-${layer.toLowerCase()}`}>
+                <rect x={x} y="52" width="194" height={height - 86} rx="12" />
+                <text x={x + 14} y="34" className="layerLabelSvg">{layer}</text>
+                <text x={x + 168} y="34" className="layerCountSvg">{count}</text>
               </g>
             );
           })}
@@ -2057,13 +2644,13 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
             const target = positions[edge.target];
             if (!source || !target) return null;
             const goesRight = source.x <= target.x;
-            const startX = source.x + (goesRight ? 88 : -88);
-            const targetX = target.x + (goesRight ? -88 : 88);
-            const curve = Math.max(70, Math.abs(targetX - startX) / 2);
+            const startX = source.x + (goesRight ? 90 : -90);
+            const targetX = target.x + (goesRight ? -90 : 90);
+            const curve = Math.max(54, Math.abs(targetX - startX) / 2);
             const c1 = goesRight ? startX + curve : startX - curve;
             const c2 = goesRight ? targetX - curve : targetX + curve;
             const labelX = (source.x + target.x) / 2;
-            const labelY = (source.y + target.y) / 2 - 10;
+            const labelY = (source.y + target.y) / 2 - 12;
             return (
               <g key={edge.id} className={`edgeGroup ${edgeTypeClass(edge.type)}`}>
                 <path d={`M ${startX} ${source.y} C ${c1} ${source.y}, ${c2} ${target.y}, ${targetX} ${target.y}`} className="edgeLine" markerEnd="url(#arrow)" />
@@ -2074,19 +2661,23 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
           {props.lineage.nodes.map((node) => {
             const point = positions[node.id];
             const omitted = props.lineage?.omitted_neighbor_counts[node.id] ?? 0;
+            const freshness = freshnessForLineageNode(node, props.selectedId, props.selectedFreshness);
+            const layer = inferDisplayLayer(node).label;
+            if (!point) return null;
             return (
               <g
                 key={node.id}
-                transform={`translate(${point.x - 88}, ${point.y - 25})`}
+                transform={`translate(${point.x - 90}, ${point.y - 32})`}
                 onClick={() => props.onSelect(node.id)}
                 className={`nodeGroup ${nodeTypeClass(node.type)} ${node.id === props.lineage?.start_id ? 'start' : ''} ${node.id === props.selectedId ? 'selected' : ''}`}
               >
-                <title>{node.id} · {node.type}</title>
-                <rect className="nodeCard" width="176" height="50" rx="6" />
-                <rect className="nodeAccent" width="3" height="50" rx="1.5" />
-                <text x="12" y="19" className="nodeId">{shortLabel(node.id, 24)}</text>
-                <text x="12" y="36" className="nodeType">{shortLabel(node.type, 20)}</text>
-                {omitted > 0 ? <text x="138" y="36" className="nodeBadge">+{omitted}</text> : null}
+                <title>{node.id} · {node.type} · {layer} · {freshness.label}</title>
+                <rect className="nodeCard laneNodeCard" width="180" height="64" rx="8" />
+                <rect className="nodeAccent" width="3" height="64" rx="1.5" />
+                <text x="12" y="18" className="nodeId">{shortLabel(node.id, 24)}</text>
+                <text x="12" y="34" className="nodeType">{shortLabel(`${node.type} · ${layer}`, 24)}</text>
+                <text x="12" y="52" className={`nodeFreshnessText freshness-${freshness.state}`}>{freshness.label}</text>
+                {omitted > 0 ? <text x="142" y="52" className="nodeBadge">+{omitted}</text> : null}
               </g>
             );
           })}
@@ -2096,15 +2687,27 @@ function LineageGraph(props: { lineage: LineageResponse | null; onSelect: (id: s
   );
 }
 
-function layoutPositions(lineage: LineageResponse, minLevel = 0): Record<string, { x: number; y: number }> {
-  const byLevel = new Map<number, string[]>();
-  Object.entries(lineage.levels).forEach(([id, level]) => {
-    byLevel.set(level, [...(byLevel.get(level) ?? []), id]);
+function layoutLayerPositions(
+  lineage: LineageResponse,
+  layers: DisplayLayer[],
+): Record<string, { x: number; y: number }> {
+  const byLayer = new Map<DisplayLayer, LineageResponse['nodes']>();
+  layers.forEach((layer) => byLayer.set(layer, []));
+  lineage.nodes.forEach((node) => {
+    const layer = inferDisplayLayer(node).layer;
+    byLayer.set(layer, [...(byLayer.get(layer) ?? []), node]);
   });
+
   const positions: Record<string, { x: number; y: number }> = {};
-  byLevel.forEach((ids, level) => {
-    ids.sort().forEach((id, index) => {
-      positions[id] = { x: 112 + (level - minLevel) * 220, y: 84 + index * 84 };
+  layers.forEach((layer, layerIndex) => {
+    const nodes = [...(byLayer.get(layer) ?? [])].sort((left, right) => {
+      const leftLevel = lineage.levels[left.id] ?? 0;
+      const rightLevel = lineage.levels[right.id] ?? 0;
+      if (leftLevel !== rightLevel) return leftLevel - rightLevel;
+      return left.id.localeCompare(right.id);
+    });
+    nodes.forEach((node, rowIndex) => {
+      positions[node.id] = { x: 135 + layerIndex * 214, y: 96 + rowIndex * 92 };
     });
   });
   return positions;
