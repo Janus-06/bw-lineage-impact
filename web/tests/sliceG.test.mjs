@@ -407,6 +407,51 @@ test('guarded capture and refresh keep snapshot reload inside the request token'
   assert.match(refreshBody, /getGlossary\(refreshedSnapshotId, glossaryQuery\.trim\(\) \|\| undefined\)/);
 });
 
+test('responsive shell does not force narrow viewports into horizontal overlap', () => {
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+
+  assert.doesNotMatch(
+    css,
+    /body\s*\{[^}]*min-width:\s*(?:9\d{2}|1\d{3})px/i,
+    'body must not force 960px+ width on narrow laptops/tablets',
+  );
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*900px\)[\s\S]*?\.appFrame\s*\{[^}]*grid-template-columns:\s*1fr/i,
+    'the main shell should collapse to one column below tablet width',
+  );
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*900px\)[\s\S]*?\.sliceGWorkspaceGrid\s*\{[^}]*grid-template-columns:\s*1fr/i,
+    'Slice G workbench columns should stack below tablet width',
+  );
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*900px\)[\s\S]*?\.catalogPane\s*\{[^}]*position:\s*static/i,
+    'the sticky sidebar should become an in-flow card on narrow screens',
+  );
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*700px\)[\s\S]*?\.topStatus\s*\{[^}]*grid-template-columns:\s*1fr/i,
+    'the header status strip should stack on phone-sized widths',
+  );
+
+  const lastConnectionRule = css.lastIndexOf('.connectionOps li {');
+  const lastMobileRule = css.lastIndexOf('@media (max-width: 700px)');
+  assert.ok(lastMobileRule > lastConnectionRule, 'phone-width grid overrides must come after connectionOps rules');
+  const finalMobileCss = css.slice(lastMobileRule);
+  assert.match(
+    finalMobileCss,
+    /\.connectionOps li[\s\S]*?grid-template-columns:\s*1fr/,
+    'connection diagnostics rows should remain one column on phone widths after cascade ordering',
+  );
+  assert.match(
+    finalMobileCss,
+    /\.captureOps li[\s\S]*?grid-template-columns:\s*1fr/,
+    'capture operation rows should remain one column on phone widths after cascade ordering',
+  );
+});
+
 test('snapshot context and glossary writes are guarded by snapshot and request identity', () => {
   const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
 

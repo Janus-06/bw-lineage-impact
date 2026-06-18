@@ -26,7 +26,7 @@
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 1120px; min-height: 100vh; background: var(--bg); font-size: 13px; }
+body { margin: 0; min-width: 0; min-height: 100vh; background: var(--bg); font-size: 13px; }
 button, input, select, textarea { min-width: 0; font: inherit; }
 button { border: 0; }
 button:not(:disabled) { cursor: pointer; }
@@ -323,11 +323,95 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.015em; }
 .graphEmpty { display: grid; place-items: center; min-height: 340px; }
 
 @media (max-width: 1240px) {
-  body { min-width: 960px; }
   .topStatus { grid-template-columns: 250px 1fr; }
   .topStatus > .ghostButton { grid-column: 1 / -1; justify-self: end; }
   .workspaceGrid { grid-template-columns: 280px minmax(0, 1fr); }
   .detailsDrawer { position: static; grid-column: 1 / -1; }
+}
+
+@media (max-width: 900px) {
+  .appShell { padding: 8px; }
+  .topStatus {
+    position: static;
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+  .topStatus > .ghostButton {
+    grid-column: auto;
+    justify-self: stretch;
+  }
+  .statusStrip { align-items: flex-start; }
+  .statusPill { max-width: 100%; }
+  .setupPrompt {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .setupPrompt button { width: 100%; }
+  .appFrame { grid-template-columns: 1fr; }
+  .catalogPane {
+    position: static;
+    top: auto;
+    height: auto;
+    max-height: none;
+  }
+  .workspacePane {
+    min-height: auto;
+    padding: 12px;
+  }
+  .workspaceGrid,
+  .impactLayout,
+  .sliceGImpactLayout,
+  .sqlLayout,
+  .glossaryLayout {
+    grid-template-columns: 1fr;
+  }
+  .sliceGWorkspaceGrid { grid-template-columns: 1fr; }
+  .detailsDrawer,
+  .sliceGDrawer,
+  .graphCard,
+  .resultCard { grid-column: 1 / -1; }
+  .tabBar {
+    display: flex;
+    width: 100%;
+    overflow-x: auto;
+  }
+  .tabButton { flex: 0 0 auto; }
+}
+
+@media (max-width: 700px) {
+  .topStatus { grid-template-columns: 1fr; }
+  .brandBlock { display: block; }
+  .setupGrid,
+  .settingsDrawer .setupGrid,
+  .setupStepper,
+  .liveOptionsGrid,
+  .liveObjectTools,
+  .compactForm.three,
+  .captureRow,
+  .metaGrid,
+  .impactMetricGrid,
+  .severityBars,
+  .sqlAnalysisGrid,
+  .basisRow,
+  .repoPathRow,
+  .connectionOps li,
+  .captureOps li {
+    grid-template-columns: 1fr;
+  }
+  .checkField,
+  .setupHint { grid-column: 1 / -1; }
+  .controlCard,
+  .graphCard,
+  .detailsDrawer,
+  .resultCard,
+  .guidedTourCard,
+  .safetyCopy,
+  .impactSummaryPanel { padding: 12px; }
+  .graphToolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .legendList { justify-content: flex-start; }
 }
 
 .connectionBadge {
@@ -667,4 +751,24 @@ pre { border: 1px solid var(--border); background: #0b0d13; color: #dce4ff; }
   .sliceGWorkspaceGrid { grid-template-columns: 280px minmax(0, 1fr); }
   .sliceGDrawer { grid-column: 1 / -1; }
   .impactMetricGrid, .severityBars { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  .sliceGWorkspaceGrid { grid-template-columns: 1fr; }
+  .sliceGImpactLayout,
+  .impactLayout,
+  .sqlLayout,
+  .glossaryLayout {
+    grid-template-columns: 1fr;
+  }
+  .sliceGDrawer { grid-column: 1 / -1; }
+}
+
+@media (max-width: 700px) {
+  .impactMetricGrid,
+  .severityBars,
+  .connectionOps li,
+  .captureOps li {
+    grid-template-columns: 1fr;
+  }
 }
