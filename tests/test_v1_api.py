@@ -36,6 +36,7 @@ def test_v1_runtime_config_auto_seeds_env_and_clear_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    monkeypatch.delenv("BW_COOKIE_FILE", raising=False)
     monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
     monkeypatch.setenv("BW_USER", "env-user")
     monkeypatch.setenv("BW_PASSWORD", "env-secret-value")
@@ -84,6 +85,28 @@ def test_v1_runtime_config_auto_seeds_env_and_clear_falls_back(
     assert "env-secret-value" not in cleared.text
 
 
+def test_v1_runtime_config_env_without_cookie_requires_bw_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
+    monkeypatch.setenv("BW_PASSWORD", "env-secret-value")
+    monkeypatch.setenv("BW_CLIENT", "100")
+    client = TestClient(create_app(project_root=tmp_path))
+
+    response = client.get("/api/v1/runtime-config")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["connection_status"] == "unconfigured"
+    assert payload["bw"]["configured"] is False
+    assert payload["bw"]["user"] is None
+    assert payload["bw"]["password"] is None
+    assert "env-secret-value" not in response.text
+
+
 def test_v1_runtime_config_loads_project_dotenv_as_startup_seed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -93,6 +116,7 @@ def test_v1_runtime_config_loads_project_dotenv_as_startup_seed(
         "BW_URL",
         "BW_USER",
         "BW_PASSWORD",
+        "BW_COOKIE_FILE",
         "BW_CLIENT",
         "BW_LANGUAGE",
         "BW_VERIFY_SSL",
@@ -158,6 +182,7 @@ _RUNTIME_ENV_KEYS = (
     "BW_URL",
     "BW_USER",
     "BW_PASSWORD",
+    "BW_COOKIE_FILE",
     "BW_CLIENT",
     "BW_LANGUAGE",
     "BW_VERIFY_SSL",

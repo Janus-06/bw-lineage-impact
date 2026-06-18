@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -52,10 +52,12 @@ class BwClient:
         self,
         *,
         base_url: str,
-        username: str,
-        password: str,
+        username: str | None,
+        password: str | None,
         sap_client: str,
         language: str = "EN",
+        initial_cookies: Mapping[str, str] | None = None,
+        frozen_cookie_names: Iterable[str] | None = None,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 30.0,
         verify: HttpxVerify = True,
@@ -65,20 +67,41 @@ class BwClient:
         self._language = language
         self._csrf_token: str | None = None
         self._csrf_token_fetched_at: float | None = None
+        self._cookie_mode = initial_cookies is not None
+        self._cookies: dict[str, str] = dict(initial_cookies or {})
+        self._frozen_cookie_names = set(
+            frozen_cookie_names if frozen_cookie_names is not None else self._cookies
+        )
+        if self._cookie_mode and not self._cookies:
+            raise ValueError("cookie mode requires at least one initial cookie")
+        if self._cookie_mode:
+            auth: tuple[str, str] | None = None
+        else:
+            if username is None or password is None:
+                raise ValueError("username and password are required without BW_COOKIE_FILE")
+            auth = (username, password)
         base_url = base_url.rstrip("/")
+        if self._cookie_mode and _url_contains_userinfo(base_url):
+            raise ValueError("BW URL must not include embedded credentials in cookie mode")
         if trust_env:
             _ensure_no_proxy_for_url(base_url)
+        headers = {
+            "User-Agent": ECLIPSE_USER_AGENT,
+            "X-sap-adt-profiling": _ADT_PROFILING,
+            "bwmt-level": _BWMT_LEVEL,
+            "sap-language": language,
+        }
+        if not self._cookie_mode:
+            headers.update(
+                {
+                    "X-sap-adt-sessiontype": _ADT_SESSION_TYPE,
+                    "sap-client": sap_client,
+                }
+            )
         self._client = httpx.Client(
             base_url=base_url,
-            auth=(username, password),
-            headers={
-                "User-Agent": ECLIPSE_USER_AGENT,
-                "X-sap-adt-profiling": _ADT_PROFILING,
-                "X-sap-adt-sessiontype": _ADT_SESSION_TYPE,
-                "bwmt-level": _BWMT_LEVEL,
-                "sap-client": sap_client,
-                "sap-language": language,
-            },
+            auth=auth,
+            headers=headers,
             transport=transport,
             timeout=timeout,
             verify=verify,
@@ -190,7 +213,8 @@ class BwClient:
         *,
         fallback_statuses: set[int],
     ) -> Any:
-        self._ensure_session()
+        if not self._read_requests_use_frozen_cookies():
+            self._ensure_session()
         response: httpx.Response | None = None
         for index, endpoint in enumerate(endpoints):
             response = self._request_read_with_auth_retry(endpoint)
@@ -204,14 +228,22 @@ class BwClient:
 
     def _request_read_with_auth_retry(self, endpoint: Endpoint) -> httpx.Response:
         response = self._request_read(endpoint)
-        if response.status_code not in _AUTH_RETRY_STATUSES:
+        if self._cookie_mode or response.status_code not in _AUTH_RETRY_STATUSES:
             return response
         self._clear_session()
         self._ensure_session()
         return self._request_read(endpoint)
 
     def _response_payload(self, response: httpx.Response) -> Any:
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if self._cookie_mode:
+                raise RuntimeError(
+                    "BW cookie authentication failed "
+                    f"(HTTP {response.status_code}); refresh BW_COOKIE_FILE and retry."
+                ) from exc
+            raise
         content_type = response.headers.get("content-type", "")
         if "json" in content_type.lower():
             return response.json()
@@ -228,12 +260,14 @@ class BwClient:
         request_headers.update(endpoint.headers)
         if self._csrf_token:
             request_headers["X-CSRF-Token"] = self._csrf_token
+        request_headers.update(self._cookie_headers())
         response = self._client.request(
             "GET",
             endpoint.path,
             params=endpoint.params,
             headers=request_headers,
         )
+        self._update_cookies(response)
         return response
 
     def _ensure_session(self) -> None:
@@ -246,11 +280,18 @@ class BwClient:
                 "Accept": "application/xml",
                 "X-CSRF-Token": "Fetch",
                 "sap-adt-request-id": str(uuid4()),
+                **self._cookie_headers(),
             },
         )
+        self._update_cookies(response)
         response.raise_for_status()
         token = response.headers.get("x-csrf-token")
         if not token or token.lower() == "fetch":
+            if self._cookie_mode:
+                raise RuntimeError(
+                    "Failed to fetch CSRF token in cookie mode; "
+                    "refresh BW_COOKIE_FILE and retry."
+                )
             raise RuntimeError(
                 "Failed to fetch CSRF token from BW systeminfo "
                 f"(HTTP {response.status_code})."
@@ -266,6 +307,28 @@ class BwClient:
     def _clear_session(self) -> None:
         self._csrf_token = None
         self._csrf_token_fetched_at = None
+
+    def _read_requests_use_frozen_cookies(self) -> bool:
+        return self._cookie_mode and bool(self._frozen_cookie_names)
+
+    def _cookie_headers(self) -> dict[str, str]:
+        if not self._cookie_mode or not self._cookies:
+            return {}
+        cookie_header = "; ".join(
+            f"{name}={value}" for name, value in self._cookies.items()
+        )
+        return {"Cookie": cookie_header}
+
+    def _update_cookies(self, response: httpx.Response) -> None:
+        if not self._cookie_mode:
+            return
+        for set_cookie in response.headers.get_list("set-cookie"):
+            pair = set_cookie.split(";", 1)[0].strip()
+            name, separator, value = pair.partition("=")
+            name = name.strip()
+            if not separator or not name or name in self._frozen_cookie_names:
+                continue
+            self._cookies[name] = value.strip()
 
 
 def _ensure_no_proxy_for_url(
@@ -284,6 +347,11 @@ def _ensure_no_proxy_for_url(
     env["NO_PROXY"] = updated
     if "no_proxy" in env:
         env["no_proxy"] = _append_no_proxy_host(env.get("no_proxy", ""), host)
+
+
+def _url_contains_userinfo(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    return parsed.username is not None or parsed.password is not None
 
 
 def _append_no_proxy_host(value: str, host: str) -> str:

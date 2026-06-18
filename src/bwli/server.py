@@ -19,7 +19,12 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from bwli import __version__
 from bwli.client import BwClient
-from bwli.config import ConfigError, LlmRuntimeConfig, validate_local_llm_base_url
+from bwli.config import (
+    ConfigError,
+    LlmRuntimeConfig,
+    load_bw_cookie_file,
+    validate_local_llm_base_url,
+)
 from bwli.dataflow import DataflowOutputFormat, render_dataflow
 from bwli.domain import summarize_impact_domain, summarize_lineage_domain
 from bwli.endpoints import (
@@ -133,6 +138,7 @@ class RuntimeBwConfigState(BaseModel):
     url: str | None = None
     user: str | None = None
     password: str | None = None
+    cookie_file: str | None = None
     client: str | None = None
     language: str = "EN"
     verify_ssl: bool = True
@@ -1162,17 +1168,26 @@ def _reset_runtime_config(state: RuntimeConfigState, env: Mapping[str, str]) -> 
 
 
 def _env_bw_state(env: Mapping[str, str]) -> RuntimeBwConfigState:
-    required = ("BW_URL", "BW_USER", "BW_CLIENT")
+    cookie_file = _optional_env(env, "BW_COOKIE_FILE")
+    required = ("BW_URL", "BW_CLIENT")
     if any(not _has_text(env.get(name)) for name in required):
         return RuntimeBwConfigState()
-    if not _has_secret_text(env.get("BW_PASSWORD")):
+    if cookie_file is None and (
+        not _has_text(env.get("BW_USER")) or not _has_secret_text(env.get("BW_PASSWORD"))
+    ):
         return RuntimeBwConfigState()
+    if cookie_file is not None:
+        try:
+            load_bw_cookie_file(cookie_file)
+        except (ConfigError, ValueError):
+            return RuntimeBwConfigState()
     return RuntimeBwConfigState(
         source="env",
         configured=True,
         url=env["BW_URL"].strip(),
-        user=env["BW_USER"].strip(),
-        password=env["BW_PASSWORD"],
+        user=env["BW_USER"].strip() if _has_text(env.get("BW_USER")) else None,
+        password=env["BW_PASSWORD"] if _has_secret_text(env.get("BW_PASSWORD")) else None,
+        cookie_file=cookie_file,
         client=env["BW_CLIENT"].strip(),
         language=env.get("BW_LANGUAGE", "EN").strip() or "EN",
         verify_ssl=_env_bool(env, "BW_VERIFY_SSL", default=True),
@@ -1390,6 +1405,7 @@ def _bw_materially_changed(
         previous.url,
         previous.user,
         previous.password,
+        previous.cookie_file,
         previous.client,
         previous.language,
         previous.verify_ssl,
@@ -1399,6 +1415,7 @@ def _bw_materially_changed(
         new.url,
         new.user,
         new.password,
+        new.cookie_file,
         new.client,
         new.language,
         new.verify_ssl,
@@ -1672,7 +1689,10 @@ def _build_runtime_bw_client(
 ) -> BwReadClient:
     if factory is not None:
         return factory(state)
-    if not state.url or not state.user or not state.password or not state.client:
+    if not state.url or not state.client:
+        raise ConfigError("BW runtime config is incomplete")
+    initial_cookies = load_bw_cookie_file(state.cookie_file) if state.cookie_file else None
+    if initial_cookies is None and (not state.user or not state.password):
         raise ConfigError("BW runtime config is incomplete")
     return BwClient(
         base_url=state.url,
@@ -1680,6 +1700,7 @@ def _build_runtime_bw_client(
         password=state.password,
         sap_client=state.client,
         language=state.language,
+        initial_cookies=initial_cookies,
         verify=state.ca_bundle if state.verify_ssl and state.ca_bundle else state.verify_ssl,
         trust_env=state.trust_env,
     )

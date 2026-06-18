@@ -613,6 +613,103 @@ def test_bw_client_bootstraps_session_before_first_search_dataflow_xref(
     assert seen_cookies[1] == "SAP_SESSIONID=bootstrap-session"
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://url-user@bw.example.invalid",
+        "https://url-user:url-password@bw.example.invalid",
+        "https://:url-password@bw.example.invalid",
+    ],
+)
+def test_cookie_auth_rejects_url_userinfo_without_requesting(base_url: str) -> None:
+    seen_headers: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(request.headers)
+        return httpx.Response(200, json={"ok": True})
+
+    with pytest.raises(ValueError, match="embedded credentials in cookie mode") as exc_info:
+        BwClient(
+            base_url=base_url,
+            username=None,
+            password=None,
+            sap_client="100",
+            language="EN",
+            initial_cookies={"SAP_SESSIONID": "file-session"},
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        )
+
+    assert seen_headers == []
+    message = str(exc_info.value)
+    assert "url-user" not in message
+    assert "url-password" not in message
+    assert "bw.example.invalid" not in message
+
+
+def test_cookie_auth_get_only_no_csrf_when_frozen() -> None:
+    seen_methods: list[str] = []
+    seen_paths: list[str] = []
+    seen_headers: list[httpx.Headers] = []
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        seen_methods.append(request.method)
+        seen_paths.append(request.url.path)
+        seen_headers.append(request.headers)
+        assert request.url.path != "/sap/bw/modeling/repo/is/systeminfo"
+        if attempts == 1:
+            return httpx.Response(
+                200,
+                json={"ok": True},
+                headers=[
+                    ("set-cookie", "SAP_SESSIONID=server-session; Path=/; HttpOnly"),
+                    ("set-cookie", "NEW_COOKIE=new-value; Path=/; HttpOnly"),
+                ],
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username=None,
+        password=None,
+        sap_client="100",
+        language="EN",
+        initial_cookies={
+            "SAP_SESSIONID": "file-session",
+            "__VCAP_ID__": "app-instance",
+        },
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+
+    try:
+        assert client.fetch_search("ADSO") == {"ok": True}
+        assert client.fetch_search("ADSO") == {"ok": True}
+    finally:
+        client.close()
+
+    assert seen_methods == ["GET", "GET"]
+    assert seen_paths == [
+        "/sap/bw/modeling/repo/is/bwsearch",
+        "/sap/bw/modeling/repo/is/bwsearch",
+    ]
+    for headers in seen_headers:
+        assert "authorization" not in headers
+        assert "sap-client" not in headers
+        assert "x-sap-adt-sessiontype" not in headers
+        assert "x-csrf-token" not in headers
+        assert headers["sap-language"] == "EN"
+        assert headers["bwmt-level"] == "50"
+    assert seen_headers[0]["cookie"] == "SAP_SESSIONID=file-session; __VCAP_ID__=app-instance"
+    assert "SAP_SESSIONID=file-session" in seen_headers[1]["cookie"]
+    assert "SAP_SESSIONID=server-session" not in seen_headers[1]["cookie"]
+    assert "__VCAP_ID__=app-instance" in seen_headers[1]["cookie"]
+    assert "NEW_COOKIE=new-value" in seen_headers[1]["cookie"]
+
+
 def test_bw_client_reuses_fresh_csrf_token_before_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

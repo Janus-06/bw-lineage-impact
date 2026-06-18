@@ -7,12 +7,25 @@ from urllib.parse import urlparse
 _BW_HOST_PLACEHOLDER = "[BW_HOST]"
 _BW_URL_PLACEHOLDER = "[BW_URL]"
 _SECRET_PLACEHOLDER = "[REDACTED]"
+_COOKIE_PLACEHOLDER = "[COOKIE_REDACTED]"
 
 _SECRET_KEY_PATTERN = re.compile(
     r"(?i)(authorization|password|passwd|pwd|token|api[_-]?key)(\s*[:=]\s*)(?:Bearer\s+)?[^\s,;&]+",
 )
 _URL_USERINFO_PATTERN = re.compile(r"(?i)(https?://)[^\s/@]+@")
 _BEARER_PATTERN = re.compile(r"(?i)Bearer\s+[^\s,;&]+")
+_COOKIE_HEADER_PATTERN = re.compile(r"(?im)^([ \t]*(?:cookie|set-cookie)[ \t]*:[ \t]*).+$")
+_COOKIE_PARAM_PATTERN = re.compile(
+    r"(?im)(^|[?&;\s])"
+    r"(((?:bw[_\-\s]*)?(?:cookie|set[_\-\s]*cookie|cookies)(?:[_\-\s]?\w*)?)"
+    r"\s*[:=]\s*)"
+    r"[^&;\s]+"
+)
+_COOKIE_PAIR_PATTERN = re.compile(
+    r"(?i)(^|[?&;\s])"
+    r"(?:SAP_SESSIONID(?:_[A-Za-z0-9]+)*|__VCAP_ID__|MYSAPSSO2|JSESSIONID|XSRF-TOKEN)"
+    r"=[^&;\s]+"
+)
 
 
 def redact_text(
@@ -43,6 +56,9 @@ def redact_text(
     redacted = _SECRET_KEY_PATTERN.sub(rf"\1\2{_SECRET_PLACEHOLDER}", redacted)
     redacted = _URL_USERINFO_PATTERN.sub(rf"\1{_SECRET_PLACEHOLDER}@", redacted)
     redacted = _BEARER_PATTERN.sub(f"Bearer {_SECRET_PLACEHOLDER}", redacted)
+    redacted = _COOKIE_HEADER_PATTERN.sub(rf"\1{_COOKIE_PLACEHOLDER}", redacted)
+    redacted = _COOKIE_PARAM_PATTERN.sub(rf"\1\2{_COOKIE_PLACEHOLDER}", redacted)
+    redacted = _COOKIE_PAIR_PATTERN.sub(rf"\1{_COOKIE_PLACEHOLDER}", redacted)
     return redacted
 
 
