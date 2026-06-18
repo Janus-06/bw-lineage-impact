@@ -4,9 +4,20 @@ import json
 from typing import cast
 
 from bwli.config import LlmRuntimeConfig
+from bwli.domain import summarize_lineage_domain
 from bwli.llm.explainer import _validate_completion_citations, _validate_completion_safety
-from bwli.llm.openai_compatible import ChatMessage, LlmChatRequest, OpenAICompatibleClient
+from bwli.llm.openai_compatible import (
+    ChatMessage,
+    LlmChatRequest,
+    LlmCompletion,
+    OpenAICompatibleClient,
+)
 from bwli.llm.sanitizer import sanitize_llm_evidence
+from bwli.llm.tour import (
+    TourRequestContext,
+    build_guided_tour_request_context,
+    validate_tour_completion_content,
+)
 
 _MAX_GRAPH_NODES = 80
 _MAX_GRAPH_EDGES = 120
@@ -77,6 +88,71 @@ def create_lineage_advice(
         "advice": completion.content,
         "citations": chat_request.citation_ids,
         "llm_audit": completion.audit.model_dump(mode="json"),
+    }
+
+
+def build_lineage_tour_request(
+    lineage_payload: dict[str, object],
+    *,
+    include_korean_summary: bool = False,
+) -> LlmChatRequest:
+    """Build a citation-bound guided-tour prompt from deterministic lineage evidence."""
+
+    return _build_lineage_tour_context(
+        lineage_payload,
+        include_korean_summary=include_korean_summary,
+    ).request
+
+
+def validate_lineage_tour_completion(
+    content: str,
+    lineage_payload: dict[str, object],
+    *,
+    include_korean_summary: bool = False,
+) -> dict[str, object]:
+    """Validate LLM tour JSON against citations and present lineage node/edge IDs."""
+
+    context = _build_lineage_tour_context(
+        lineage_payload,
+        include_korean_summary=include_korean_summary,
+    )
+    return validate_tour_completion_content(
+        content,
+        citation_ids=context.request.citation_ids,
+        allowed_node_ids=context.allowed_node_ids,
+        allowed_edge_ids=context.allowed_edge_ids,
+        include_korean_summary=include_korean_summary,
+    )
+
+
+def create_lineage_tour(
+    lineage_payload: dict[str, object],
+    *,
+    runtime: LlmRuntimeConfig,
+    include_korean_summary: bool = False,
+) -> dict[str, object]:
+    """Create and validate a guided lineage tour from sanitized deterministic evidence."""
+
+    context = _build_lineage_tour_context(
+        lineage_payload,
+        include_korean_summary=include_korean_summary,
+    )
+    completion = OpenAICompatibleClient(runtime=runtime).chat(context.request)
+    _validate_completion_safety(completion)
+    tour_result = validate_tour_completion_content(
+        completion.content,
+        citation_ids=context.request.citation_ids,
+        allowed_node_ids=context.allowed_node_ids,
+        allowed_edge_ids=context.allowed_edge_ids,
+        include_korean_summary=include_korean_summary,
+    )
+    completion = _mark_citation_validation_passed(completion)
+    return {
+        "summary": tour_result["summary"],
+        "tour": tour_result["tour"],
+        "citations": tour_result["citations"],
+        "llm_audit": completion.audit.model_dump(mode="json"),
+        "domain_summary": context.domain_summary,
     }
 
 
@@ -185,6 +261,55 @@ def _lineage_evidence_payload(
             "total": len(edges_raw),
         }
     return evidence, citations
+
+
+def _build_lineage_tour_context(
+    lineage_payload: dict[str, object],
+    *,
+    include_korean_summary: bool,
+) -> TourRequestContext:
+    evidence, citations = _lineage_evidence_payload(lineage_payload)
+    sanitized = sanitize_llm_evidence(evidence)
+    safe_evidence = (
+        cast(dict[str, object], sanitized.data)
+        if isinstance(sanitized.data, dict)
+        else {}
+    )
+    domain_summary = summarize_lineage_domain(safe_evidence)
+    bounded_evidence = _truncate_evidence_text(safe_evidence)
+    bounded_evidence, citations = _cap_serialized_evidence(bounded_evidence, citations)
+    if not isinstance(bounded_evidence, dict):
+        bounded_evidence = {}
+    allowed_node_ids = _item_ids(bounded_evidence.get("nodes"))
+    allowed_edge_ids = _item_ids(bounded_evidence.get("edges"))
+    return build_guided_tour_request_context(
+        task="lineage_tour",
+        evidence_label="lineage_evidence",
+        evidence=bounded_evidence,
+        citations=citations,
+        domain_summary=domain_summary,
+        allowed_node_ids=allowed_node_ids,
+        allowed_edge_ids=allowed_edge_ids,
+        include_korean_summary=include_korean_summary,
+    )
+
+
+def _item_ids(value: object) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {
+        item["id"]
+        for item in value
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+
+def _mark_citation_validation_passed(completion: LlmCompletion) -> LlmCompletion:
+    return completion.model_copy(
+        update={
+            "audit": completion.audit.model_copy(update={"citation_validation": "passed"})
+        }
+    )
 
 
 def _cap_item_evidence_ids(item: dict[str, object]) -> None:

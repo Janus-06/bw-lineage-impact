@@ -4,9 +4,20 @@ import json
 from typing import cast
 
 from bwli.config import LlmRuntimeConfig
+from bwli.domain import summarize_impact_domain
 from bwli.llm.explainer import _validate_completion_citations, _validate_completion_safety
-from bwli.llm.openai_compatible import ChatMessage, LlmChatRequest, OpenAICompatibleClient
+from bwli.llm.openai_compatible import (
+    ChatMessage,
+    LlmChatRequest,
+    LlmCompletion,
+    OpenAICompatibleClient,
+)
 from bwli.llm.sanitizer import sanitize_llm_evidence
+from bwli.llm.tour import (
+    TourRequestContext,
+    build_guided_tour_request_context,
+    validate_tour_completion_content,
+)
 
 _MAX_AFFECTED_OBJECTS = 60
 _MAX_LLM_EVIDENCE_TEXT_CHARS = 600
@@ -72,6 +83,71 @@ def create_impact_advice(
         "advice": completion.content,
         "citations": chat_request.citation_ids,
         "llm_audit": completion.audit.model_dump(mode="json"),
+    }
+
+
+def build_impact_tour_request(
+    impact_payload: dict[str, object],
+    *,
+    include_korean_summary: bool = False,
+) -> LlmChatRequest:
+    """Build a citation-bound guided-tour prompt from deterministic impact evidence."""
+
+    return _build_impact_tour_context(
+        impact_payload,
+        include_korean_summary=include_korean_summary,
+    ).request
+
+
+def validate_impact_tour_completion(
+    content: str,
+    impact_payload: dict[str, object],
+    *,
+    include_korean_summary: bool = False,
+) -> dict[str, object]:
+    """Validate LLM tour JSON against citations and present impact node/edge IDs."""
+
+    context = _build_impact_tour_context(
+        impact_payload,
+        include_korean_summary=include_korean_summary,
+    )
+    return validate_tour_completion_content(
+        content,
+        citation_ids=context.request.citation_ids,
+        allowed_node_ids=context.allowed_node_ids,
+        allowed_edge_ids=context.allowed_edge_ids,
+        include_korean_summary=include_korean_summary,
+    )
+
+
+def create_impact_tour(
+    impact_payload: dict[str, object],
+    *,
+    runtime: LlmRuntimeConfig,
+    include_korean_summary: bool = False,
+) -> dict[str, object]:
+    """Create and validate a guided impact tour from sanitized deterministic evidence."""
+
+    context = _build_impact_tour_context(
+        impact_payload,
+        include_korean_summary=include_korean_summary,
+    )
+    completion = OpenAICompatibleClient(runtime=runtime).chat(context.request)
+    _validate_completion_safety(completion)
+    tour_result = validate_tour_completion_content(
+        completion.content,
+        citation_ids=context.request.citation_ids,
+        allowed_node_ids=context.allowed_node_ids,
+        allowed_edge_ids=context.allowed_edge_ids,
+        include_korean_summary=include_korean_summary,
+    )
+    completion = _mark_citation_validation_passed(completion)
+    return {
+        "summary": tour_result["summary"],
+        "tour": tour_result["tour"],
+        "citations": tour_result["citations"],
+        "llm_audit": completion.audit.model_dump(mode="json"),
+        "domain_summary": context.domain_summary,
     }
 
 
@@ -153,6 +229,77 @@ def _impact_evidence_payload(
             "total": len(affected_raw),
         }
     return evidence, citations
+
+
+def _build_impact_tour_context(
+    impact_payload: dict[str, object],
+    *,
+    include_korean_summary: bool,
+) -> TourRequestContext:
+    evidence, citations = _impact_evidence_payload(impact_payload)
+    sanitized = sanitize_llm_evidence(evidence)
+    safe_evidence = (
+        cast(dict[str, object], sanitized.data)
+        if isinstance(sanitized.data, dict)
+        else {}
+    )
+    domain_summary = summarize_impact_domain(safe_evidence)
+    bounded_evidence = _truncate_evidence_text(safe_evidence)
+    allowed_node_ids = _impact_node_ids(bounded_evidence)
+    allowed_edge_ids = _impact_edge_ids(bounded_evidence)
+    return build_guided_tour_request_context(
+        task="impact_tour",
+        evidence_label="impact_evidence",
+        evidence=bounded_evidence if isinstance(bounded_evidence, dict) else {},
+        citations=citations,
+        domain_summary=domain_summary,
+        allowed_node_ids=allowed_node_ids,
+        allowed_edge_ids=allowed_edge_ids,
+        include_korean_summary=include_korean_summary,
+    )
+
+
+def _impact_node_ids(evidence: object) -> set[str]:
+    if not isinstance(evidence, dict):
+        return set()
+    values: set[str] = set()
+    scenario = evidence.get("scenario")
+    if isinstance(scenario, dict):
+        object_id = scenario.get("object_id")
+        if isinstance(object_id, str):
+            values.add(object_id)
+    affected = evidence.get("affected_objects")
+    if isinstance(affected, list):
+        for item in affected:
+            if not isinstance(item, dict):
+                continue
+            object_id = item.get("object_id")
+            if isinstance(object_id, str):
+                values.add(object_id)
+    return values
+
+
+def _impact_edge_ids(evidence: object) -> set[str]:
+    if not isinstance(evidence, dict):
+        return set()
+    values: set[str] = set()
+    affected = evidence.get("affected_objects")
+    if isinstance(affected, list):
+        for item in affected:
+            if not isinstance(item, dict):
+                continue
+            edge_ids = item.get("evidence_edge_ids")
+            if isinstance(edge_ids, list):
+                values.update(edge_id for edge_id in edge_ids if isinstance(edge_id, str))
+    return values
+
+
+def _mark_citation_validation_passed(completion: LlmCompletion) -> LlmCompletion:
+    return completion.model_copy(
+        update={
+            "audit": completion.audit.model_copy(update={"citation_validation": "passed"})
+        }
+    )
 
 
 def _copy_keys(source: dict[str, object], keys: list[str]) -> dict[str, object]:
