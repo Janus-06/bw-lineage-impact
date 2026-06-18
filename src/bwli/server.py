@@ -21,6 +21,7 @@ from bwli import __version__
 from bwli.client import BwClient
 from bwli.config import ConfigError, LlmRuntimeConfig, validate_local_llm_base_url
 from bwli.dataflow import DataflowOutputFormat, render_dataflow
+from bwli.domain import summarize_impact_domain, summarize_lineage_domain
 from bwli.endpoints import (
     REQUEST_MONITOR_TOP_CAP,
     REQUEST_MONITOR_TOP_DEFAULT,
@@ -464,6 +465,10 @@ class V1LineageExpandRequest(V1LineageRequest):
     expand_object_id: str | None = None
 
 
+class V1LineageTourRequest(V1LineageRequest):
+    include_korean_summary: bool = False
+
+
 class V1ImpactScenarioRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -475,6 +480,10 @@ class V1ImpactScenarioRequest(BaseModel):
     depth: int = Field(default=3, ge=0, le=20)
     node_cap: int = Field(default=25, ge=1, le=500)
     edge_cap: int = Field(default=60, ge=0, le=1000)
+
+
+class V1ImpactTourRequest(V1ImpactScenarioRequest):
+    include_korean_summary: bool = False
 
 
 class V1SqlExplainRequest(BaseModel):
@@ -519,12 +528,32 @@ class ImpactAdviceFactory(Protocol):
     ) -> dict[str, object]: ...
 
 
+class ImpactTourFactory(Protocol):
+    def __call__(
+        self,
+        impact_payload: dict[str, object],
+        *,
+        runtime: LlmRuntimeConfig,
+        include_korean_summary: bool = False,
+    ) -> dict[str, object]: ...
+
+
 class LineageAdviceFactory(Protocol):
     def __call__(
         self,
         lineage_payload: dict[str, object],
         *,
         runtime: LlmRuntimeConfig,
+    ) -> dict[str, object]: ...
+
+
+class LineageTourFactory(Protocol):
+    def __call__(
+        self,
+        lineage_payload: dict[str, object],
+        *,
+        runtime: LlmRuntimeConfig,
+        include_korean_summary: bool = False,
     ) -> dict[str, object]: ...
 
 
@@ -843,6 +872,20 @@ def create_app(
         except Exception as exc:
             raise _http_error(exc) from exc
 
+    @app.post("/api/v1/snapshots/{snapshot_id}/lineage/tour")
+    def lineage_tour_v1(snapshot_id: str, request: V1LineageTourRequest) -> dict[str, object]:
+        try:
+            lineage_payload = _run_v1_lineage(catalog_store, snapshot_id, request).model_dump(
+                mode="json"
+            )
+            return _lineage_tour_payload(
+                runtime_config=runtime_config,
+                lineage_payload=lineage_payload,
+                include_korean_summary=request.include_korean_summary,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
     @app.post(
         "/api/v1/snapshots/{snapshot_id}/lineage/expand",
         response_model=BoundedLineageResult,
@@ -886,6 +929,21 @@ def create_app(
             return _impact_advice_payload(
                 runtime_config=runtime_config,
                 impact_payload=impact_payload,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/impact/tour")
+    def impact_tour_v1(
+        snapshot_id: str,
+        request: V1ImpactTourRequest,
+    ) -> dict[str, object]:
+        try:
+            impact_payload = _run_v1_impact_scenario(catalog_store, snapshot_id, request)
+            return _impact_tour_payload(
+                runtime_config=runtime_config,
+                impact_payload=impact_payload,
+                include_korean_summary=request.include_korean_summary,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -2194,6 +2252,7 @@ def _lineage_advice_payload(
     runtime_config: RuntimeConfigState,
     lineage_payload: dict[str, object],
 ) -> dict[str, object]:
+    domain_summary = summarize_lineage_domain(lineage_payload)
     if not runtime_config.llm.enabled or not runtime_config.llm.configured:
         return {
             "schema_version": "1.0",
@@ -2205,7 +2264,10 @@ def _lineage_advice_payload(
                 "생성할 수 있습니다."
             ),
             "advice": "",
+            "summary": "",
+            "tour": [],
             "citations": [],
+            "domain_summary": domain_summary,
             "lineage": lineage_payload,
         }
     if (
@@ -2239,8 +2301,74 @@ def _lineage_advice_payload(
         "config_required": False,
         "message": "Deterministic snapshot evidence 기반 Lineage advisory review를 생성했습니다.",
         "advice": advice,
+        "summary": "",
+        "tour": [],
         "citations": citations,
+        "domain_summary": domain_summary,
         "llm_audit": advice_result["llm_audit"],
+        "lineage": lineage_payload,
+    }
+
+
+def _lineage_tour_payload(
+    *,
+    runtime_config: RuntimeConfigState,
+    lineage_payload: dict[str, object],
+    include_korean_summary: bool,
+) -> dict[str, object]:
+    domain_summary = summarize_lineage_domain(lineage_payload)
+    if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        return {
+            "schema_version": "1.0",
+            "status": "disabled",
+            "advisory": True,
+            "config_required": True,
+            "message": (
+                "로컬 OpenAI-compatible LLM endpoint를 설정하면 Lineage guided tour를 "
+                "생성할 수 있습니다."
+            ),
+            "summary": "",
+            "tour": [],
+            "citations": [],
+            "domain_summary": domain_summary,
+            "lineage": lineage_payload,
+        }
+    if (
+        not runtime_config.llm.base_url
+        or not runtime_config.llm.model
+        or not runtime_config.llm.api_key
+    ):
+        raise ConfigError("LLM runtime config is incomplete")
+    tour_result = _create_llm_lineage_tour(
+        lineage_payload,
+        runtime=LlmRuntimeConfig(
+            base_url=runtime_config.llm.base_url,
+            model=runtime_config.llm.model,
+            api_key=SecretStr(runtime_config.llm.api_key),
+        ),
+        include_korean_summary=include_korean_summary,
+    )
+    summary = str(tour_result.get("summary", "")).strip()
+    raw_tour = tour_result.get("tour", [])
+    tour = raw_tour if isinstance(raw_tour, list) else []
+    raw_citations = tour_result.get("citations", [])
+    citations = (
+        [item for item in raw_citations if isinstance(item, str)]
+        if isinstance(raw_citations, list)
+        else []
+    )
+    assert_no_persisted_secrets({"summary": summary, "tour": tour})
+    return {
+        "schema_version": "1.0",
+        "status": "ok",
+        "advisory": True,
+        "config_required": False,
+        "message": "Deterministic snapshot evidence 기반 Lineage guided tour를 생성했습니다.",
+        "summary": summary,
+        "tour": tour,
+        "citations": citations,
+        "domain_summary": tour_result.get("domain_summary", domain_summary),
+        "llm_audit": tour_result["llm_audit"],
         "lineage": lineage_payload,
     }
 
@@ -2350,6 +2478,7 @@ def _impact_advice_payload(
     runtime_config: RuntimeConfigState,
     impact_payload: dict[str, object],
 ) -> dict[str, object]:
+    domain_summary = summarize_impact_domain(impact_payload)
     if not runtime_config.llm.enabled or not runtime_config.llm.configured:
         return {
             "schema_version": "1.0",
@@ -2361,7 +2490,10 @@ def _impact_advice_payload(
                 "생성할 수 있습니다."
             ),
             "advice": "",
+            "summary": "",
+            "tour": [],
             "citations": [],
+            "domain_summary": domain_summary,
             "impact": impact_payload,
         }
     if (
@@ -2395,8 +2527,74 @@ def _impact_advice_payload(
         "config_required": False,
         "message": "Deterministic snapshot evidence 기반 Impact advisory review를 생성했습니다.",
         "advice": advice,
+        "summary": "",
+        "tour": [],
         "citations": citations,
+        "domain_summary": domain_summary,
         "llm_audit": advice_result["llm_audit"],
+        "impact": impact_payload,
+    }
+
+
+def _impact_tour_payload(
+    *,
+    runtime_config: RuntimeConfigState,
+    impact_payload: dict[str, object],
+    include_korean_summary: bool,
+) -> dict[str, object]:
+    domain_summary = summarize_impact_domain(impact_payload)
+    if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        return {
+            "schema_version": "1.0",
+            "status": "disabled",
+            "advisory": True,
+            "config_required": True,
+            "message": (
+                "로컬 OpenAI-compatible LLM endpoint를 설정하면 Impact guided tour를 "
+                "생성할 수 있습니다."
+            ),
+            "summary": "",
+            "tour": [],
+            "citations": [],
+            "domain_summary": domain_summary,
+            "impact": impact_payload,
+        }
+    if (
+        not runtime_config.llm.base_url
+        or not runtime_config.llm.model
+        or not runtime_config.llm.api_key
+    ):
+        raise ConfigError("LLM runtime config is incomplete")
+    tour_result = _create_llm_impact_tour(
+        impact_payload,
+        runtime=LlmRuntimeConfig(
+            base_url=runtime_config.llm.base_url,
+            model=runtime_config.llm.model,
+            api_key=SecretStr(runtime_config.llm.api_key),
+        ),
+        include_korean_summary=include_korean_summary,
+    )
+    summary = str(tour_result.get("summary", "")).strip()
+    raw_tour = tour_result.get("tour", [])
+    tour = raw_tour if isinstance(raw_tour, list) else []
+    raw_citations = tour_result.get("citations", [])
+    citations = (
+        [item for item in raw_citations if isinstance(item, str)]
+        if isinstance(raw_citations, list)
+        else []
+    )
+    assert_no_persisted_secrets({"summary": summary, "tour": tour})
+    return {
+        "schema_version": "1.0",
+        "status": "ok",
+        "advisory": True,
+        "config_required": False,
+        "message": "Deterministic snapshot evidence 기반 Impact guided tour를 생성했습니다.",
+        "summary": summary,
+        "tour": tour,
+        "citations": citations,
+        "domain_summary": tour_result.get("domain_summary", domain_summary),
+        "llm_audit": tour_result["llm_audit"],
         "impact": impact_payload,
     }
 
@@ -2604,6 +2802,21 @@ def _create_llm_impact_advice(
     return create_impact_advice(impact_payload, runtime=runtime)
 
 
+def _create_llm_impact_tour(
+    impact_payload: dict[str, object],
+    *,
+    runtime: LlmRuntimeConfig,
+    include_korean_summary: bool,
+) -> dict[str, object]:
+    module = import_module("bwli.llm.impact_advisor")
+    create_impact_tour = cast(ImpactTourFactory, module.create_impact_tour)
+    return create_impact_tour(
+        impact_payload,
+        runtime=runtime,
+        include_korean_summary=include_korean_summary,
+    )
+
+
 def _create_llm_lineage_advice(
     lineage_payload: dict[str, object],
     *,
@@ -2612,6 +2825,21 @@ def _create_llm_lineage_advice(
     module = import_module("bwli.llm.lineage_advisor")
     create_lineage_advice = cast(LineageAdviceFactory, module.create_lineage_advice)
     return create_lineage_advice(lineage_payload, runtime=runtime)
+
+
+def _create_llm_lineage_tour(
+    lineage_payload: dict[str, object],
+    *,
+    runtime: LlmRuntimeConfig,
+    include_korean_summary: bool,
+) -> dict[str, object]:
+    module = import_module("bwli.llm.lineage_advisor")
+    create_lineage_tour = cast(LineageTourFactory, module.create_lineage_tour)
+    return create_lineage_tour(
+        lineage_payload,
+        runtime=runtime,
+        include_korean_summary=include_korean_summary,
+    )
 
 
 def _frontend_static_dir(root: Path, static_dir: Path | None) -> Path | None:

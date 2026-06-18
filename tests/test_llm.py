@@ -110,6 +110,26 @@ def test_sanitizer_redacts_text_identifiers_before_llm_prompting() -> None:
     assert sanitized.count(REDACTED) >= 4
 
 
+def test_sanitizer_redacts_public_urls_and_fqdns_without_touching_ids() -> None:
+    text = (
+        "Review sapbw.example.com and https://bw-gateway.example.net:8443/bw "
+        "using citation [node:1], BW object /BIC/AZSALES00, and table raw.sales_orders."
+    )
+
+    sanitized = sanitize_text(text)
+
+    for forbidden in [
+        "sapbw.example.com",
+        "bw-gateway.example.net",
+        "https://bw-gateway.example.net:8443/bw",
+    ]:
+        assert forbidden not in sanitized
+    assert "[node:1]" in sanitized
+    assert "/BIC/AZSALES00" in sanitized
+    assert "raw.sales_orders" in sanitized
+    assert sanitized.count(REDACTED) >= 2
+
+
 def test_sanitizer_redacts_credential_assignments_before_llm_prompting() -> None:
     sanitized = sanitize_text(
         "WHERE credential = 'should-not-render' AND credentials='also-hidden'"
@@ -1043,6 +1063,53 @@ def test_build_impact_advice_request_uses_sanitized_deterministic_evidence_only(
     assert "[affected:1]" in prompt
 
 
+def test_impact_advice_and_tour_prompts_redact_public_scenario_hosts() -> None:
+    from bwli.llm.impact_advisor import build_impact_tour_request
+
+    impact_payload: dict[str, object] = {
+        "scenario": {
+            "object_id": "SRC",
+            "object_type": "ADSO",
+            "change_type": "field_removed",
+            "field": "NET_VALUE",
+            "value_description": "BW host sapbw.example.com",
+            "description": "Review https://bw-gateway.example.net:8443/bw before transport.",
+        },
+        "affected_objects": [
+            {
+                "object_id": "TGT",
+                "object_type": "HCPR",
+                "severity": "HIGH",
+                "confidence": "direct",
+                "reason": "Downstream label copied from sapbw-public.example.org",
+            }
+        ],
+        "lineage_bounds": {"depth": 2},
+    }
+
+    requests = [
+        build_impact_advice_request(impact_payload),
+        build_impact_tour_request(impact_payload),
+    ]
+    for request in requests:
+        prompt = "\n".join(message.content for message in request.messages)
+
+        assert request.citation_ids == ["scenario:change", "affected:1"]
+        for forbidden in [
+            "sapbw.example.com",
+            "bw-gateway.example.net",
+            "sapbw-public.example.org",
+            "sapbw",
+            "bw-gateway",
+            "sapbw-public",
+        ]:
+            assert forbidden not in prompt.lower()
+        assert "SRC" in prompt
+        assert "TGT" in prompt
+        assert "scenario:change" in prompt
+        assert "affected:1" in prompt
+
+
 def test_build_lineage_advice_request_uses_sanitized_bounded_graph_evidence_only() -> None:
     from bwli.llm.lineage_advisor import build_lineage_advice_request
 
@@ -1109,6 +1176,42 @@ def test_build_lineage_advice_request_uses_sanitized_bounded_graph_evidence_only
     assert "[edge:1]" in prompt
 
 
+def test_lineage_advice_prompt_redacts_public_node_hosts() -> None:
+    from bwli.llm.lineage_advisor import build_lineage_advice_request
+
+    request = build_lineage_advice_request(
+        {
+            "snapshot_id": "snap-fixture",
+            "start_id": "SRC",
+            "direction": "downstream",
+            "depth": 1,
+            "nodes": [
+                {
+                    "id": "SRC",
+                    "type": "ADSO",
+                    "name": "https://bw-node.example.net:8443/model",
+                    "label": "sapbw.example.com",
+                    "evidence_ids": ["node:SRC"],
+                }
+            ],
+            "edges": [],
+            "levels": {"SRC": 0},
+        }
+    )
+    prompt = "\n".join(message.content for message in request.messages)
+
+    for forbidden in [
+        "sapbw.example.com",
+        "bw-node.example.net",
+        "sapbw",
+        "bw-node",
+    ]:
+        assert forbidden not in prompt.lower()
+    assert request.citation_ids == ["node:1"]
+    assert "SRC" in prompt
+    assert "[node:1]" in prompt
+
+
 def test_build_lineage_advice_request_caps_serialized_prompt_evidence() -> None:
     from bwli.llm.lineage_advisor import (
         _MAX_LLM_EVIDENCE_JSON_CHARS,
@@ -1156,6 +1259,239 @@ def test_build_lineage_advice_request_caps_serialized_prompt_evidence() -> None:
     assert "node:0:8" not in prompt
     assert request.citation_ids
     assert all(citation in prompt for citation in request.citation_ids)
+
+
+
+def _sample_lineage_payload_for_tour() -> dict[str, object]:
+    return {
+        "snapshot_id": "snap-fixture",
+        "start_id": "SRC",
+        "direction": "downstream",
+        "depth": 3,
+        "nodes": [
+            {
+                "id": "SRC",
+                "type": "ADSO",
+                "name": "Sales Source ADSO",
+                "label": "Source",
+                "metadata": {
+                    "host": "sapbw.internal",
+                    "owner_email": "person@example.invalid",
+                    "client": "100",
+                },
+                "evidence_ids": [f"node:SRC:{index}" for index in range(12)],
+            },
+            {
+                "id": "TR",
+                "type": "TRFN",
+                "name": "Sales Transformation",
+                "label": "Sales transform " * 100,
+                "metadata": {"Authorization": "Bearer x"},
+                "evidence_ids": ["node:TR"],
+            },
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "SRC",
+                "target": "TR",
+                "type": "feeds",
+                "confidence": "direct",
+                "metadata": {"client": "200"},
+                "evidence_ids": ["edge:e1"],
+            }
+        ],
+        "levels": {"SRC": 0, "TR": 1},
+        "truncated": False,
+        "raw_snapshot": {"payload": "must not reach prompt"},
+        "manifest": {"cookie": "must not reach prompt either"},
+    }
+
+
+def test_lineage_tour_prompt_redacts_public_node_hosts() -> None:
+    from bwli.llm.lineage_advisor import build_lineage_tour_request
+
+    payload = _sample_lineage_payload_for_tour()
+    nodes = payload["nodes"]
+    assert isinstance(nodes, list)
+    assert isinstance(nodes[0], dict)
+    assert isinstance(nodes[1], dict)
+    nodes[0]["label"] = "sapbw.example.com"
+    nodes[1]["name"] = "https://bw-tour.example.net:8443/bw/model"
+
+    request = build_lineage_tour_request(payload)
+    prompt = "\n".join(message.content for message in request.messages)
+
+    for forbidden in [
+        "sapbw.example.com",
+        "bw-tour.example.net",
+        "sapbw",
+        "bw-tour",
+    ]:
+        assert forbidden not in prompt.lower()
+    assert request.citation_ids == ["node:1", "node:2", "edge:1"]
+    assert "SRC" in prompt
+    assert "TR" in prompt
+    assert "[node:1]" in prompt
+    assert "[edge:1]" in prompt
+
+
+def test_llm_tour_requires_sanitized_cited_evidence() -> None:
+    from bwli.llm.lineage_advisor import build_lineage_tour_request
+
+    request = build_lineage_tour_request(_sample_lineage_payload_for_tour())
+    prompt = "\n".join(message.content for message in request.messages)
+
+    assert request.metadata == {"task": "lineage_tour", "include_korean_summary": "false"}
+    assert request.citation_ids == ["node:1", "node:2", "edge:1"]
+    assert "must not reach prompt" not in prompt
+    assert "must not reach prompt either" not in prompt
+    assert "sapbw.internal" not in prompt
+    assert "person@example.invalid" not in prompt
+    assert "Authorization" not in prompt
+    assert "Bearer" not in prompt
+    assert '"client"' not in prompt
+    assert "node:SRC:8" not in prompt
+    assert "evidence_ids_truncated" in prompt
+    assert "Sales transform " * 80 not in prompt
+    assert "…(truncated)" in prompt
+    assert "[node:1]" in prompt
+    assert "[edge:1]" in prompt
+    assert "allowed_node_ids" in prompt
+    assert "domain_summary" in prompt
+
+
+def test_tour_steps_reference_only_present_node_ids() -> None:
+    from bwli.llm.lineage_advisor import validate_lineage_tour_completion
+
+    payload = _sample_lineage_payload_for_tour()
+    valid = validate_lineage_tour_completion(
+        json.dumps(
+            {
+                "summary": "",
+                "tour": [
+                    {
+                        "id": "step-1",
+                        "title": "Start at source",
+                        "description": "Review the source object first [node:1].",
+                        "node_ids": ["SRC"],
+                        "edge_ids": ["e1"],
+                    }
+                ],
+                "citations": ["node:1", "edge:1"],
+            }
+        ),
+        payload,
+    )
+
+    assert valid["tour"][0]["node_ids"] == ["SRC"]
+    assert valid["tour"][0]["edge_ids"] == ["e1"]
+
+    hallucinated_node = json.dumps(
+        {
+            "summary": "",
+            "tour": [
+                {
+                    "id": "step-1",
+                    "title": "Bad node",
+                    "description": (
+                        "This cites allowed evidence but names an unknown node [node:1]."
+                    ),
+                    "node_ids": ["NOT_IN_GRAPH"],
+                    "edge_ids": [],
+                }
+            ],
+            "citations": ["node:1"],
+        }
+    )
+    with pytest.raises(ValueError, match="unknown node"):
+        validate_lineage_tour_completion(hallucinated_node, payload)
+
+    hallucinated_edge = json.dumps(
+        {
+            "summary": "",
+            "tour": [
+                {
+                    "id": "step-1",
+                    "title": "Bad edge",
+                    "description": (
+                        "This cites allowed evidence but names an unknown edge [node:1]."
+                    ),
+                    "node_ids": ["SRC"],
+                    "edge_ids": ["edge:not-present"],
+                }
+            ],
+            "citations": ["node:1"],
+        }
+    )
+    with pytest.raises(ValueError, match="unknown edge"):
+        validate_lineage_tour_completion(hallucinated_edge, payload)
+
+    uncited = json.dumps(
+        {
+            "summary": "This summary has no citation.",
+            "tour": [],
+            "citations": [],
+        }
+    )
+    with pytest.raises(LlmCitationError):
+        validate_lineage_tour_completion(uncited, payload, include_korean_summary=True)
+
+    prefix_only = json.dumps(
+        {
+            "summary": "Unsupported fabricated citation [node:1:not-real].",
+            "tour": [],
+            "citations": ["node:1:not-real"],
+        }
+    )
+    with pytest.raises(LlmCitationError):
+        validate_lineage_tour_completion(prefix_only, payload, include_korean_summary=True)
+
+
+def test_korean_summary_opt_in_flag() -> None:
+    from bwli.llm.lineage_advisor import (
+        build_lineage_tour_request,
+        validate_lineage_tour_completion,
+    )
+
+    payload = _sample_lineage_payload_for_tour()
+    default_request = build_lineage_tour_request(payload)
+    default_prompt = "\n".join(message.content for message in default_request.messages)
+    korean_request = build_lineage_tour_request(payload, include_korean_summary=True)
+    korean_prompt = "\n".join(message.content for message in korean_request.messages)
+
+    assert "Korean summary" not in default_prompt
+    assert "한국어" not in default_prompt
+    assert default_request.metadata["include_korean_summary"] == "false"
+    assert "Korean summary" in korean_prompt
+    assert "한국어" in korean_prompt
+    assert korean_request.metadata["include_korean_summary"] == "true"
+
+    korean_result = validate_lineage_tour_completion(
+        json.dumps(
+            {
+                "summary": "한국어 요약은 명시적 opt-in에서만 반환합니다 [node:1].",
+                "tour": [],
+                "citations": ["node:1"],
+            },
+            ensure_ascii=False,
+        ),
+        payload,
+        include_korean_summary=True,
+    )
+    assert korean_result["summary"].startswith("한국어")
+
+    with pytest.raises(ValueError, match="summary was not requested"):
+        validate_lineage_tour_completion(
+            json.dumps(
+                {
+                    "summary": "Default summary should fail even when cited [node:1].",
+                    "tour": [],
+                    "citations": ["node:1"],
+                }
+            ),
+            payload,
+        )
 
 
 def test_create_lineage_advice_rejects_sensitive_completion_text(

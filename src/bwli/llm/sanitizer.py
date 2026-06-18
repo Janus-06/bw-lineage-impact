@@ -112,6 +112,13 @@ _AUTH_HEADER_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_URL_RE = re.compile(r"(?i)\b(?:[a-z][a-z0-9+.-]*://|www\.)[^\s<>\"'`]+")
+_HOST_LABEL_PATTERN = r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
+_FQDN_HOST_RE = re.compile(
+    rf"(?<![A-Za-z0-9_:/-])(?:{_HOST_LABEL_PATTERN}\.)+[A-Za-z]{{2,63}}"
+    r"(?::\d{1,5})?(?=[^A-Za-z0-9_-]|$)",
+    re.I,
+)
 _INTERNAL_HOST_RE = re.compile(r"\b[A-Za-z0-9-]+\.(?:corp|internal|lan|local)\b", re.I)
 _OPENAI_STYLE_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]+\b")
 _SECRET_MARKER_RE = re.compile(rf"(?i){_SECRET_IDENTIFIER_PATTERN}")
@@ -175,6 +182,7 @@ def sanitize_text(value: str) -> str:
 
     sanitized = _AUTH_HEADER_RE.sub(REDACTED, value)
     sanitized = _BEARER_RE.sub(REDACTED, sanitized)
+    sanitized = _URL_RE.sub(REDACTED, sanitized)
     sanitized = _ENV_FUNCTION_SQL_PREDICATE_RE.sub(REDACTED, sanitized)
     sanitized = _ENV_REVERSED_IN_SQL_PREDICATE_RE.sub(REDACTED, sanitized)
     sanitized = _ENV_REVERSED_SQL_PREDICATE_RE.sub(REDACTED, sanitized)
@@ -190,6 +198,7 @@ def sanitize_text(value: str) -> str:
     sanitized = _EMAIL_RE.sub(REDACTED, sanitized)
     sanitized = _IPV4_RE.sub(REDACTED, sanitized)
     sanitized = _INTERNAL_HOST_RE.sub(REDACTED, sanitized)
+    sanitized = _FQDN_HOST_RE.sub(REDACTED, sanitized)
     sanitized = _OPENAI_STYLE_KEY_RE.sub(REDACTED, sanitized)
     sanitized = _SQL_ANY_STRING_LITERAL_RE.sub(REDACTED, sanitized)
     sanitized = _SECRET_MARKER_RE.sub(REDACTED, sanitized)

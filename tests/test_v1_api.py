@@ -1062,6 +1062,49 @@ def test_v1_lineage_advice_returns_deterministic_lineage_when_llm_disabled(
     assert [edge["id"] for edge in payload["lineage"]["edges"]]
 
 
+
+def test_v1_lineage_tour_disabled_by_default_no_network_returns_domain_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ["BWLI_LLM_BASE_URL", "BWLI_LLM_MODEL", "BWLI_LLM_API_KEY"]:
+        monkeypatch.delenv(name, raising=False)
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    class ForbiddenTourClient:
+        def __init__(self, **_: object) -> None:
+            raise AssertionError("disabled LLM tour must not construct a network client")
+
+    monkeypatch.setattr(
+        "bwli.llm.lineage_advisor.OpenAICompatibleClient",
+        ForbiddenTourClient,
+    )
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/lineage/tour",
+        json={
+            "object_id": "SRC",
+            "direction": "downstream",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "disabled"
+    assert payload["config_required"] is True
+    assert payload["summary"] == ""
+    assert payload["tour"] == []
+    assert payload["citations"] == []
+    assert payload["lineage"]["start_id"] == "SRC"
+    assert payload["domain_summary"]["node_count"] == len(payload["lineage"]["nodes"])
+    assert payload["domain_summary"]["edge_count"] == len(payload["lineage"]["edges"])
+    assert payload["domain_summary"]["object_types"]
+
+
 def test_v1_lineage_advice_uses_local_llm_with_citation_audit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
