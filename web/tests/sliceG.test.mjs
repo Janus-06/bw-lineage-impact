@@ -305,7 +305,7 @@ test('object list metadata and freshness fallback are keyed to the selected snap
   const reloadBody = appFunctionBody(source, 'async function reloadSnapshots', '\n  async function runLineage');
   assert.match(
     reloadBody,
-    /if \(options\.preserveAnalysisSelection\) \{\s*selectionRef\.current = \{ snapshotId: nextSnapshotId, objectId: selectionRef\.current\.objectId \};\s*markObjectsStaleForSnapshot\(nextSnapshotId\);\s*setSelectedSnapshotId\(nextSnapshotId\);/,
+    /if \(options\.preserveAnalysisSelection\) \{\s*selectionRef\.current = \{ snapshotId: nextSnapshotId, objectId: selectionRef\.current\.objectId \};\s*markObjectsStaleForSnapshot\(nextSnapshotId\);\s*markSnapshotContextStale\(\);\s*setSelectedSnapshotId\(nextSnapshotId\);/,
     'preserved reloads must mark the previous object list stale before rendering the new basis',
   );
 
@@ -330,7 +330,7 @@ test('guarded capture and refresh keep snapshot reload inside the request token'
   assert.match(reloadBody, /if \(options\.isStale\?\.\(\)\) return null;/);
   assert.match(
     reloadBody,
-    /if \(options\.preserveAnalysisSelection\) \{\s*selectionRef\.current = \{ snapshotId: nextSnapshotId, objectId: selectionRef\.current\.objectId \};\s*markObjectsStaleForSnapshot\(nextSnapshotId\);\s*setSelectedSnapshotId\(nextSnapshotId\);\s*\} else \{\s*chooseSnapshot\(nextSnapshotId\);\s*\}/,
+    /if \(options\.preserveAnalysisSelection\) \{\s*selectionRef\.current = \{ snapshotId: nextSnapshotId, objectId: selectionRef\.current\.objectId \};\s*markObjectsStaleForSnapshot\(nextSnapshotId\);\s*markSnapshotContextStale\(\);\s*setSelectedSnapshotId\(nextSnapshotId\);\s*\} else \{\s*chooseSnapshot\(nextSnapshotId\);\s*\}/,
     'guarded reloads must not call chooseSnapshot, because chooseSnapshot invalidates the request token',
   );
   [
@@ -344,6 +344,7 @@ test('guarded capture and refresh keep snapshot reload inside the request token'
     'setImpactTourStepIndex(0)',
     'setObjectDetail(null)',
     'setObjectFreshness(null)',
+    'setCaptureScope([])',
     'setGlossaryTerms([])',
   ].forEach((resetCall) => {
     assert.match(refreshClearBody, new RegExp(resetCall.replace(/[()[\]]/g, '\\$&')), `${resetCall} should clear stale rendered refresh state`);
@@ -404,6 +405,85 @@ test('guarded capture and refresh keep snapshot reload inside the request token'
   assert.match(refreshBody, /postLineage\(refreshedSnapshotId, \{/);
   assert.match(refreshBody, /postImpactScenario\(refreshedSnapshotId, impactBody\)/);
   assert.match(refreshBody, /getGlossary\(refreshedSnapshotId, glossaryQuery\.trim\(\) \|\| undefined\)/);
+});
+
+test('snapshot context and glossary writes are guarded by snapshot and request identity', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+
+  assert.match(source, /const snapshotContextRequestRef = useRef\(0\);/);
+  assert.match(source, /const glossarySearchRequestRef = useRef\(0\);/);
+
+  const contextHelpers = appFunctionBody(source, 'function nextSnapshotContextRequestId', '\n  function clearAnalysisState');
+  assert.match(contextHelpers, /snapshotContextRequestRef\.current \+= 1;/);
+  assert.match(contextHelpers, /glossarySearchRequestRef\.current \+= 1;/);
+  assert.match(contextHelpers, /selectionRef\.current\.snapshotId === snapshotId/);
+  assert.match(contextHelpers, /function markSnapshotContextStale\(\)/);
+  assert.match(contextHelpers, /setCaptureScope\(\[\]\);/);
+  assert.match(contextHelpers, /setGlossaryTerms\(\[\]\);/);
+  assert.doesNotMatch(
+    contextHelpers,
+    /analysisRequestRef|invalidateAnalysisRequests|clearAnalysisState/,
+    'snapshot context stale clearing must not invalidate analysis request tokens',
+  );
+
+  const chooseBody = appFunctionBody(source, 'function chooseSnapshot', '\n  function parseLiveObjectNames');
+  assert.match(
+    chooseBody,
+    /selectionRef\.current = \{ snapshotId, objectId: '' \};\s*markObjectsStaleForSnapshot\(snapshotId\);\s*markSnapshotContextStale\(\);\s*setSelectedSnapshotId\(snapshotId\);/,
+    'normal snapshot selection must clear unkeyed snapshot context before rendering the new basis',
+  );
+
+  const reloadBody = appFunctionBody(source, 'async function reloadSnapshots', '\n  async function runLineage');
+  assert.match(
+    reloadBody,
+    /preserveAnalysisSelection[\s\S]*markObjectsStaleForSnapshot\(nextSnapshotId\);\s*markSnapshotContextStale\(\);\s*setSelectedSnapshotId\(nextSnapshotId\);/,
+    'preserved reloads must mark capture scope and glossary terms stale without calling chooseSnapshot',
+  );
+
+  const refreshContextBody = appFunctionBody(
+    source,
+    'async function refreshSnapshotContext',
+    '\n  async function loadRepository',
+  );
+  assert.match(refreshContextBody, /const contextRequestId = nextSnapshotContextRequestId\(\);/);
+  assert.match(refreshContextBody, /const glossaryRequestId = nextGlossarySearchRequestId\(\);/);
+  assert.match(
+    refreshContextBody,
+    /if \(isCurrentSnapshotContextRequest\(contextRequestId, snapshotId\)\) \{\s*setCaptureScope\(scopeResponse\.items\);/,
+    'capture scope must be set only for the current snapshot context request',
+  );
+  assert.match(
+    refreshContextBody,
+    /if \(isCurrentGlossarySearchRequest\(glossaryRequestId, snapshotId\)\) \{\s*setGlossaryTerms\(glossaryResponse\.items\);/,
+    'snapshot glossary terms must be set only for the current glossary request',
+  );
+  assert.match(refreshContextBody, /const contextStillCurrent = isCurrentSnapshotContextRequest\(contextRequestId, snapshotId\);/);
+  assert.match(refreshContextBody, /const glossaryStillCurrent = isCurrentGlossarySearchRequest\(glossaryRequestId, snapshotId\);/);
+  assert.match(
+    refreshContextBody,
+    /if \(contextStillCurrent && glossaryStillCurrent\) \{\s*setError\(errorText\(err\)\);/,
+    'snapshot context errors must be guarded against stale snapshot or superseded glossary requests',
+  );
+  assert.doesNotMatch(
+    refreshContextBody,
+    /catch \(err\) \{\s*setCaptureScope\(\[\]\);\s*setGlossaryTerms\(\[\]\);\s*setError\(errorText\(err\)\);/,
+    'refreshSnapshotContext must not clear context or set errors unguarded',
+  );
+
+  const searchBody = appFunctionBody(source, 'async function searchGlossary', '\n  async function runConnectionTest');
+  assert.match(searchBody, /const requestSnapshotId = selectedSnapshotId;/);
+  assert.match(searchBody, /const requestId = nextGlossarySearchRequestId\(\);/);
+  assert.match(searchBody, /getGlossary\(requestSnapshotId, glossaryQuery\.trim\(\) \|\| undefined\)/);
+  assert.match(
+    searchBody,
+    /if \(!isCurrentGlossarySearchRequest\(requestId, requestSnapshotId\)\) return;\s*setGlossaryTerms\(response\.items\);/,
+    'searchGlossary must check the selected snapshot before setting terms',
+  );
+  assert.match(
+    searchBody,
+    /if \(isCurrentGlossarySearchRequest\(requestId, requestSnapshotId\)\) \{\s*setGlossaryTerms\(\[\]\);\s*setError\(errorText\(err\)\);/,
+    'searchGlossary errors must be guarded by the same request and snapshot identity',
+  );
 });
 
 test('derives compact change grade and impact summary', () => {

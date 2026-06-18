@@ -215,6 +215,8 @@ export default function App() {
   const selectionRef = useRef({ snapshotId: '', objectId: '' });
   const analysisRequestRef = useRef(0);
   const objectListRequestRef = useRef(0);
+  const snapshotContextRequestRef = useRef(0);
+  const glossarySearchRequestRef = useRef(0);
 
   const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
   const currentObjects = useMemo(
@@ -269,6 +271,7 @@ export default function App() {
       const nextSnapshotId = snapshots[0].id;
       selectionRef.current = { snapshotId: nextSnapshotId, objectId: selectionRef.current.objectId };
       markObjectsStaleForSnapshot(nextSnapshotId);
+      markSnapshotContextStale();
       setSelectedSnapshotId(nextSnapshotId);
     }
   }, [selectedSnapshotId, snapshots]);
@@ -279,8 +282,7 @@ export default function App() {
     } else {
       markObjectsStaleForSnapshot('');
       setSelectedObjectId('');
-      setCaptureScope([]);
-      setGlossaryTerms([]);
+      markSnapshotContextStale();
     }
   }, [selectedSnapshotId]);
 
@@ -371,6 +373,34 @@ export default function App() {
     setBusy((current) => current === 'catalog' ? '' : current);
   }
 
+  function nextSnapshotContextRequestId(): number {
+    snapshotContextRequestRef.current += 1;
+    return snapshotContextRequestRef.current;
+  }
+
+  function isCurrentSnapshotContextRequest(requestId: number, snapshotId: string): boolean {
+    return snapshotContextRequestRef.current === requestId
+      && selectionRef.current.snapshotId === snapshotId;
+  }
+
+  function nextGlossarySearchRequestId(): number {
+    glossarySearchRequestRef.current += 1;
+    return glossarySearchRequestRef.current;
+  }
+
+  function isCurrentGlossarySearchRequest(requestId: number, snapshotId: string): boolean {
+    return glossarySearchRequestRef.current === requestId
+      && selectionRef.current.snapshotId === snapshotId;
+  }
+
+  function markSnapshotContextStale() {
+    snapshotContextRequestRef.current += 1;
+    glossarySearchRequestRef.current += 1;
+    setCaptureScope([]);
+    setGlossaryTerms([]);
+    setBusy((current) => current === 'glossary' ? '' : current);
+  }
+
   function clearAnalysisState() {
     invalidateAnalysisRequests();
     setLineage(null);
@@ -400,12 +430,14 @@ export default function App() {
     setImpactTourStepIndex(0);
     setObjectDetail(null);
     setObjectFreshness(null);
+    setCaptureScope([]);
     setGlossaryTerms([]);
   }
 
   function chooseSnapshot(snapshotId: string) {
     selectionRef.current = { snapshotId, objectId: '' };
     markObjectsStaleForSnapshot(snapshotId);
+    markSnapshotContextStale();
     setSelectedSnapshotId(snapshotId);
     setSelectedObjectId('');
     setAllowHiddenSelection(false);
@@ -543,17 +575,31 @@ export default function App() {
   }
 
   async function refreshSnapshotContext(snapshotId: string) {
+    const contextRequestId = nextSnapshotContextRequestId();
+    const glossaryRequestId = nextGlossarySearchRequestId();
     try {
       const [scopeResponse, glossaryResponse] = await Promise.all([
         getCaptureScope(snapshotId),
         getGlossary(snapshotId),
       ]);
-      setCaptureScope(scopeResponse.items);
-      setGlossaryTerms(glossaryResponse.items);
+      if (isCurrentSnapshotContextRequest(contextRequestId, snapshotId)) {
+        setCaptureScope(scopeResponse.items);
+      }
+      if (isCurrentGlossarySearchRequest(glossaryRequestId, snapshotId)) {
+        setGlossaryTerms(glossaryResponse.items);
+      }
     } catch (err) {
-      setCaptureScope([]);
-      setGlossaryTerms([]);
-      setError(errorText(err));
+      const contextStillCurrent = isCurrentSnapshotContextRequest(contextRequestId, snapshotId);
+      const glossaryStillCurrent = isCurrentGlossarySearchRequest(glossaryRequestId, snapshotId);
+      if (contextStillCurrent) {
+        setCaptureScope([]);
+      }
+      if (glossaryStillCurrent) {
+        setGlossaryTerms([]);
+      }
+      if (contextStillCurrent && glossaryStillCurrent) {
+        setError(errorText(err));
+      }
     }
   }
 
@@ -890,16 +936,23 @@ export default function App() {
 
   async function searchGlossary() {
     if (!selectedSnapshotId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestId = nextGlossarySearchRequestId();
     setBusy('glossary');
     try {
-      const response = await getGlossary(selectedSnapshotId, glossaryQuery.trim() || undefined);
+      const response = await getGlossary(requestSnapshotId, glossaryQuery.trim() || undefined);
+      if (!isCurrentGlossarySearchRequest(requestId, requestSnapshotId)) return;
       setGlossaryTerms(response.items);
       setError('');
     } catch (err) {
-      setGlossaryTerms([]);
-      setError(errorText(err));
+      if (isCurrentGlossarySearchRequest(requestId, requestSnapshotId)) {
+        setGlossaryTerms([]);
+        setError(errorText(err));
+      }
     } finally {
-      setBusy('');
+      if (glossarySearchRequestRef.current === requestId) {
+        setBusy((current) => current === 'glossary' ? '' : current);
+      }
     }
   }
 
@@ -943,6 +996,7 @@ export default function App() {
     if (options.preserveAnalysisSelection) {
       selectionRef.current = { snapshotId: nextSnapshotId, objectId: selectionRef.current.objectId };
       markObjectsStaleForSnapshot(nextSnapshotId);
+      markSnapshotContextStale();
       setSelectedSnapshotId(nextSnapshotId);
     } else {
       chooseSnapshot(nextSnapshotId);
