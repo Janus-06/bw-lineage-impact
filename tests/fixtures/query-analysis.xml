@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Qry:queryResource xmlns:Qry="http://www.sap.com/bw/modeling/query" xmlns:atom="http://www.w3.org/2005/Atom" technicalName="ZQ_SALES_MARGIN" description="Sales Margin Query">
+  <atom:link rel="related" href="/sap/bw/modeling/hcpr/zc_sales/m" />
+  <Qry:subComponents>
+    <Qry:variable id="VAR_0CALMONTH" technicalName="ZVAR_CALMONTH" infoObject="0CALMONTH" mandatory="true" processingType="USER_ENTRY">
+      <Qry:description value="Calendar Month" />
+    </Qry:variable>
+    <Qry:calculatedKeyFigure id="CKF_MARGIN" technicalName="ZCKF_MARGIN" formula="NET_VALUE - COST">
+      <Qry:description value="Margin" />
+    </Qry:calculatedKeyFigure>
+    <Qry:restrictedKeyFigure id="RKF_CURR_YEAR" technicalName="ZRKF_CURR_YEAR" baseKeyFigure="0NET_VALUE">
+      <Qry:description value="Current Year Revenue" />
+      <Qry:selection infoObject="0CALYEAR" operator="EQ" value="2026" />
+    </Qry:restrictedKeyFigure>
+  </Qry:subComponents>
+  <Qry:filters>
+    <Qry:filter infoObject="0COUNTRY" operator="EQ" value="US" />
+  </Qry:filters>
+  <Qry:layout>
+    <Qry:rows><Qry:element infoObject="0CUSTOMER" /></Qry:rows>
+    <Qry:columns><Qry:element member="CKF_MARGIN" /></Qry:columns>
+    <Qry:free><Qry:element infoObject="0MATERIAL" /></Qry:free>
+  </Qry:layout>
+  <Qry:localMembers>
+    <Qry:member id="LM_MARGIN_RATE" technicalName="ZLM_MARGIN_RATE" formula="ZCKF_MARGIN / NET_VALUE">
+      <Qry:description value="Margin Rate" />
+    </Qry:member>
+  </Qry:localMembers>
+</Qry:queryResource>

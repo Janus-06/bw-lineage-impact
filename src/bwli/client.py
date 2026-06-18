@@ -175,7 +175,7 @@ class BwClient:
                 build_query_endpoint(query_name, active=True),
                 build_query_endpoint(query_name, active=False),
             ],
-            fallback_statuses={404},
+            fallback_statuses={404, 406, 415},
         )
 
     def fetch_composite_provider(self, object_name: str) -> Any:

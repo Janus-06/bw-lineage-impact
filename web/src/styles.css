@@ -48,7 +48,7 @@ pre { overflow: auto; max-height: 300px; margin: 12px 0 0; padding: 12px; border
 .appShell { min-height: 100vh; padding: 14px; }
 .topStatus {
   position: sticky;
-  top: 10px;
+  top: 0;
   z-index: 10;
   display: grid;
   grid-template-columns: 190px minmax(0, 1fr) auto;
@@ -167,7 +167,16 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.015em; }
 .objectItem { display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 4px 8px; width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 12px; color: var(--text); text-align: left; background: #fff; }
 .objectItem:hover, .objectItem.active { border-color: var(--blue); background: #f0f5ff; }
 .objectType { grid-row: span 2; align-self: center; padding: 4px 6px; border-radius: 8px; color: #334155; background: #e8edf3; font-size: 9px; font-weight: 750; text-align: center; }
-.objectItem strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 650; }
+.objectItem strong {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
 .objectItem small { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 
 .workspacePane { min-height: calc(100vh - 96px); padding: 14px; background: linear-gradient(180deg, #fff 0%, #fbfdff 100%); }
@@ -225,7 +234,7 @@ h1, h2, h3 { color: var(--text); letter-spacing: -.015em; }
 .nodeId { fill: #172033; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 9.3px; font-weight: 600; }
 .nodeType { fill: #64748b; font-size: 8.4px; font-weight: 600; letter-spacing: .04em; }
 .nodeBadge { fill: #c2410c; font-size: 8.8px; font-weight: 750; }
-.detailsDrawer { position: sticky; top: 82px; }
+.detailsDrawer { position: sticky; top: 82px; max-height: calc(100vh - 96px); overflow: auto; }
 .detailRows { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 14px 0; padding: 10px; border-radius: 12px; background: var(--panel-soft); }
 .detailRows span { color: var(--muted); }
 .detailRows strong, .scenarioObject strong { min-width: 0; overflow-wrap: anywhere; }
@@ -548,6 +557,7 @@ pre { border: 1px solid #d7dfeb; background: #f8fafc; color: #22304a; }
 }
 .workspacePane { background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(248,251,255,.96)); }
 .catalogPane, .detailsDrawer { top: 86px; background: rgba(255,255,255,.98); }
+.detailsDrawer { max-height: calc(100vh - 96px); overflow: auto; }
 .paneHeader h2,
 .sectionTitle h1,
 .controlCard h1,
@@ -748,7 +758,8 @@ h3 { color: #101828; }
   background: #edf3ff;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 10px;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 .tourControls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
 .safetyCopy { border-color: #9bd8bd; background: #ecfdf6; }
@@ -910,3 +921,13 @@ h3 { color: #101828; }
   }
   .legendList { justify-content: flex-start; }
 }
+
+.topStatus.scrolled {
+  border-color: #c8d7ee;
+  background: rgba(255,255,255,.98);
+  box-shadow: 0 10px 24px rgba(15,23,42,.12);
+}
+
+.queryLayout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 12px; margin-top: 12px; align-items: start; }
+.queryResultCard .jsonPreview { max-height: 520px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.lifecycleActions { justify-content: flex-start; }

@@ -40,7 +40,12 @@ const TYPE_LAYER_ALIASES: Record<string, DisplayLayer> = {
   datasourcemetadata: 'Source',
   sourcesystem: 'Source',
   lsys: 'Source',
+  infosource: 'Source',
+  isource: 'Source',
   dtp: 'Transform',
+  dtpa: 'Transform',
+  dtpload: 'Transform',
+  trcs: 'Transform',
   trfn: 'Transform',
   transformation: 'Transform',
   transformations: 'Transform',
@@ -56,6 +61,16 @@ const TYPE_LAYER_ALIASES: Record<string, DisplayLayer> = {
   compositeprovider: 'Semantic',
   hcpr: 'Semantic',
   query: 'Semantic',
+  alvl: 'Semantic',
+  aggrlevel: 'Semantic',
+  aggregationlevel: 'Semantic',
+  aggr_level: 'Semantic',
+  ckf: 'Semantic',
+  rkf: 'Semantic',
+  queryvariable: 'Semantic',
+  query_variable: 'Semantic',
+  localmember: 'Semantic',
+  local_member: 'Semantic',
   bquery: 'Semantic',
   workbook: 'Semantic',
   nativeview: 'Semantic',
@@ -105,6 +120,22 @@ export interface NormalizedTourStep {
   evidenceIds: string[];
   canPrevious: boolean;
   canNext: boolean;
+}
+
+export interface ObjectField {
+  name: string;
+  type?: string;
+  role?: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface UnknownBreakdown {
+  metadata_missing: number;
+  type_unmapped: number;
+  parser_unsupported: number;
+  freshness_unavailable: number;
+  unknown: number;
 }
 
 export interface ImpactSummary {
@@ -191,7 +222,7 @@ export function normalizeGuidedTourSteps(value: unknown): NormalizedTourStep[] {
   return tour.map((item, index) => {
     const record = isRecord(item) ? item : {};
     const title = stringValue(record.title) || `Step ${index + 1}`;
-    const description = stringValue(record.description) || '';
+    const description = stringValue(record.description) || stringValue(record.body) || '';
     const evidenceIds = uniqueStrings([
       ...citations,
       ...arrayStrings(record.evidence_ids),
@@ -219,6 +250,58 @@ export function clampTourIndex(index: number, steps: NormalizedTourStep[]): numb
   if (steps.length === 0) return 0;
   if (!Number.isFinite(index)) return 0;
   return Math.max(0, Math.min(steps.length - 1, Math.trunc(index)));
+}
+
+export function objectFieldsFromMetadata(metadata: unknown): ObjectField[] {
+  if (!isRecord(metadata)) return [];
+  const direct = Array.isArray(metadata.fields) ? metadata.fields : null;
+  const queryAnalysis = isRecord(metadata.query_analysis) ? metadata.query_analysis : null;
+  const queryFields = queryAnalysis && Array.isArray(queryAnalysis.fields) ? queryAnalysis.fields : null;
+  const sourceFields = direct ?? queryFields ?? [];
+  return sourceFields
+    .map((item) => fieldFromRecord(item))
+    .filter((field): field is ObjectField => Boolean(field));
+}
+
+export function firstAutoFieldName(fields: ObjectField[]): string {
+  return fields.find((field) => field.name.trim())?.name ?? '';
+}
+
+export function nextImpactFieldName(
+  current: string,
+  fields: ObjectField[],
+  options: { objectChanged?: boolean; manualFallback?: string } = {},
+): string {
+  const fieldNames = fields
+    .map((field) => field.name.trim())
+    .filter(Boolean);
+  if (fieldNames.length === 0) {
+    return options.objectChanged ? (options.manualFallback ?? 'AMOUNT') : current;
+  }
+  const currentName = current.trim();
+  if (currentName && currentName !== 'AMOUNT' && fieldNames.includes(currentName)) {
+    return current;
+  }
+  return fieldNames[0];
+}
+
+export function unknownBreakdown(nodes: LayerNodeLike[]): UnknownBreakdown {
+  const breakdown: UnknownBreakdown = {
+    metadata_missing: 0,
+    type_unmapped: 0,
+    parser_unsupported: 0,
+    freshness_unavailable: 0,
+    unknown: 0,
+  };
+  nodes.forEach((node) => {
+    const reason = unknownReason(node);
+    if (reason === 'METADATA_MISSING') breakdown.metadata_missing += 1;
+    else if (reason === 'TYPE_UNMAPPED') breakdown.type_unmapped += 1;
+    else if (reason === 'PARSER_UNSUPPORTED') breakdown.parser_unsupported += 1;
+    else if (reason === 'FRESHNESS_UNAVAILABLE') breakdown.freshness_unavailable += 1;
+    else if (inferDisplayLayer(node).layer === 'Unknown') breakdown.unknown += 1;
+  });
+  return breakdown;
 }
 
 export function deriveImpactSummary(value: unknown): ImpactSummary {
@@ -260,6 +343,29 @@ export function deriveImpactSummary(value: unknown): ImpactSummary {
     manualVerificationCount,
     truncated,
   };
+}
+
+function fieldFromRecord(value: unknown): ObjectField | null {
+  if (!isRecord(value)) return null;
+  const name = stringValue(value.name) ?? stringValue(value.technical_name) ?? stringValue(value.fieldName);
+  if (!name) return null;
+  const field: ObjectField = { name };
+  const type = stringValue(value.type);
+  const role = stringValue(value.role);
+  const description = stringValue(value.description);
+  if (type) field.type = type;
+  if (role) field.role = role;
+  if (description) field.description = description;
+  Object.entries(value).forEach(([key, item]) => {
+    if (!(key in field)) field[key] = item;
+  });
+  return field;
+}
+
+function unknownReason(node: LayerNodeLike): string | null {
+  if (!isRecord(node.metadata)) return null;
+  const reason = stringValue(node.metadata.unknown_reason);
+  return reason ? reason.toUpperCase() : null;
 }
 
 function layerInfo(layer: DisplayLayer, source: DisplayLayerInfo['source']): DisplayLayerInfo {

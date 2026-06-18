@@ -107,6 +107,21 @@ test('normalizes guided tour steps into 1-based navigation-safe display data', (
   assert.equal(steps[1].canNext, false);
 });
 
+test('normalizes legacy tour body text as description', () => {
+  const steps = sliceG.normalizeGuidedTourSteps({
+    tour: [
+      {
+        id: 'deterministic',
+        title: 'Deterministic fallback',
+        body: 'Backend deterministic walkthrough body should remain visible.',
+        node_ids: ['SRC'],
+      },
+    ],
+  });
+
+  assert.equal(steps[0].description, 'Backend deterministic walkthrough body should remain visible.');
+});
+
 test('Glossary object selection clears stale tour and freshness state before Lineage', () => {
   const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   const handlerMatch = source.match(
@@ -148,6 +163,7 @@ test('Glossary object selection clears stale tour and freshness state before Lin
   );
   assert.match(source, /const selectionRef = useRef\(\{ snapshotId: '', objectId: '' \}\);/);
   assert.match(source, /const analysisRequestRef = useRef\(0\);/);
+  assert.match(source, /const queryAnalysisRequestRef = useRef\(0\);/);
   assert.match(source, /function isCurrentAnalysisRequest\(requestId: number, snapshotId: string, objectId: string\): boolean/);
   assert.match(
     source,
@@ -177,6 +193,12 @@ test('Glossary object selection clears stale tour and freshness state before Lin
     assert.match(body, /nextAnalysisRequestId\(\)/, `${functionStart} should key capture\/refresh requests`);
     assert.match(body, /analysisRequestRef\.current !==/, `${functionStart} should ignore stale capture\/refresh responses`);
   });
+  const queryBody = appFunctionBody(source, 'async function runQueryAnalysis', '\n  async function confirmGlossaryTerm');
+  assert.match(queryBody, /const requestSnapshotId = selectedSnapshotId;/);
+  assert.match(queryBody, /const requestQueryName = name;/);
+  assert.match(queryBody, /const requestId = nextQueryAnalysisRequestId\(\);/);
+  assert.match(queryBody, /getQueryAnalysis\(requestSnapshotId, requestQueryName\)/);
+  assert.match(queryBody, /isCurrentQueryAnalysisRequest\(requestId, requestSnapshotId, requestQueryName\)/);
   const freshnessMatch = source.match(
     /const selectedFreshness = useMemo<RequestFreshnessResponse \| null>\(\(\) => \{([\s\S]*?)\n\s*\}, \[[^\]]*\]\);/,
   );
@@ -315,6 +337,178 @@ test('object list metadata and freshness fallback are keyed to the selected snap
   assert.doesNotMatch(listRender, /\bobjects\.map\(\(item\) =>/);
   assert.match(listRender, /currentObjectNextCursor \?/);
   assert.match(listRender, /refreshObjects\(selectedSnapshotId, currentObjectNextCursor\)/);
+});
+
+
+test('BW Search QUERY capture clears dataflow targets and sends query list only', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const captureBody = appFunctionBody(source, 'async function captureLiveWithTargets', '\n  async function captureLive');
+  const fetchBody = appFunctionBody(source, 'async function fetchAndAnalyzeObject', '\n  async function refreshAnalysisBasis');
+
+  assert.match(
+    captureBody,
+    /const queries = options\.queries \?\? \(objectType === 'QUERY' \? options\.objectNames : \[\]\);/,
+    'QUERY capture should populate queries from the selected BW Search object ids',
+  );
+  assert.match(
+    captureBody,
+    /const objectNames = objectType === 'QUERY' \? \[\] : options\.objectNames;/,
+    'QUERY capture must clear objectNames so V1 does not run dataflow\/xref on query ids',
+  );
+  assert.match(captureBody, /objectNames,\s*searchTerms:/, 'capture request should use the guarded objectNames list');
+  assert.match(captureBody, /queries,\s*objectType,/, 'capture request should include the query list');
+  assert.match(
+    fetchBody,
+    /captureLiveWithTargets\(\{\s*objectNames: \[item\.object_id\],\s*objectType: item\.object_type,\s*\}\)/,
+    'BW Search capture should preserve the found object type so QUERY items take the query-only capture path',
+  );
+});
+
+test('query-name input changes synchronously invalidate pending Query Analysis', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+
+  assert.match(
+    source,
+    /const \[queryName, setQueryNameState\] = useState\(''\);/,
+    'query input should use a wrapped state setter so input edits can update refs synchronously',
+  );
+  assert.match(
+    source,
+    /setQueryName=\{setQueryNameFromInput\}/,
+    'QueryTab should receive the synchronous input setter, not the raw state setter',
+  );
+
+  const queryGuardBody = appFunctionBody(source, 'function isCurrentQueryAnalysisRequest', '\n  function nextQueryAnalysisRequestId');
+  assert.match(
+    queryGuardBody,
+    /queryAnalysisRequestRef\.current === requestId/,
+    'Query Analysis should be guarded by the query-only request token',
+  );
+  assert.doesNotMatch(
+    queryGuardBody,
+    /analysisRequestRef\.current === requestId/,
+    'Query Analysis guard must not depend on the shared analysis request token',
+  );
+
+  const helperBody = appFunctionBody(source, 'function invalidateQueryAnalysisRequests', '\n  function nextObjectListRequestId');
+  const helperTokenIndex = helperBody.indexOf('queryAnalysisRequestRef.current += 1;');
+  const helperBusyClearIndex = helperBody.indexOf(
+    "setBusy((current) => current === 'query-analysis' ? '' : current);",
+  );
+  assert.notEqual(helperTokenIndex, -1, 'query invalidation helper should invalidate the query-analysis request token');
+  assert.notEqual(helperBusyClearIndex, -1, 'query invalidation helper should clear pending query-analysis busy state');
+  assert.ok(helperTokenIndex < helperBusyClearIndex, 'query invalidation token must advance before clearing busy');
+  assert.doesNotMatch(
+    helperBody,
+    /analysisRequestRef/,
+    'query invalidation helper must not touch the shared analysis request token',
+  );
+
+  const setterBody = appFunctionBody(source, 'function setQueryNameFromInput', '\n  function applyImpactFieldsForSelection');
+  const refIndex = setterBody.indexOf('queryNameRef.current = value;');
+  const invalidateIndex = setterBody.indexOf('invalidateQueryAnalysisRequests();');
+  const stateIndex = setterBody.indexOf('setQueryNameState(value);');
+  assert.notEqual(refIndex, -1, 'query input setter should update queryNameRef immediately');
+  assert.notEqual(invalidateIndex, -1, 'query input setter should invalidate pending query-analysis immediately');
+  assert.equal(
+    setterBody.indexOf('analysisRequestRef.current += 1;'),
+    -1,
+    'query input setter must not invalidate the shared analysis request token',
+  );
+  assert.notEqual(stateIndex, -1, 'query input setter should still update React state');
+  assert.ok(refIndex < invalidateIndex, 'queryNameRef must update before invalidating/evaluating stale responses');
+  assert.ok(invalidateIndex < stateIndex, 'query-analysis busy must clear before scheduling setQueryName state update');
+
+  const queryBody = appFunctionBody(source, 'async function runQueryAnalysis', '\n  async function confirmGlossaryTerm');
+  assert.match(queryBody, /const requestId = nextQueryAnalysisRequestId\(\);/);
+  assert.match(queryBody, /if \(!isCurrentQueryAnalysisRequest\(requestId, requestSnapshotId, requestQueryName\)\) return;/);
+  assert.match(queryBody, /applyQueryName\(response\.query_name\);/);
+});
+
+test('snapshot and object selection invalidation clears pending Query Analysis with query-only token', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+
+  const helperBody = appFunctionBody(source, 'function invalidateQueryAnalysisRequests', '\n  function nextObjectListRequestId');
+  assert.match(helperBody, /queryAnalysisRequestRef\.current \+= 1;/);
+  assert.match(helperBody, /setBusy\(\(current\) => current === 'query-analysis' \? '' : current\);/);
+  assert.doesNotMatch(
+    helperBody,
+    /analysisRequestRef/,
+    'query-only invalidation must stay separate from shared lineage/impact request tokens',
+  );
+
+  const snapshotSetterBody = appFunctionBody(source, 'function setSelectedSnapshotId', '\n  function setSelectedObjectId');
+  assert.match(
+    snapshotSetterBody,
+    /if \(snapshotId !== selectedSnapshotId\) \{\s*resetImpactFieldSelection\(\);\s*invalidateQueryAnalysisRequests\(\);/,
+    'snapshot selection changes should invalidate pending query analysis without depending on shared analysis tokens',
+  );
+  assert.doesNotMatch(snapshotSetterBody, /analysisRequestRef/);
+
+  const objectSetterBody = appFunctionBody(source, 'function setSelectedObjectId', '\n  function applyQueryName');
+  assert.match(
+    objectSetterBody,
+    /if \(objectId !== selectedObjectId\) \{\s*resetImpactFieldSelection\(\);\s*invalidateQueryAnalysisRequests\(\);/,
+    'object selection changes should invalidate pending query analysis without depending on shared analysis tokens',
+  );
+  assert.doesNotMatch(objectSetterBody, /analysisRequestRef/);
+
+  const clearBody = appFunctionBody(source, 'function clearAnalysisState', '\n  function clearRenderedAnalysisStateForRefresh');
+  const sharedInvalidationIndex = clearBody.indexOf('invalidateAnalysisRequests();');
+  const queryInvalidationIndex = clearBody.indexOf('invalidateQueryAnalysisRequests();');
+  assert.notEqual(sharedInvalidationIndex, -1, 'clearAnalysisState should still invalidate non-query analysis requests');
+  assert.notEqual(queryInvalidationIndex, -1, 'clearAnalysisState should also invalidate pending query analysis');
+  assert.ok(sharedInvalidationIndex < queryInvalidationIndex, 'query invalidation should be explicit and separate');
+  assert.match(clearBody, /setQueryAnalysis\(null\);/);
+
+  const refreshClearBody = appFunctionBody(source, 'function clearRenderedAnalysisStateForRefresh', '\n  function chooseSnapshot');
+  assert.match(
+    refreshClearBody,
+    /invalidateQueryAnalysisRequests\(\);/,
+    'refresh stale-render clearing should invalidate pending query analysis when clearing query results',
+  );
+  assert.doesNotMatch(
+    refreshClearBody,
+    /analysisRequestRef|invalidateAnalysisRequests|clearAnalysisState/,
+    'refresh query invalidation must not disturb the active shared analysis request token',
+  );
+
+  const chooseBody = appFunctionBody(source, 'function chooseSnapshot', '\n  function parseLiveObjectNames');
+  assert.match(
+    chooseBody,
+    /setSelectedSnapshotId\(snapshotId\);\s*setSelectedObjectId\(''\);\s*setAllowHiddenSelection\(false\);\s*clearAnalysisState\(\);/,
+    'snapshot chooser should route through guarded selection setters and clearAnalysisState',
+  );
+
+  const queryInputBody = appFunctionBody(source, 'function setQueryNameFromInput', '\n  function applyImpactFieldsForSelection');
+  assert.match(queryInputBody, /invalidateQueryAnalysisRequests\(\);/);
+  assert.doesNotMatch(
+    queryInputBody,
+    /analysisRequestRef|nextAnalysisRequestId|invalidateAnalysisRequests\(/,
+    'query input changes must not rely on or mutate the shared analysis request token',
+  );
+});
+
+test('stale Query Analysis completion cannot clear a newer pending busy state', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const queryBody = appFunctionBody(source, 'async function runQueryAnalysis', '\n  async function confirmGlossaryTerm');
+  const finallyBodyMatch = queryBody.match(/finally\s*\{([\s\S]*?)\n\s*\}\n\s*\}/);
+
+  assert.ok(finallyBodyMatch, 'runQueryAnalysis should have a finally block');
+  const finallyBody = finallyBodyMatch[1];
+  const guardIndex = finallyBody.indexOf(
+    'isCurrentQueryAnalysisRequest(requestId, requestSnapshotId, requestQueryName)',
+  );
+  const busyClearIndex = finallyBody.indexOf(
+    "setBusy((current) => current === 'query-analysis' ? '' : current);",
+  );
+  assert.notEqual(
+    guardIndex,
+    -1,
+    'query-analysis busy clearing must be guarded by the request/snapshot/query identity',
+  );
+  assert.notEqual(busyClearIndex, -1, 'query-analysis busy state should still clear for the current request');
+  assert.ok(guardIndex < busyClearIndex, 'stale query-analysis requests must not clear newer pending busy state');
 });
 
 test('guarded capture and refresh keep snapshot reload inside the request token', () => {
@@ -573,4 +767,96 @@ test('derives compact change grade and impact summary', () => {
   const empty = sliceG.deriveImpactSummary(null);
   assert.equal(empty.grade, '—');
   assert.equal(empty.headline, 'Run impact to grade the selected change.');
+});
+
+
+test('additional BW object aliases and unknown breakdown are actionable', () => {
+  assert.equal(sliceG.inferDisplayLayer({ type: 'DTPA' }).label, 'Transform');
+  assert.equal(sliceG.inferDisplayLayer({ type: 'ALVL' }).label, 'Semantic');
+  assert.equal(sliceG.inferDisplayLayer({ type: 'AGGR_LEVEL' }).label, 'Semantic');
+  assert.equal(sliceG.inferDisplayLayer({ type: 'INFOSOURCE' }).label, 'Source');
+  assert.equal(sliceG.inferDisplayLayer({ type: 'TRCS' }).label, 'Transform');
+
+  assert.deepEqual(sliceG.unknownBreakdown([
+    { id: 'missing', type: 'UNKNOWN', metadata: { unknown_reason: 'METADATA_MISSING' } },
+    { id: 'unmapped', type: 'CUSTOM_WIDGET', metadata: { unknown_reason: 'TYPE_UNMAPPED' } },
+    { id: 'parser', type: 'UNKNOWN', metadata: { unknown_reason: 'PARSER_UNSUPPORTED' } },
+    { id: 'fresh', type: 'ADSO', metadata: { unknown_reason: 'FRESHNESS_UNAVAILABLE' } },
+  ]), {
+    metadata_missing: 1,
+    type_unmapped: 1,
+    parser_unsupported: 1,
+    freshness_unavailable: 1,
+    unknown: 0,
+  });
+});
+
+test('object field helpers auto-select fields with manual fallback', () => {
+  const fields = sliceG.objectFieldsFromMetadata({ fields: [
+    { name: 'CUSTOMER_ID', type: 'CHAR', role: 'key' },
+    { name: 'NET_VALUE', type: 'CURR', role: 'data' },
+  ] });
+  assert.deepEqual(fields.map((field) => field.name), ['CUSTOMER_ID', 'NET_VALUE']);
+  assert.equal(sliceG.firstAutoFieldName(fields), 'CUSTOMER_ID');
+  assert.equal(sliceG.nextImpactFieldName('NET_VALUE', fields), 'NET_VALUE');
+  assert.equal(sliceG.nextImpactFieldName('AMOUNT', fields), 'CUSTOMER_ID');
+  assert.equal(
+    sliceG.nextImpactFieldName('NET_VALUE', [{ name: 'CUSTOMER_ID', type: 'CHAR' }]),
+    'CUSTOMER_ID',
+  );
+  assert.equal(sliceG.nextImpactFieldName('NET_VALUE', [], { objectChanged: true }), 'AMOUNT');
+  assert.equal(sliceG.nextImpactFieldName('MANUAL_FIELD', [], { objectChanged: false }), 'MANUAL_FIELD');
+  assert.deepEqual(sliceG.objectFieldsFromMetadata({}), []);
+  assert.equal(sliceG.firstAutoFieldName([]), '');
+});
+
+test('App clears stale impact fields synchronously when selection changes', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const resetIndex = source.indexOf('function resetImpactFieldSelection');
+  const getFieldsIndex = source.indexOf('getObjectFields(selectedSnapshotId, selectedObjectId)');
+  assert.notEqual(resetIndex, -1, 'impact field reset helper should be present');
+  assert.notEqual(getFieldsIndex, -1, 'object fields fetch should remain present');
+  assert.ok(resetIndex < getFieldsIndex, 'stale fields should be cleared before async object field fetch logic');
+
+  const resetBody = appFunctionBody(source, 'function resetImpactFieldSelection', '\n  function setSelectedSnapshotId');
+  assert.match(resetBody, /setObjectFields\(\[\]\);/);
+  assert.match(resetBody, /setFieldName\('AMOUNT'\);/);
+  assert.doesNotMatch(resetBody, /getObjectFields|await|async/, 'reset must not wait on field/detail fetches');
+
+  const selectionSetters = appFunctionBody(source, 'function setSelectedSnapshotId', '\n  function nextAnalysisRequestId');
+  assert.match(
+    selectionSetters,
+    /function setSelectedSnapshotId\(snapshotId: string\) \{\s*if \(snapshotId !== selectedSnapshotId\) \{\s*resetImpactFieldSelection\(\);[\s\S]*?\}\s*setSelectedSnapshotIdState\(snapshotId\);/,
+    'snapshot changes should synchronously clear stale impact fields',
+  );
+  assert.match(
+    selectionSetters,
+    /function setSelectedObjectId\(objectId: string\) \{\s*if \(objectId !== selectedObjectId\) \{\s*resetImpactFieldSelection\(\);[\s\S]*?\}\s*setSelectedObjectIdState\(objectId\);/,
+    'object changes should synchronously clear stale impact fields',
+  );
+});
+
+test('App source exposes Query tab, field auto-select, evidence/business labels, and sticky/wrapping CSS', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
+  const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+
+  assert.match(app, /<TabButton id="query" active=\{activeTab\} onClick=\{setActiveTab\} label="Query Analysis" \/>/);
+  assert.match(app, /getObjectFields\(selectedSnapshotId, selectedObjectId\)/);
+  assert.match(app, /fieldSelectionRef/);
+  assert.match(app, /nextImpactFieldName/);
+  assert.match(app, /<select value=\{props\.fieldName\}/);
+  assert.match(api, /queries\?: string\[\];/);
+  assert.match(api, /queries: options\.queries \?\? \[\]/);
+  assert.match(app, /Evidence Walkthrough/);
+  assert.match(app, /Impact Brief/);
+  assert.match(app, /Business Summary/);
+  assert.doesNotMatch(app, />LLM notes</);
+  assert.match(app, /topStatus \$\{topStatusScrolled \? 'scrolled' : ''\}/);
+
+  assert.match(styles, /\.topStatus \{[\s\S]*?top: 0;/);
+  assert.match(styles, /\.topStatus\.scrolled/);
+  assert.match(styles, /\.detailsDrawer \{[\s\S]*?max-height: calc\(100vh - 96px\);[\s\S]*?overflow: auto;/);
+  assert.match(styles, /\.objectItem strong[\s\S]*?-webkit-line-clamp: 2;/);
+  assert.match(styles, /\.evidencePill, \.tourEvidenceList code \{[\s\S]*?overflow-wrap: anywhere;[\s\S]*?white-space: normal;/);
 });

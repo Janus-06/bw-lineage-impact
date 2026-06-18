@@ -210,12 +210,36 @@ def build_source_system_endpoint(source_system: str) -> Endpoint:
     )
 
 
-def build_query_endpoint(query_name: str, *, active: bool = True) -> Endpoint:
+def negotiate_accept(kind: str, *, discovered: str | None = None) -> str:
+    """Return a deterministic Accept header with discovered media types first."""
+
+    candidates: list[str] = []
+    if discovered and discovered.strip():
+        candidates.extend(part.strip() for part in discovered.split(",") if part.strip())
+    base = ACCEPT_HEADERS.get(kind, "*/*")
+    candidates.extend(part.strip() for part in base.split(",") if part.strip())
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in candidates:
+        normalized = item.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(item)
+    return ", ".join(ordered)
+
+
+def build_query_endpoint(
+    query_name: str,
+    *,
+    active: bool = True,
+    discovered_accept: str | None = None,
+) -> Endpoint:
     suffix = "a" if active else "m"
     return Endpoint(
         path=f"/sap/bw/modeling/query/{_url_lower(query_name)}/{suffix}",
         params={},
-        accept=ACCEPT_HEADERS["query"],
+        accept=negotiate_accept("query", discovered=discovered_accept),
     )
 
 
