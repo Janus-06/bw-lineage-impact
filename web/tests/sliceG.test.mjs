@@ -452,6 +452,30 @@ test('responsive shell does not force narrow viewports into horizontal overlap',
   );
 });
 
+test('Claude Design light workbench theme avoids dark override and keeps desktop panels readable', () => {
+  const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+
+  assert.match(css, /Claude Design light workbench/i, 'stylesheet should document the light design pass');
+  assert.doesNotMatch(css, /color-scheme:\s*dark/i, 'final workbench theme must not force dark color-scheme');
+  assert.doesNotMatch(css, /Slice G Open Design direction:\s*dark/i, 'stale dark-workbench block should be removed');
+  assert.doesNotMatch(css, /--bg:\s*#(?:0d0e15|0f1018|101119)/i, 'dark page background tokens must not override light theme');
+  assert.match(
+    css,
+    /\.sliceGWorkspaceGrid\s*\{[^}]*grid-template-columns:\s*minmax\(240px,\s*280px\)\s+minmax\(420px,\s*1fr\)\s+minmax\(260px,\s*300px\)/i,
+    'desktop Slice G workbench should use bounded, readable columns',
+  );
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*1280px\)[\s\S]*?\.sliceGWorkspaceGrid\s*\{[^}]*grid-template-columns:\s*minmax\(240px,\s*300px\)\s+minmax\(0,\s*1fr\)/i,
+    'laptop Slice G layout should drop the drawer below before columns crowd',
+  );
+  assert.match(
+    css,
+    /\.lineageSummaryStrip\s*\{[^}]*background:\s*linear-gradient\([^;]*(?:#ffffff|#f8fbff)/i,
+    'summary strip should use a bright surface instead of a dark panel',
+  );
+});
+
 test('snapshot context and glossary writes are guarded by snapshot and request identity', () => {
   const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
 
