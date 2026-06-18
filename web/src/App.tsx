@@ -7,8 +7,11 @@ import {
   explainSql,
   getCaptureScope,
   getGlossary,
+  getGlossaryAggregate,
   getObject,
+  getObjectFields,
   getObjectFreshness,
+  getQueryAnalysis,
   getRepository,
   getRuntimeConfig,
   listObjects,
@@ -20,6 +23,7 @@ import {
   postLineage,
   postLineageAdvice,
   postLineageTour,
+  postGlossaryLifecycle,
   putRuntimeConfig,
   refreshSnapshotFromBw,
   searchBwObjects,
@@ -32,6 +36,7 @@ import {
   type ConnectionStatus,
   type DataflowDirection,
   type Direction,
+  type GlossaryAggregateResponse,
   type GlossaryTerm,
   type ImpactAdviceResponse,
   type ImpactScenarioResponse,
@@ -39,6 +44,7 @@ import {
   type LineageAdviceResponse,
   type LineageResponse,
   type LineageTourResponse,
+  type QueryAnalysisResponse,
   type LiveCaptureSummary,
   type LiveSmokeResult,
   type RequestFreshnessResponse,
@@ -57,10 +63,13 @@ import {
   freshnessFromMetadata,
   groupNodesByDisplayLayer,
   inferDisplayLayer,
+  nextImpactFieldName,
   normalizeGuidedTourSteps,
+  objectFieldsFromMetadata,
   type DisplayLayer,
   type FreshnessDisplay,
   type NormalizedTourStep,
+  type ObjectField,
 } from './sliceG';
 
 const fixtureGraphPath = 'tests/fixtures/sample-graph.json';
@@ -139,11 +148,11 @@ interface ReloadSnapshotsOptions {
 export default function App() {
   const [runtime, setRuntime] = useState<RuntimeConfigResponse | null>(null);
   const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
-  const [selectedSnapshotId, setSelectedSnapshotId] = useState('');
+  const [selectedSnapshotId, setSelectedSnapshotIdState] = useState('');
   const [objects, setObjects] = useState<CatalogObject[]>([]);
   const [objectsSnapshotId, setObjectsSnapshotId] = useState('');
   const [objectNextCursor, setObjectNextCursor] = useState<string | null>(null);
-  const [selectedObjectId, setSelectedObjectId] = useState('');
+  const [selectedObjectId, setSelectedObjectIdState] = useState('');
   const [allowHiddenSelection, setAllowHiddenSelection] = useState(false);
   const [objectDetail, setObjectDetail] = useState<ObjectDetailState | null>(null);
   const [objectFreshness, setObjectFreshness] = useState<ObjectFreshnessState | null>(null);
@@ -156,6 +165,9 @@ export default function App() {
   const [edgeCap, setEdgeCap] = useState(60);
   const [changeType, setChangeType] = useState<ChangeType>('field_removed');
   const [fieldName, setFieldName] = useState('AMOUNT');
+  const [objectFields, setObjectFields] = useState<ObjectField[]>([]);
+  const [queryName, setQueryNameState] = useState('');
+  const [queryAnalysis, setQueryAnalysis] = useState<QueryAnalysisResponse | null>(null);
   const [scenarioDescription, setScenarioDescription] = useState('컬럼/로직 변경 영향 검토');
   const [impactDepth, setImpactDepth] = useState(3);
   const [sqlViewId, setSqlViewId] = useState('ZSQL_VIEW');
@@ -175,6 +187,7 @@ export default function App() {
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [topStatusScrolled, setTopStatusScrolled] = useState(false);
   const [setupForm, setSetupForm] = useState<SetupForm>({
     url: '',
     user: '',
@@ -207,6 +220,7 @@ export default function App() {
   const [repositoryActionRequired, setRepositoryActionRequired] = useState<string | null>(null);
   const [captureScope, setCaptureScope] = useState<CaptureScopeItem[]>([]);
   const [glossaryTerms, setGlossaryTerms] = useState<GlossaryTerm[]>([]);
+  const [glossaryAggregate, setGlossaryAggregate] = useState<GlossaryAggregateResponse | null>(null);
   const [glossaryQuery, setGlossaryQuery] = useState('');
   const [bwSearchTerm, setBwSearchTerm] = useState('');
   const [bwSearchType, setBwSearchType] = useState('');
@@ -214,9 +228,12 @@ export default function App() {
   const [bwSearchTruncated, setBwSearchTruncated] = useState(false);
   const selectionRef = useRef({ snapshotId: '', objectId: '' });
   const analysisRequestRef = useRef(0);
+  const queryAnalysisRequestRef = useRef(0);
   const objectListRequestRef = useRef(0);
   const snapshotContextRequestRef = useRef(0);
   const glossarySearchRequestRef = useRef(0);
+  const fieldSelectionRef = useRef({ snapshotId: '', objectId: '' });
+  const queryNameRef = useRef('');
 
   const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
   const currentObjects = useMemo(
@@ -258,13 +275,64 @@ export default function App() {
     return value && typeof value === 'object' ? value as RequestFreshnessResponse : null;
   }, [objectFreshness, selectedObjectDetail, selectedObjectFromCurrentObjects, selectedObjectId, selectedSnapshotId]);
 
+  function resetImpactFieldSelection() {
+    setObjectFields([]);
+    setFieldName('AMOUNT');
+  }
+
+  function setSelectedSnapshotId(snapshotId: string) {
+    if (snapshotId !== selectedSnapshotId) {
+      resetImpactFieldSelection();
+      invalidateQueryAnalysisRequests();
+    }
+    setSelectedSnapshotIdState(snapshotId);
+  }
+
+  function setSelectedObjectId(objectId: string) {
+    if (objectId !== selectedObjectId) {
+      resetImpactFieldSelection();
+      invalidateQueryAnalysisRequests();
+    }
+    setSelectedObjectIdState(objectId);
+  }
+
+  function applyQueryName(value: string) {
+    queryNameRef.current = value;
+    setQueryNameState(value);
+  }
+
+  function setQueryNameFromInput(value: string) {
+    queryNameRef.current = value;
+    invalidateQueryAnalysisRequests();
+    setQueryNameState(value);
+  }
+
+  function applyImpactFieldsForSelection(snapshotId: string, objectId: string, fields: ObjectField[]) {
+    setObjectFields(fields);
+    const objectChanged = fieldSelectionRef.current.snapshotId !== snapshotId
+      || fieldSelectionRef.current.objectId !== objectId;
+    fieldSelectionRef.current = { snapshotId, objectId };
+    setFieldName((current) => nextImpactFieldName(current, fields, { objectChanged }));
+  }
+
   useEffect(() => {
     void refreshAll();
   }, []);
 
   useEffect(() => {
+    const onScroll = () => setTopStatusScrolled(window.scrollY > 8);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  useEffect(() => {
     selectionRef.current = { snapshotId: selectedSnapshotId, objectId: selectedObjectId };
   }, [selectedSnapshotId, selectedObjectId]);
+
+  useEffect(() => {
+    queryNameRef.current = queryName;
+  }, [queryName]);
 
   useEffect(() => {
     if (!selectedSnapshotId && snapshots.length > 0) {
@@ -325,6 +393,30 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selectedSnapshotId, selectedObjectId]);
 
+  useEffect(() => {
+    if (!selectedSnapshotId || !selectedObjectId) {
+      setObjectFields([]);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await getObjectFields(selectedSnapshotId, selectedObjectId);
+        if (cancelled) return;
+        const fields = response.fields.length > 0
+          ? response.fields
+          : objectFieldsFromMetadata(selectedObjectDetail?.metadata ?? selectedObjectFromCurrentObjects?.metadata);
+        applyImpactFieldsForSelection(selectedSnapshotId, selectedObjectId, fields);
+      } catch (_err) {
+        if (!cancelled) {
+          const fields = objectFieldsFromMetadata(selectedObjectDetail?.metadata ?? selectedObjectFromCurrentObjects?.metadata);
+          applyImpactFieldsForSelection(selectedSnapshotId, selectedObjectId, fields);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedSnapshotId, selectedObjectId, selectedObjectDetail, selectedObjectFromCurrentObjects]);
+
   const latestSnapshotLabel = selectedSnapshot
     ? compactDate(selectedSnapshot.created_at)
     : '분석 기준 없음';
@@ -353,6 +445,23 @@ export default function App() {
     return analysisRequestRef.current === requestId
       && selectionRef.current.snapshotId === snapshotId
       && selectionRef.current.objectId === objectId;
+  }
+
+  function isCurrentQueryAnalysisRequest(requestId: number, snapshotId: string, queryNameForRequest: string): boolean {
+    const currentQueryName = queryNameRef.current.trim() || selectionRef.current.objectId;
+    return queryAnalysisRequestRef.current === requestId
+      && selectionRef.current.snapshotId === snapshotId
+      && currentQueryName === queryNameForRequest;
+  }
+
+  function nextQueryAnalysisRequestId(): number {
+    queryAnalysisRequestRef.current += 1;
+    return queryAnalysisRequestRef.current;
+  }
+
+  function invalidateQueryAnalysisRequests() {
+    queryAnalysisRequestRef.current += 1;
+    setBusy((current) => current === 'query-analysis' ? '' : current);
   }
 
   function nextObjectListRequestId(): number {
@@ -398,11 +507,13 @@ export default function App() {
     glossarySearchRequestRef.current += 1;
     setCaptureScope([]);
     setGlossaryTerms([]);
+    setGlossaryAggregate(null);
     setBusy((current) => current === 'glossary' ? '' : current);
   }
 
   function clearAnalysisState() {
     invalidateAnalysisRequests();
+    invalidateQueryAnalysisRequests();
     setLineage(null);
     setLineageAdvice(null);
     setLineageTour(null);
@@ -415,11 +526,14 @@ export default function App() {
     setSqlDraft(null);
     setObjectDetail(null);
     setObjectFreshness(null);
+    setObjectFields([]);
+    setQueryAnalysis(null);
   }
 
   function clearRenderedAnalysisStateForRefresh() {
     // Guarded refresh reruns keep the current request token alive until the rerun is started.
-    // Clear only rendered snapshot/object-scoped state here; do not touch the request token.
+    // Clear only rendered snapshot/object-scoped state here; do not touch the shared analysis request token.
+    invalidateQueryAnalysisRequests();
     setLineage(null);
     setLineageAdvice(null);
     setLineageTour(null);
@@ -430,6 +544,8 @@ export default function App() {
     setImpactTourStepIndex(0);
     setObjectDetail(null);
     setObjectFreshness(null);
+    setObjectFields([]);
+    setQueryAnalysis(null);
     setCaptureScope([]);
     setGlossaryTerms([]);
   }
@@ -578,15 +694,17 @@ export default function App() {
     const contextRequestId = nextSnapshotContextRequestId();
     const glossaryRequestId = nextGlossarySearchRequestId();
     try {
-      const [scopeResponse, glossaryResponse] = await Promise.all([
+      const [scopeResponse, glossaryResponse, aggregateResponse] = await Promise.all([
         getCaptureScope(snapshotId),
         getGlossary(snapshotId),
+        getGlossaryAggregate(),
       ]);
       if (isCurrentSnapshotContextRequest(contextRequestId, snapshotId)) {
         setCaptureScope(scopeResponse.items);
       }
       if (isCurrentGlossarySearchRequest(glossaryRequestId, snapshotId)) {
         setGlossaryTerms(glossaryResponse.items);
+        setGlossaryAggregate(glossaryResponse.counts ?? aggregateResponse);
       }
     } catch (err) {
       const contextStillCurrent = isCurrentSnapshotContextRequest(contextRequestId, snapshotId);
@@ -638,6 +756,7 @@ export default function App() {
       const detail = await getObject(snapshotId, objectId);
       if (isStale()) return;
       setObjectDetail({ snapshotId, objectId, value: detail });
+      applyImpactFieldsForSelection(snapshotId, objectId, objectFieldsFromMetadata(detail.metadata));
       const metadataFreshness = freshnessFromMetadata(detail.metadata);
       setObjectFreshness({
         snapshotId,
@@ -742,12 +861,17 @@ export default function App() {
     objectNames: string[];
     searchTerms?: string[];
     objectType?: string;
+    queries?: string[];
   }): Promise<SnapshotSummary> {
+    const objectType = liveCaptureObjectTypeFor(options.objectNames, options.objectType);
+    const queries = options.queries ?? (objectType === 'QUERY' ? options.objectNames : []);
+    const objectNames = objectType === 'QUERY' ? [] : options.objectNames;
     return captureLiveSnapshot({
       confirmReadOnly: true,
-      objectNames: options.objectNames,
+      objectNames,
       searchTerms: options.searchTerms && options.searchTerms.length > 0 ? options.searchTerms : undefined,
-      objectType: liveCaptureObjectTypeFor(options.objectNames, options.objectType),
+      queries,
+      objectType,
       sourceSystem: liveSourceSystem.trim() || undefined,
       dataflowDirection: liveDataflowDirection,
       dataflowLevels: liveDataflowLevels,
@@ -943,6 +1067,7 @@ export default function App() {
       const response = await getGlossary(requestSnapshotId, glossaryQuery.trim() || undefined);
       if (!isCurrentGlossarySearchRequest(requestId, requestSnapshotId)) return;
       setGlossaryTerms(response.items);
+      setGlossaryAggregate(response.counts ?? null);
       setError('');
     } catch (err) {
       if (isCurrentGlossarySearchRequest(requestId, requestSnapshotId)) {
@@ -1188,6 +1313,49 @@ export default function App() {
     }
   }
 
+  async function runQueryAnalysis() {
+    if (!selectedSnapshotId) return;
+    const name = queryName.trim() || selectedObjectId;
+    if (!name) {
+      setError('Query name 또는 selected query object가 필요합니다.');
+      return;
+    }
+    const requestSnapshotId = selectedSnapshotId;
+    const requestQueryName = name;
+    const requestId = nextQueryAnalysisRequestId();
+    setBusy('query-analysis');
+    try {
+      const response = await getQueryAnalysis(requestSnapshotId, requestQueryName);
+      if (!isCurrentQueryAnalysisRequest(requestId, requestSnapshotId, requestQueryName)) return;
+      setQueryAnalysis(response);
+      applyQueryName(response.query_name);
+      setError('');
+    } catch (err) {
+      if (isCurrentQueryAnalysisRequest(requestId, requestSnapshotId, requestQueryName)) {
+        setQueryAnalysis(null);
+        setError(errorText(err));
+      }
+    } finally {
+      if (isCurrentQueryAnalysisRequest(requestId, requestSnapshotId, requestQueryName)) {
+        setBusy((current) => current === 'query-analysis' ? '' : current);
+      }
+    }
+  }
+
+  async function confirmGlossaryTerm(termId: string, lifecycle: 'candidate' | 'confirmed' | 'rejected') {
+    setBusy('glossary');
+    try {
+      const updated = await postGlossaryLifecycle(termId, lifecycle);
+      setGlossaryTerms((current) => current.map((term) => term.id === termId ? { ...term, ...updated } : term));
+      setGlossaryAggregate(await getGlossaryAggregate(glossaryQuery.trim() || undefined));
+      setError('');
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy('');
+    }
+  }
+
   async function runSqlExplain() {
     if (!selectedSnapshotId) return;
     setBusy('sql-explain');
@@ -1229,11 +1397,11 @@ export default function App() {
 
   return (
     <div className="appShell">
-      <header className="topStatus">
+      <header className={`topStatus ${topStatusScrolled ? 'scrolled' : ''}`}>
         <div className="brandBlock">
           <div>
             <strong>BW Lineage Impact Workbench · Slice G</strong>
-            <span>Layer lanes · Guided tours · Read-only metadata</span>
+            <span>Layer lanes · Evidence Walkthroughs · Read-only metadata</span>
           </div>
         </div>
         <div className="statusStrip">
@@ -1766,6 +1934,7 @@ export default function App() {
                 <button
                   key={item.id}
                   className={item.id === selectedObjectId ? 'objectItem active' : 'objectItem'}
+                  title={`${item.type} · ${item.id}${item.name ? ` · ${item.name}` : ''}`}
                   onClick={() => {
                     invalidateAnalysisRequests();
                     setAllowHiddenSelection(false);
@@ -1806,6 +1975,7 @@ export default function App() {
           <nav className="tabBar">
             <TabButton id="lineage" active={activeTab} onClick={setActiveTab} label="Lineage" />
             <TabButton id="impact" active={activeTab} onClick={setActiveTab} label="Impact" />
+            <TabButton id="query" active={activeTab} onClick={setActiveTab} label="Query Analysis" />
             <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Analysis" />
             <TabButton id="glossary" active={activeTab} onClick={setActiveTab} label="Glossary" />
           </nav>
@@ -1868,6 +2038,7 @@ export default function App() {
               setChangeType={setChangeType}
               fieldName={fieldName}
               setFieldName={setFieldName}
+              objectFields={objectFields}
               description={scenarioDescription}
               setDescription={setScenarioDescription}
               impactDepth={impactDepth}
@@ -1884,6 +2055,18 @@ export default function App() {
               onTour={() => void runImpactTour()}
               tourStepIndex={impactTourStepIndex}
               setTourStepIndex={setImpactTourStepIndex}
+            />
+          ) : null}
+
+          {activeTab === 'query' ? (
+            <QueryTab
+              selectedSnapshot={selectedSnapshot}
+              selectedObject={selectedObject}
+              queryName={queryName}
+              setQueryName={setQueryNameFromInput}
+              queryAnalysis={queryAnalysis}
+              onRun={() => void runQueryAnalysis()}
+              busy={busy === 'query-analysis'}
             />
           ) : null}
 
@@ -1912,7 +2095,9 @@ export default function App() {
               query={glossaryQuery}
               setQuery={setGlossaryQuery}
               terms={glossaryTerms}
+              aggregate={glossaryAggregate}
               onSearch={() => void searchGlossary()}
+              onLifecycle={(termId, lifecycle) => void confirmGlossaryTerm(termId, lifecycle)}
               onSelectObject={(objectId) => {
                 invalidateAnalysisRequests();
                 setAllowHiddenSelection(true);
@@ -2032,10 +2217,10 @@ function LineageTab(props: {
           Lineage 실행
         </button>
         <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
-          Guided tour
+          Evidence Walkthrough
         </button>
         <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
-          LLM notes
+          Business Summary
         </button>
         {props.lineage ? (
           <div className="metaGrid">
@@ -2055,7 +2240,7 @@ function LineageTab(props: {
       </section>
       <aside className="detailsDrawer sliceGDrawer">
         <GuidedTourPanel
-          title="Guided tour"
+          title="Evidence Walkthrough"
           response={props.lineageTour}
           steps={tourSteps}
           currentIndex={currentTourIndex}
@@ -2089,7 +2274,7 @@ function LineageTab(props: {
         ) : <p>카탈로그 또는 graph node를 선택하세요.</p>}
         {props.lineageAdvice ? (
           <div className={`llmAdviceBox ${props.lineageAdvice.status}`}>
-            <h3>LLM notes</h3>
+            <h3>Business Summary</h3>
             <p>{props.lineageAdvice.message}</p>
             {props.lineageAdvice.advice ? <pre>{props.lineageAdvice.advice}</pre> : null}
             <small>Citations: {props.lineageAdvice.citations.join(', ') || 'none'}</small>
@@ -2107,6 +2292,7 @@ function ImpactTab(props: {
   setChangeType: (value: ChangeType) => void;
   fieldName: string;
   setFieldName: (value: string) => void;
+  objectFields: ObjectField[];
   description: string;
   setDescription: (value: string) => void;
   impactDepth: number;
@@ -2142,7 +2328,15 @@ function ImpactTab(props: {
           </select>
         </label>
         <label>Field / 필드
-          <input value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)} />
+          {props.objectFields.length > 0 ? (
+            <select value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)}>
+              {props.objectFields.map((field) => (
+                <option key={field.name} value={field.name}>{field.name}{field.role ? ` · ${field.role}` : ''}</option>
+              ))}
+            </select>
+          ) : (
+            <input value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)} placeholder="Manual field name" />
+          )}
         </label>
         <label>설명
           <textarea value={props.description} onChange={(event) => props.setDescription(event.target.value)} rows={4} />
@@ -2152,10 +2346,10 @@ function ImpactTab(props: {
           Impact 실행
         </button>
         <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
-          Impact tour
+          Impact Brief
         </button>
         <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
-          LLM notes
+          Business Summary
         </button>
       </section>
       <section className="resultCard impactWorkbenchPanel">
@@ -2185,7 +2379,7 @@ function ImpactTab(props: {
         </div>
 
         <GuidedTourPanel
-          title="Impact tour"
+          title="Impact Brief"
           response={props.impactTour}
           steps={tourSteps}
           currentIndex={currentTourIndex}
@@ -2197,7 +2391,7 @@ function ImpactTab(props: {
         <span className="eyebrow">Affected</span>
         {props.impactAdvice ? (
           <div className={`llmAdviceBox ${props.impactAdvice.status}`}>
-            <h3>LLM notes</h3>
+            <h3>Business Summary</h3>
             <p>{props.impactAdvice.message}</p>
             {props.impactAdvice.advice ? <pre>{props.impactAdvice.advice}</pre> : null}
             <small>Citations: {props.impactAdvice.citations.join(', ') || 'none'}</small>
@@ -2224,6 +2418,64 @@ function ImpactTab(props: {
             {props.impact.affected_objects.length === 0 ? <div className="emptyState">이 범위 내 영향 없음 (깊이 기준 확인 필요)</div> : null}
           </div>
         ) : <div className="emptyState">변경 시나리오(예: 필드 삭제)를 고르면 영향 객체를 심각도순으로 보여드립니다. Lineage에서 본 객체가 자동으로 선택됩니다.</div>}
+      </section>
+    </div>
+  );
+}
+
+
+function QueryTab(props: {
+  selectedSnapshot: SnapshotSummary | null;
+  selectedObject: CatalogObject | null;
+  queryName: string;
+  setQueryName: (value: string) => void;
+  queryAnalysis: QueryAnalysisResponse | null;
+  onRun: () => void;
+  busy: boolean;
+}) {
+  const result = props.queryAnalysis?.result ?? null;
+  const variables = Array.isArray(result?.variables) ? result.variables : [];
+  const calculated = Array.isArray(result?.calculated_key_figures) ? result.calculated_key_figures : [];
+  const restricted = Array.isArray(result?.restricted_key_figures) ? result.restricted_key_figures : [];
+  const providers = Array.isArray(result?.providers) ? result.providers : [];
+  const fields = Array.isArray(result?.fields) ? result.fields : [];
+  return (
+    <div className="queryLayout">
+      <section className="controlCard">
+        <span className="eyebrow">Query Analysis</span>
+        <h1>Query XML analysis</h1>
+        <p className="tabPurpose">Snapshot-driven, read-only parser output. No live query execution, preview, or data rows.</p>
+        <div className="scenarioObject">분석 기준: <strong>{props.selectedSnapshot ? compactDate(props.selectedSnapshot.created_at) : '없음'}</strong></div>
+        <label>Query technical name
+          <input
+            value={props.queryName}
+            placeholder={props.selectedObject?.type === 'QUERY' ? props.selectedObject.id : 'ZQ_SALES_MARGIN'}
+            onChange={(event) => props.setQueryName(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Enter') props.onRun(); }}
+          />
+        </label>
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedSnapshot || props.busy}>
+          Query Analysis 실행
+        </button>
+        <p className="policyNote">Live capture가 없으면 snapshot fixture/catalog에 저장된 query XML 분석 결과만 표시합니다.</p>
+      </section>
+      <section className="resultCard queryResultCard">
+        <span className="eyebrow">Result</span>
+        {props.queryAnalysis ? (
+          <>
+            <div className="metaGrid">
+              <Metric label="Read-only" value={props.queryAnalysis.read_only ? 'Yes' : 'No'} />
+              <Metric label="Variables" value={String(variables.length)} />
+              <Metric label="CKF" value={String(calculated.length)} />
+              <Metric label="RKF" value={String(restricted.length)} />
+              <Metric label="Providers" value={String(providers.length)} />
+              <Metric label="Fields" value={String(fields.length)} />
+            </div>
+            <pre className="jsonPreview">{JSON.stringify(props.queryAnalysis.result, null, 2)}</pre>
+          </>
+        ) : (
+          <div className="emptyState">Query name을 입력하거나 QUERY object를 선택한 뒤 분석을 실행하세요.</div>
+        )}
       </section>
     </div>
   );
@@ -2332,7 +2584,9 @@ function GlossaryTab(props: {
   query: string;
   setQuery: (value: string) => void;
   terms: GlossaryTerm[];
+  aggregate: GlossaryAggregateResponse | null;
   onSearch: () => void;
+  onLifecycle: (termId: string, lifecycle: 'candidate' | 'confirmed' | 'rejected') => void;
   onSelectObject: (objectId: string) => void;
   onAddTarget: (objectId: string) => void;
   busy: boolean;
@@ -2392,7 +2646,8 @@ function GlossaryTab(props: {
           </label>
         </div>
         <div className="metaGrid glossaryMetrics">
-          <Metric label="Terms" value={String(props.terms.length)} />
+          <Metric label="Terms" value={String(props.aggregate?.total ?? props.terms.length)} />
+          <Metric label="Confirmed" value={String(props.aggregate?.confirmed ?? props.terms.filter((term) => term.lifecycle === 'confirmed').length)} />
           <Metric label="Visible" value={String(filteredTerms.length)} />
           <Metric label="Sources" value={String(sources.length)} />
         </div>
@@ -2423,6 +2678,10 @@ function GlossaryTab(props: {
                         </button>
                       </div>
                     ) : null}
+                    <div className="glossaryActions lifecycleActions" aria-label="local glossary lifecycle">
+                      <button className="ghostButton" onClick={() => props.onLifecycle(term.id, 'confirmed')}>Confirm</button>
+                      <button className="ghostButton" onClick={() => props.onLifecycle(term.id, 'rejected')}>Reject</button>
+                    </div>
                     <small>Evidence IDs: {term.evidence_ids.join(', ') || '—'}</small>
                   </article>
                 );
@@ -2565,8 +2824,8 @@ function GuidedTourPanel(props: {
       {props.response?.summary ? <p className="tourSummary">{props.response.summary}</p> : null}
       {current ? (
         <>
-          <p>{current.description || props.response?.message || 'Guided tour step has no description.'}</p>
-          <div className="tourEvidenceList" aria-label="guided tour evidence ids">
+          <p>{current.description || props.response?.message || 'Evidence Walkthrough step has no description.'}</p>
+          <div className="tourEvidenceList" aria-label="evidence walkthrough evidence ids">
             {current.evidenceIds.length > 0 ? current.evidenceIds.slice(0, 6).map((id) => <code key={id}>{id}</code>) : <span>No evidence IDs returned</span>}
           </div>
           <div className="tourControls">
@@ -2576,9 +2835,9 @@ function GuidedTourPanel(props: {
         </>
       ) : (
         <>
-          <p>{isDisabled ? props.response?.message : 'Generate a citation-bound guided tour for the selected bounded analysis.'}</p>
+          <p>{isDisabled ? props.response?.message : 'Generate a citation-bound evidence walkthrough for the selected bounded analysis.'}</p>
           {props.response?.citations.length ? <small>Citations: {props.response.citations.join(', ')}</small> : null}
-          <button className="secondaryButton wide" onClick={props.onRun} disabled={props.busy}>{props.busy ? 'Generating…' : 'Generate guided tour'}</button>
+          <button className="secondaryButton wide" onClick={props.onRun} disabled={props.busy}>{props.busy ? 'Generating…' : 'Generate Evidence Walkthrough'}</button>
         </>
       )}
     </section>

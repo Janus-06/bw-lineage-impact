@@ -482,6 +482,29 @@ def test_ingest_manifest_query_xml_ignores_self_link_provider_edges(
     ]
 
 
+def test_ingest_manifest_query_xml_ignores_source_query_related_self_edge(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_query",
+        payload_id="query-source-self-link",
+        source="bw://bw_get_query?queryName=ZQ_SELF",
+        payload="""
+        <Qry:queryResource xmlns:Qry="urn:sap:bw:query"
+            xmlns:atom="http://www.w3.org/2005/Atom"
+            description="Self-linked query without root technical name">
+          <atom:link rel="related" href="/sap/bw/modeling/query/zq_self/m" />
+        </Qry:queryResource>
+        """,
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    assert [(item.id, item.type) for item in catalog.objects] == [("ZQ_SELF", "QUERY")]
+    assert catalog.edges == []
+
+
 def test_ingest_manifest_composite_provider_xml_adds_input_provider_edges(
     tmp_path: Path,
 ) -> None:
@@ -714,3 +737,144 @@ def test_ingest_manifest_merges_duplicate_json_search_objects_before_storage(
     snapshot = store.create_snapshot(mode="test", source="fixture://duplicate-search-json")
     store.replace_catalog(snapshot.id, objects=catalog.objects, edges=catalog.edges)
     assert store.get_object(snapshot.id, "ZADSO_DUP") is not None
+
+
+def test_xref_endpoints_tag_unknown_reason_metadata_missing(tmp_path: Path) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_xref",
+        payload_id="xref-unknown",
+        payload={"references": [{"sourceObject": "ZUPSTREAM", "targetObject": "ZDOWNSTREAM"}]},
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZUPSTREAM"].type == "UNKNOWN"
+    assert objects["ZUPSTREAM"].metadata["unknown_reason"] == "METADATA_MISSING"
+    assert objects["ZDOWNSTREAM"].metadata["unknown_reason"] == "METADATA_MISSING"
+
+
+def test_type_unmapped_vs_metadata_missing_distinguished(tmp_path: Path) -> None:
+    missing_manifest = _write_manifest_payload(
+        tmp_path / "missing",
+        kind="bw_xref",
+        payload_id="xref-unknown",
+        payload={"references": [{"sourceObject": "ZUNKNOWN", "targetObject": "ZTARGET"}]},
+    )
+    _, missing_catalog = ingest_manifest(missing_manifest)
+    missing = {item.id: item for item in missing_catalog.objects}
+    assert missing["ZUNKNOWN"].metadata["unknown_reason"] == "METADATA_MISSING"
+
+    unmapped_manifest = _write_manifest_payload(
+        tmp_path / "unmapped",
+        kind="bw_search",
+        payload_id="search-unmapped",
+        payload={"objects": [{"technicalName": "ZCUSTOM", "objectType": "CUSTOM_WIDGET"}]},
+    )
+    _, unmapped_catalog = ingest_manifest(unmapped_manifest)
+    unmapped = {item.id: item for item in unmapped_catalog.objects}
+    assert unmapped["ZCUSTOM"].type == "CUSTOM_WIDGET"
+    assert unmapped["ZCUSTOM"].metadata["unknown_reason"] == "TYPE_UNMAPPED"
+
+
+def test_unknown_reason_removed_when_later_metadata_resolves_type(tmp_path: Path) -> None:
+    writer = SnapshotWriter(tmp_path)
+    payloads = [
+        writer.write_payload(
+            payload_id="xref-unknown",
+            kind="bw_xref",
+            source="bw://bw_xref",
+            payload={"references": [{"sourceObject": "ZOBJ", "targetObject": "ZQUERY"}]},
+        ),
+        writer.write_payload(
+            payload_id="search-resolved",
+            kind="bw_search",
+            source="bw://bw_search",
+            payload={"objects": [{"technicalName": "ZOBJ", "objectType": "ADSO"}]},
+        ),
+    ]
+    writer.write_manifest(mode="live-read-only", payloads=payloads)
+
+    _, catalog = ingest_manifest(tmp_path / "manifest.json")
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZOBJ"].type == "ADSO"
+    assert "unknown_reason" not in objects["ZOBJ"].metadata
+    assert objects["ZQUERY"].metadata["unknown_reason"] == "METADATA_MISSING"
+
+
+def test_query_ingest_emits_variable_and_keyfigure_nodes(tmp_path: Path) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_query",
+        payload_id="query-rich",
+        payload=(Path("tests/fixtures/query-analysis.xml").read_text(encoding="utf-8")),
+        source="bw://bw_get_query?queryName=ZQ_SALES_MARGIN",
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    objects = {item.id: item for item in catalog.objects}
+    assert objects["ZQ_SALES_MARGIN"].type == "QUERY"
+    assert objects["ZQ_SALES_MARGIN"].metadata["query_analysis"]["variable_count"] == 1
+    assert objects["ZQ_SALES_MARGIN"].metadata["fields"][0]["name"] == "ZVAR_CALMONTH"
+    assert objects["ZVAR_CALMONTH"].type == "QUERY_VARIABLE"
+    assert objects["ZCKF_MARGIN"].type == "CKF"
+    assert objects["ZRKF_CURR_YEAR"].type == "RKF"
+    assert objects["ZC_SALES"].type == "HCPR"
+    assert ("ZC_SALES", "ZQ_SALES_MARGIN", "provides") in {
+        (edge.source, edge.target, edge.type) for edge in catalog.edges
+    }
+
+
+def test_ingest_adso_xml_extracts_fields(tmp_path: Path) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_adso",
+        payload_id="adso-fields",
+        payload=Path("tests/fixtures/adso-fields.xml").read_text(encoding="utf-8"),
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    obj = {item.id: item for item in catalog.objects}["ZADSO_SALES"]
+    assert obj.type == "ADSO"
+    assert obj.metadata["fields"] == [
+        {
+            "name": "CUSTOMER_ID",
+            "description": "Customer",
+            "type": "CHAR",
+            "role": "key",
+            "length": "10",
+        },
+        {
+            "name": "NET_VALUE",
+            "description": "Net value",
+            "type": "CURR",
+            "role": "data",
+            "length": "17",
+        },
+    ]
+
+
+def test_hcpr_fields_attached(tmp_path: Path) -> None:
+    manifest_path = _write_manifest_payload(
+        tmp_path,
+        kind="bw_get_composite_provider",
+        payload_id="hcpr-fields",
+        payload=Path("tests/fixtures/hcpr-fields.xml").read_text(encoding="utf-8"),
+    )
+
+    _, catalog = ingest_manifest(manifest_path)
+
+    obj = {item.id: item for item in catalog.objects}["ZC_SALES"]
+    assert obj.metadata["fields"] == [
+        {
+            "name": "CUSTOMER_ID",
+            "description": "Customer",
+            "type": "CHAR",
+            "role": "characteristic",
+        },
+        {"name": "NET_VALUE", "description": "Net value", "type": "DEC", "role": "key_figure"},
+    ]

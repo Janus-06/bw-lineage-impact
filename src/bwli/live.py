@@ -124,6 +124,9 @@ def run_live_smoke(
     dataflow_source_system: str | None = None,
     dataflow_direction: DataflowDirection = "downwards",
     dataflow_levels: int = 3,
+    query_name: str | None = None,
+    datasource: tuple[str, str] | None = None,
+    process_chain: str | None = None,
     secret_values: Sequence[str] = (),
     secret_urls: Sequence[str] = (),
 ) -> LiveSmokeResult:
@@ -168,6 +171,41 @@ def run_live_smoke(
                         object_type=dataflow_object_type,
                         source_system=dataflow_source_system,
                     ),
+                    secret_values=secret_values,
+                    secret_urls=secret_urls,
+                )
+            )
+        if query_name:
+            operations.append(
+                _run_operation(
+                    name="bw_get_query",
+                    label=f"bw://bw_get_query?queryName={quote(query_name, safe='')}",
+                    func=lambda: client.fetch_query(query_name),
+                    secret_values=secret_values,
+                    secret_urls=secret_urls,
+                )
+            )
+        if datasource is not None:
+            datasource_name, source_system = datasource
+            operations.append(
+                _run_operation(
+                    name="bw_get_datasource",
+                    label=(
+                        "bw://bw_get_datasource?"
+                        f"datasourceName={quote(datasource_name, safe='')}&"
+                        f"sourceSystem={quote(source_system, safe='')}"
+                    ),
+                    func=lambda: client.fetch_datasource(datasource_name, source_system),
+                    secret_values=secret_values,
+                    secret_urls=secret_urls,
+                )
+            )
+        if process_chain:
+            operations.append(
+                _run_operation(
+                    name="bw_get_process_chain",
+                    label=f"bw://bw_get_process_chain?chainName={quote(process_chain, safe='')}",
+                    func=lambda: client.fetch_process_chain(process_chain),
                     secret_values=secret_values,
                     secret_urls=secret_urls,
                 )

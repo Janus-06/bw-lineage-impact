@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from bwli.dataflow import parse_dataflow_xml
 from bwli.graph import BwEdge, BwGraph, BwNode
+from bwli.layers import assign_layer
+from bwli.query_analysis import QueryAnalysisResult, parse_query_xml
 from bwli.repository import RepositoryNodeRecord, normalize_repository_path
 from bwli.snapshot import SnapshotManifest, SnapshotReader
 from bwli.store.secret_guard import assert_no_persisted_secrets
@@ -22,6 +24,10 @@ from bwli.store.secret_guard import assert_no_persisted_secrets
 JsonDict = dict[str, object]
 ObjectInput = dict[str, object]
 EdgeInput = dict[str, object]
+UNKNOWN_REASON_METADATA_MISSING = "METADATA_MISSING"
+UNKNOWN_REASON_TYPE_UNMAPPED = "TYPE_UNMAPPED"
+UNKNOWN_REASON_PARSER_UNSUPPORTED = "PARSER_UNSUPPORTED"
+UNKNOWN_REASON_FRESHNESS_UNAVAILABLE = "FRESHNESS_UNAVAILABLE"
 
 
 class CatalogSnapshotRecord(BaseModel):
@@ -424,6 +430,12 @@ class CatalogStore:
             ],
         )
 
+    def get_object_fields(self, snapshot_id: str, object_id: str) -> list[dict[str, object]]:
+        detail = self.get_object(snapshot_id, object_id)
+        if detail is None:
+            raise KeyError(f"object not found: {object_id}")
+        return _object_field_records(detail.metadata)
+
     def list_glossary_terms(
         self,
         snapshot_id: str,
@@ -765,8 +777,10 @@ def _ingest_payload(
     kind: str | None = None,
 ) -> IngestedCatalog:
     kind_value = _payload_kind(payload, explicit_kind=kind)
-    if isinstance(payload, dict) and isinstance(payload.get("nodes"), list) and isinstance(
-        payload.get("edges"), list
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("nodes"), list)
+        and isinstance(payload.get("edges"), list)
     ):
         return _ingest_graph_payload(payload, payload_id=payload_id)
     if kind_value in {"bw_list_requests", "list_requests", "request_list"}:
@@ -800,6 +814,10 @@ def _ingest_payload(
     if kind_value in {"bw_get_datasource", "datasource", "rsds"}:
         if isinstance(payload, str):
             return _ingest_datasource_xml(payload, payload_id=payload_id)
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    if kind_value in {"bw_get_adso", "adso", "adsoo"}:
+        if isinstance(payload, str):
+            return _ingest_adso_xml(payload, payload_id=payload_id)
         return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
     if kind_value in {"bw_get_source_system", "source_system", "sourcesystem", "lsys"}:
         if isinstance(payload, str):
@@ -954,19 +972,25 @@ def _ingest_process_chain_payload(
     )
     node_ids: list[str] = []
     for index, node in enumerate(nodes):
-        variant_id = _first_text(
-            node,
-            "sProcessVariant",
-            "processVariant",
-            "variantName",
-            "name",
-        ) or f"{chain_id}:step:{index}"
-        process_type = _first_text(
-            node,
-            "sProcessType",
-            "processType",
-            "type",
-        ) or "PROCESS"
+        variant_id = (
+            _first_text(
+                node,
+                "sProcessVariant",
+                "processVariant",
+                "variantName",
+                "name",
+            )
+            or f"{chain_id}:step:{index}"
+        )
+        process_type = (
+            _first_text(
+                node,
+                "sProcessType",
+                "processType",
+                "type",
+            )
+            or "PROCESS"
+        )
         evidence_id = f"{payload_id}:process-chain-node:{index}"
         node_ids.append(variant_id)
         mutable.add_object(
@@ -1041,9 +1065,8 @@ def _ingest_process_variant_payload(
     payload_id: str,
     source: str,
 ) -> IngestedCatalog:
-    variant_name = (
-        _source_query_value(source, "variantName")
-        or _first_text(payload, "sProcessVariant", "variantName", "name")
+    variant_name = _source_query_value(source, "variantName") or _first_text(
+        payload, "sProcessVariant", "variantName", "name"
     )
     if variant_name is None:
         return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
@@ -1106,12 +1129,16 @@ def _ingest_dtp_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
         "source",
         "sourceObject",
     ) or _first_text(source_fields, "technicalName", "name", "objectName")
-    source_type = _first_text(
-        fields,
-        "sourceObjectType",
-        "sourceType",
-        "sourceTlogo",
-    ) or _first_text(source_fields, "objectType", "type", "tlogo") or "UNKNOWN"
+    source_type = (
+        _first_text(
+            fields,
+            "sourceObjectType",
+            "sourceType",
+            "sourceTlogo",
+        )
+        or _first_text(source_fields, "objectType", "type", "tlogo")
+        or "UNKNOWN"
+    )
     source_system = _first_text(fields, "sourceSystemName", "sourceSystem") or _first_text(
         source_fields, "sourceSystemName", "sourceSystem"
     )
@@ -1140,12 +1167,16 @@ def _ingest_dtp_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
         "target",
         "targetObject",
     ) or _first_text(target_fields, "technicalName", "name", "objectName")
-    target_type = _first_text(
-        fields,
-        "targetObjectType",
-        "targetType",
-        "targetTlogo",
-    ) or _first_text(target_fields, "objectType", "type", "tlogo") or "UNKNOWN"
+    target_type = (
+        _first_text(
+            fields,
+            "targetObjectType",
+            "targetType",
+            "targetTlogo",
+        )
+        or _first_text(target_fields, "objectType", "type", "tlogo")
+        or "UNKNOWN"
+    )
     if target_id is not None:
         mutable.add_object(
             CatalogObjectRecord(
@@ -1220,6 +1251,37 @@ def _ingest_datasource_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
     )
 
 
+def _ingest_adso_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
+    root = _xml_root(xml)
+    if root is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    fields = _xml_fields(root)
+    adso_id = _first_text(fields, "name", "technicalName", "adsoName", "objectName")
+    if adso_id is None:
+        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+    field_metadata = _xml_field_records(root)
+    evidence_id = f"{payload_id}:adso"
+    metadata: JsonDict = {
+        "object_status": _first_text(fields, "objectStatus", "status"),
+        "description": _first_text(fields, "description", "label"),
+    }
+    if field_metadata:
+        metadata["fields"] = field_metadata
+    return IngestedCatalog(
+        objects=[
+            CatalogObjectRecord(
+                id=adso_id,
+                name=_first_text(fields, "description", "label"),
+                type="ADSO",
+                metadata=metadata,
+                evidence_ids=[evidence_id],
+            )
+        ],
+        edges=[],
+        evidence_ids=[evidence_id],
+    )
+
+
 def _ingest_source_system_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
     root = _xml_root(xml)
     if root is None:
@@ -1245,45 +1307,137 @@ def _ingest_source_system_xml(xml: str, *, payload_id: str) -> IngestedCatalog:
 
 
 def _ingest_query_xml(xml: str, *, payload_id: str, source: str) -> IngestedCatalog:
-    root = _xml_root(xml)
-    if root is None:
-        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
-    fields = _xml_fields(root)
-    query_id = (
-        _first_text(fields, "technicalName", "name", "queryName")
-        or _source_query_value(source, "queryName")
-    )
-    if query_id is None:
-        return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
-    evidence_id = f"{payload_id}:query"
-    mutable = _MutableCatalog()
-    mutable.add_object(
-        CatalogObjectRecord(
-            id=query_id,
-            name=_first_text(fields, "description", "label", "text"),
-            type="QUERY",
+    try:
+        analysis = parse_query_xml(xml, source=source)
+    except ValueError:
+        query_id = _source_query_value(source, "queryName")
+        if query_id is None:
+            return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
+        evidence_id = f"{payload_id}:query"
+        return IngestedCatalog(
+            objects=[
+                CatalogObjectRecord(
+                    id=query_id,
+                    type="QUERY",
+                    metadata={
+                        "query_analysis": {"unknown_reason": UNKNOWN_REASON_PARSER_UNSUPPORTED}
+                    },
+                    evidence_ids=[evidence_id],
+                )
+            ],
+            edges=[],
             evidence_ids=[evidence_id],
         )
-    )
-    for index, (provider_id, provider_type) in enumerate(
-        _related_providers_from_links(root, current_object_id=query_id)
-    ):
+
+    evidence_id = f"{payload_id}:query"
+    mutable = _MutableCatalog()
+    mutable.add_object(_query_analysis_object(analysis, evidence_id=evidence_id))
+
+    for index, provider in enumerate(analysis.providers):
         provider_evidence_id = f"{payload_id}:query-provider:{index}"
         mutable.add_object(
             CatalogObjectRecord(
-                id=provider_id,
-                type=provider_type,
+                id=provider.object_id,
+                type=provider.object_type,
+                metadata={"role": provider.role, "href": provider.href},
                 evidence_ids=[provider_evidence_id],
             )
         )
         mutable.add_edge(
             CatalogEdgeRecord(
                 id=provider_evidence_id,
-                source=provider_id,
-                target=query_id,
+                source=provider.object_id,
+                target=analysis.query_id,
                 type="provides",
                 confidence="direct",
+                metadata={"source": "query_analysis", "provider_type": provider.object_type},
                 evidence_ids=[provider_evidence_id],
+            )
+        )
+
+    for variable in analysis.variables:
+        component_evidence_id = f"{payload_id}:query-variable:{variable.technical_name}"
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=variable.technical_name,
+                name=variable.description,
+                type="QUERY_VARIABLE",
+                metadata={
+                    "query_id": analysis.query_id,
+                    "technical_name": variable.technical_name,
+                    "info_object": variable.info_object,
+                    "processing_type": variable.processing_type,
+                    "mandatory": variable.mandatory,
+                },
+                evidence_ids=[component_evidence_id],
+            )
+        )
+        mutable.add_edge(
+            CatalogEdgeRecord(
+                id=component_evidence_id,
+                source=variable.technical_name,
+                target=analysis.query_id,
+                type="query_variable",
+                confidence="direct",
+                evidence_ids=[component_evidence_id],
+            )
+        )
+
+    for kind, figures in (
+        ("CKF", analysis.calculated_key_figures),
+        ("RKF", analysis.restricted_key_figures),
+    ):
+        for figure in figures:
+            component_evidence_id = f"{payload_id}:query-{kind.lower()}:{figure.technical_name}"
+            mutable.add_object(
+                CatalogObjectRecord(
+                    id=figure.technical_name,
+                    name=figure.description,
+                    type=kind,
+                    metadata={
+                        "query_id": analysis.query_id,
+                        "technical_name": figure.technical_name,
+                        "formula": figure.formula,
+                        "selections": figure.selections,
+                    },
+                    evidence_ids=[component_evidence_id],
+                )
+            )
+            mutable.add_edge(
+                CatalogEdgeRecord(
+                    id=component_evidence_id,
+                    source=figure.technical_name,
+                    target=analysis.query_id,
+                    type="query_component",
+                    confidence="direct",
+                    metadata={"component_type": kind},
+                    evidence_ids=[component_evidence_id],
+                )
+            )
+
+    for member in analysis.local_members:
+        technical_name = _text(member.get("technical_name"))
+        if technical_name is None:
+            continue
+        member_evidence_id = f"{payload_id}:query-local-member:{technical_name}"
+        mutable.add_object(
+            CatalogObjectRecord(
+                id=technical_name,
+                name=_text(member.get("description")),
+                type="LOCAL_MEMBER",
+                metadata={"query_id": analysis.query_id, **member},
+                evidence_ids=[member_evidence_id],
+            )
+        )
+        mutable.add_edge(
+            CatalogEdgeRecord(
+                id=member_evidence_id,
+                source=technical_name,
+                target=analysis.query_id,
+                type="query_component",
+                confidence="direct",
+                metadata={"component_type": "LOCAL_MEMBER"},
+                evidence_ids=[member_evidence_id],
             )
         )
     return mutable.to_catalog()
@@ -1299,11 +1453,16 @@ def _ingest_composite_provider_xml(xml: str, *, payload_id: str) -> IngestedCata
         return IngestedCatalog(objects=[], edges=[], evidence_ids=[])
     evidence_id = f"{payload_id}:hcpr"
     mutable = _MutableCatalog()
+    metadata: JsonDict = {"description": _first_text(fields, "description", "label")}
+    field_metadata = _xml_field_records(root)
+    if field_metadata:
+        metadata["fields"] = field_metadata
     mutable.add_object(
         CatalogObjectRecord(
             id=hcpr_id,
             name=_first_text(fields, "description", "label"),
             type="HCPR",
+            metadata=metadata,
             evidence_ids=[evidence_id],
         )
     )
@@ -1887,17 +2046,23 @@ class _MutableCatalog:
             self.add_edge(edge)
 
     def add_object(self, obj: CatalogObjectRecord) -> None:
-        current = self.objects.get(obj.id)
+        incoming = _classified_object_record(obj)
+        current = self.objects.get(incoming.id)
         if current is None:
-            self.objects[obj.id] = obj
+            self.objects[incoming.id] = incoming
             return
-        evidence_ids = sorted({*current.evidence_ids, *obj.evidence_ids})
-        self.objects[obj.id] = CatalogObjectRecord(
+        current = _classified_object_record(current)
+        evidence_ids = sorted({*current.evidence_ids, *incoming.evidence_ids})
+        resolved_type = current.type if current.type != "UNKNOWN" else incoming.type
+        self.objects[incoming.id] = CatalogObjectRecord(
             id=current.id,
-            name=current.name or obj.name,
-            type=current.type if current.type != "UNKNOWN" else obj.type,
-            label=current.label or obj.label,
-            metadata=_merge_metadata(current.metadata, obj.metadata),
+            name=current.name or incoming.name,
+            type=resolved_type,
+            label=current.label or incoming.label,
+            metadata=_classified_metadata(
+                resolved_type,
+                _merge_metadata(current.metadata, incoming.metadata),
+            ),
             evidence_ids=evidence_ids,
         )
 
@@ -1916,10 +2081,38 @@ class _MutableCatalog:
         return IngestedCatalog(objects=objects, edges=edges, evidence_ids=evidence_ids)
 
 
+def _classified_object_record(obj: CatalogObjectRecord) -> CatalogObjectRecord:
+    metadata = _classified_metadata(obj.type, obj.metadata)
+    if metadata == obj.metadata:
+        return obj
+    return obj.model_copy(deep=True, update={"metadata": metadata})
+
+
+def _classified_metadata(
+    object_type: str,
+    metadata: dict[str, object],
+    *,
+    default_unknown_reason: str | None = None,
+) -> dict[str, object]:
+    resolved_type = object_type.strip().upper() if object_type.strip() else "UNKNOWN"
+    classified = dict(metadata)
+    if resolved_type == "UNKNOWN":
+        classified.setdefault(
+            "unknown_reason",
+            default_unknown_reason or UNKNOWN_REASON_METADATA_MISSING,
+        )
+        return classified
+    if assign_layer(BwNode(id="__type_probe__", type=resolved_type)) is None:
+        classified.setdefault("unknown_reason", UNKNOWN_REASON_TYPE_UNMAPPED)
+        return classified
+    classified.pop("unknown_reason", None)
+    return classified
+
+
 def _coerce_object_record(value: ObjectInput | CatalogObjectRecord) -> CatalogObjectRecord:
     if isinstance(value, CatalogObjectRecord):
-        return value
-    return CatalogObjectRecord.model_validate(value)
+        return _classified_object_record(value)
+    return _classified_object_record(CatalogObjectRecord.model_validate(value))
 
 
 def _coerce_edge_record(value: EdgeInput | CatalogEdgeRecord) -> CatalogEdgeRecord:
@@ -2143,6 +2336,37 @@ def _metadata_glossary_terms(
                 metadata={"source_field": source_field},
             )
             terms.setdefault(record.id, record)
+        for field in _object_field_records(obj.metadata):
+            field_name = _text(field.get("name"))
+            if field_name is None:
+                continue
+            field_record = _glossary_record(
+                term=field_name,
+                source="metadata",
+                object_id=obj.id,
+                object_type=obj.type,
+                field_name=field_name,
+                evidence_ids=obj.evidence_ids,
+                metadata={
+                    "source_field": "field",
+                    "role": field.get("role"),
+                    "type": field.get("type"),
+                    "description": field.get("description"),
+                },
+            )
+            terms.setdefault(field_record.id, field_record)
+            field_description = _text(field.get("description"))
+            if field_description is not None:
+                description_record = _glossary_record(
+                    term=field_description,
+                    source="metadata",
+                    object_id=obj.id,
+                    object_type=obj.type,
+                    field_name=field_name,
+                    evidence_ids=obj.evidence_ids,
+                    metadata={"source_field": "field_description"},
+                )
+                terms.setdefault(description_record.id, description_record)
     return sorted(terms.values(), key=lambda item: (item.source, item.term.lower(), item.id))
 
 
@@ -2310,26 +2534,89 @@ def _xml_root(xml: str) -> ET.Element[str] | None:
         return None
 
 
-def _datasource_fields(root: ET.Element[str]) -> list[dict[str, object]]:
+def _query_analysis_object(
+    analysis: QueryAnalysisResult,
+    *,
+    evidence_id: str,
+) -> CatalogObjectRecord:
+    analysis_payload: JsonDict = analysis.model_dump(mode="json")
+    analysis_payload.update(
+        {
+            "variable_count": len(analysis.variables),
+            "calculated_key_figure_count": len(analysis.calculated_key_figures),
+            "restricted_key_figure_count": len(analysis.restricted_key_figures),
+            "filter_count": len(analysis.filters),
+            "provider_count": len(analysis.providers),
+        }
+    )
+    metadata: JsonDict = {
+        "query_analysis": analysis_payload,
+        "query_name": analysis.query_id,
+    }
+    if analysis.description:
+        metadata["description"] = analysis.description
+    if analysis.fields:
+        metadata["fields"] = analysis.fields
+    return CatalogObjectRecord(
+        id=analysis.query_id,
+        name=analysis.description,
+        type="QUERY",
+        metadata=metadata,
+        evidence_ids=[evidence_id],
+    )
+
+
+def _object_field_records(metadata: dict[str, object]) -> list[dict[str, object]]:
+    raw_fields = metadata.get("fields")
+    if isinstance(raw_fields, list):
+        fields = [_field_record(item) for item in raw_fields if isinstance(item, dict)]
+        return [field for field in fields if field]
+    query_analysis = metadata.get("query_analysis")
+    if isinstance(query_analysis, dict):
+        raw_query_fields = query_analysis.get("fields")
+        if isinstance(raw_query_fields, list):
+            fields = [_field_record(item) for item in raw_query_fields if isinstance(item, dict)]
+            return [field for field in fields if field]
+    return []
+
+
+def _field_record(item: dict[str, object]) -> dict[str, object]:
+    name = _first_text(item, "name", "technical_name", "fieldName")
+    if name is None:
+        return {}
+    record: dict[str, object] = {"name": name}
+    for source_key, target_key in (
+        ("description", "description"),
+        ("type", "type"),
+        ("role", "role"),
+        ("length", "length"),
+        ("formula", "formula"),
+        ("source_component", "source_component"),
+    ):
+        value = _first_text(item, source_key)
+        if value is not None:
+            record[target_key] = value
+    if "role" not in record:
+        key_value = _first_text(item, "key")
+        if key_value is not None:
+            record["role"] = "key" if key_value.lower() in {"true", "x", "1", "yes"} else "data"
+    return record
+
+
+def _xml_field_records(root: ET.Element[str]) -> list[dict[str, object]]:
     fields: list[dict[str, object]] = []
     for element in root.iter():
-        if element is root or _local_xml_name(element.tag) != "field":
+        if element is root or _local_xml_name(element.tag).lower() != "field":
             continue
         item = _xml_fields(element)
-        name = _first_text(item, "name", "technicalName", "fieldName")
-        if name is None:
-            continue
-        record: dict[str, object] = {"name": name}
-        for source_key, target_key in (
-            ("description", "description"),
-            ("type", "type"),
-            ("length", "length"),
-        ):
-            value = _first_text(item, source_key)
-            if value is not None:
-                record[target_key] = value
-        fields.append(record)
+        record = _field_record(item)
+        if record:
+            fields.append(record)
     return fields
+
+
+def _datasource_fields(root: ET.Element[str]) -> list[dict[str, object]]:
+    return _xml_field_records(root)
 
 
 def _first_xml_child_fields(root: ET.Element[str], *local_names: str) -> dict[str, object]:

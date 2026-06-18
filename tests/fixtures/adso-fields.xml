@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<adso:advancedDataStoreObject xmlns:adso="http://www.sap.com/bw/modeling/adso" technicalName="ZADSO_SALES" description="Sales ADSO">
+  <adso:fields>
+    <adso:field name="CUSTOMER_ID" description="Customer" type="CHAR" key="true" length="10" />
+    <adso:field name="NET_VALUE" description="Net value" type="CURR" key="false" length="17" />
+  </adso:fields>
+</adso:advancedDataStoreObject>

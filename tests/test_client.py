@@ -50,9 +50,7 @@ def test_bw_client_public_surface_is_get_only_read_api() -> None:
     }
     assert names.isdisjoint(forbidden)
     assert not {
-        name
-        for name in names
-        if any(token in name.lower().split("_") for token in forbidden)
+        name for name in names if any(token in name.lower().split("_") for token in forbidden)
     }
     expected = {
         "fetch_search",
@@ -90,11 +88,7 @@ def test_run_dtp_and_activate_request_absent_from_surface() -> None:
         "delete",
     )
 
-    assert not [
-        name
-        for name in names
-        if any(term in name.lower() for term in forbidden_terms)
-    ]
+    assert not [name for name in names if any(term in name.lower() for term in forbidden_terms)]
 
 
 def test_endpoint_builders_use_expected_read_only_paths() -> None:
@@ -140,10 +134,7 @@ def test_endpoint_builders_use_expected_read_only_paths() -> None:
     assert repository_root.path == "/sap/bw/modeling/repo/infoproviderstructure"
     assert repository_root.params == {}
     assert repository_root.accept == ACCEPT_HEADERS["repository"]
-    assert (
-        repository_child.path
-        == "/sap/bw/modeling/repo/infoproviderstructure/infoarea/zsales"
-    )
+    assert repository_child.path == "/sap/bw/modeling/repo/infoproviderstructure/infoarea/zsales"
     assert repository_child.params == {}
     assert repository_child.accept == ACCEPT_HEADERS["repository"]
 
@@ -176,10 +167,7 @@ def test_build_process_chain_endpoint_path_and_accept() -> None:
 def test_build_process_variant_endpoint_path_and_accept() -> None:
     endpoint = endpoints_module.build_process_variant_endpoint("ABAP", "ZVAR_SALES")
 
-    assert (
-        endpoint.path
-        == "/sap/bw4/v1/modeling/processtypes/abap/variants/zvar_sales/m"
-    )
+    assert endpoint.path == "/sap/bw4/v1/modeling/processtypes/abap/variants/zvar_sales/m"
     assert endpoint.params == {}
     assert endpoint.accept == ACCEPT_HEADERS["process_variant"]
     assert endpoint.accept == "application/json"
@@ -201,8 +189,7 @@ def test_build_datasource_endpoint_path_and_accept() -> None:
     assert endpoint.params == {}
     assert endpoint.accept == ACCEPT_HEADERS["datasource"]
     assert (
-        endpoint.accept
-        == "application/vnd.sap.bw.modeling.rsds-v1_0_0+xml, "
+        endpoint.accept == "application/vnd.sap.bw.modeling.rsds-v1_0_0+xml, "
         "application/vnd.sap.bw.modeling.rsds-v1_1_0+xml"
     )
 
@@ -214,8 +201,7 @@ def test_build_source_system_endpoint_path_and_accept() -> None:
     assert endpoint.params == {}
     assert endpoint.accept == ACCEPT_HEADERS["source_system"]
     assert (
-        endpoint.accept
-        == "application/vnd.sap.bw.modeling.lsys-v1_0_0+xml, "
+        endpoint.accept == "application/vnd.sap.bw.modeling.lsys-v1_0_0+xml, "
         "application/vnd.sap.bw.modeling.lsys-v1_1_0+xml"
     )
 
@@ -940,3 +926,58 @@ def test_bw_client_leaves_no_proxy_alone_when_environment_is_not_trusted(
         assert os.environ["NO_PROXY"] == "localhost,127.0.0.1"
     finally:
         client.close()
+
+
+def test_query_accept_prefers_discovered_media_type_then_static_range() -> None:
+    accept = endpoints_module.negotiate_accept(
+        "query",
+        discovered="application/vnd.sap.bw.modeling.query-v1_12_0+xml",
+    )
+
+    assert accept.startswith("application/vnd.sap.bw.modeling.query-v1_12_0+xml, ")
+    assert "application/vnd.sap.bw.modeling.query-v1_8_0+xml" in accept
+    assert accept.count("application/vnd.sap.bw.modeling.query-v1_12_0+xml") == 1
+
+
+def test_bw_client_fetch_query_negotiates_on_406_415_then_404() -> None:
+    seen_paths: list[str] = []
+    seen_methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        seen_methods.append(request.method)
+        if request.url.path == "/sap/bw/modeling/repo/is/systeminfo":
+            return httpx.Response(
+                200,
+                text="<systeminfo />",
+                headers={"x-csrf-token": "csrf-token"},
+            )
+        if request.url.path.endswith("/a"):
+            return httpx.Response(406, text="media type rejected")
+        return httpx.Response(
+            200,
+            text='<Qry:queryResource technicalName="ZQ_SALES" />',
+            headers={"content-type": ACCEPT_HEADERS["query"]},
+        )
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username="fixture-user",
+        password="[REDACTED]",
+        sap_client="100",
+        language="EN",
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+
+    try:
+        assert client.fetch_query("ZQ_SALES") == '<Qry:queryResource technicalName="ZQ_SALES" />'
+    finally:
+        client.close()
+
+    assert seen_methods == ["GET", "GET", "GET"]
+    assert seen_paths == [
+        "/sap/bw/modeling/repo/is/systeminfo",
+        "/sap/bw/modeling/query/zq_sales/a",
+        "/sap/bw/modeling/query/zq_sales/m",
+    ]

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<hcpr:compositeProvider xmlns:hcpr="http://www.sap.com/bw/modeling/hcpr" technicalName="ZC_SALES" description="Sales Composite Provider">
+  <hcpr:inputProvider name="ZADSO_SALES" objectType="ADSO" />
+  <hcpr:field name="CUSTOMER_ID" description="Customer" type="CHAR" role="characteristic" />
+  <hcpr:field name="NET_VALUE" description="Net value" type="DEC" role="key_figure" />
+</hcpr:compositeProvider>

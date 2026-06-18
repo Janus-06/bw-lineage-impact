@@ -81,3 +81,17 @@ def test_assign_layers_populates_node_layers_without_mutating_original_graph() -
 
     assert graph.nodes[0].tags == ["source"]
     assert graph.nodes[0].metadata == {"owner": "original", "nested": {"status": "stable"}}
+
+
+@pytest.mark.parametrize(
+    ("object_type", "expected"),
+    [
+        ("DTPA", BwLayer.TRANSFORMATION),
+        ("ALVL", BwLayer.REPORTING),
+        ("AGGR_LEVEL", BwLayer.REPORTING),
+        ("INFOSOURCE", BwLayer.ACQUISITION),
+        ("TRCS", BwLayer.TRANSFORMATION),
+    ],
+)
+def test_assign_layer_additional_bw_modeling_types(object_type: str, expected: BwLayer) -> None:
+    assert assign_layer(BwNode(id=object_type, type=object_type)) == expected

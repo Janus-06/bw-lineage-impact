@@ -757,9 +757,7 @@ def test_freshness_endpoint_read_only(
     assert response.status_code == 200, response.text
     assert response.json() == freshness
 
-    bic_response = client.get(
-        f"/api/v1/snapshots/{snapshot.id}/objects/%2FBIC%2FZADSO/freshness"
-    )
+    bic_response = client.get(f"/api/v1/snapshots/{snapshot.id}/objects/%2FBIC%2FZADSO/freshness")
     assert bic_response.status_code == 200, bic_response.text
     assert bic_response.json() == bic_freshness
 
@@ -773,15 +771,11 @@ def test_freshness_endpoint_read_only(
     assert missing_freshness.status_code == 404
     assert "request_freshness" in missing_freshness.text
 
-    missing_object = client.get(
-        f"/api/v1/snapshots/{snapshot.id}/objects/ZMISSING/freshness"
-    )
+    missing_object = client.get(f"/api/v1/snapshots/{snapshot.id}/objects/ZMISSING/freshness")
     assert missing_object.status_code == 404
     assert "object not found" in missing_object.text
 
-    missing_snapshot = client.get(
-        "/api/v1/snapshots/snap-missing/objects/ZADSO_SALES/freshness"
-    )
+    missing_snapshot = client.get("/api/v1/snapshots/snap-missing/objects/ZADSO_SALES/freshness")
     assert missing_snapshot.status_code == 404
     assert "snapshot not found" in missing_snapshot.text
 
@@ -1087,7 +1081,6 @@ def test_v1_lineage_advice_returns_deterministic_lineage_when_llm_disabled(
     assert [edge["id"] for edge in payload["lineage"]["edges"]]
 
 
-
 def test_v1_lineage_tour_disabled_by_default_no_network_returns_domain_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1121,9 +1114,11 @@ def test_v1_lineage_tour_disabled_by_default_no_network_returns_domain_summary(
     payload = response.json()
     assert payload["status"] == "disabled"
     assert payload["config_required"] is True
-    assert payload["summary"] == ""
-    assert payload["tour"] == []
-    assert payload["citations"] == []
+    assert payload["summary"]
+    assert payload["tour"]
+    assert payload["citations"]
+    assert all(step["node_ids"] for step in payload["tour"])
+    assert all(step["description"] for step in payload["tour"])
     assert payload["lineage"]["start_id"] == "SRC"
     assert payload["domain_summary"]["node_count"] == len(payload["lineage"]["nodes"])
     assert payload["domain_summary"]["edge_count"] == len(payload["lineage"]["edges"])
@@ -1422,6 +1417,72 @@ def test_v1_live_capture_named_objects_does_not_run_wildcard_search(
     assert "Test connection" in blocked_after_change.text
 
 
+def test_v1_live_capture_queries_fetches_query_xml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    calls: list[tuple[str, str]] = []
+
+    class FakeBwClient:
+        def fetch_search(
+            self, search_term: str, *, object_type: str | None = None
+        ) -> dict[str, object]:
+            calls.append(("search", search_term))
+            return {"objects": []}
+
+        def fetch_dataflow(self, object_name: str, **_: object) -> str:
+            raise AssertionError(f"query capture must not fetch dataflow for {object_name}")
+
+        def fetch_xref(self, object_name: str, **_: object) -> dict[str, object]:
+            raise AssertionError(f"query capture must not fetch xref for {object_name}")
+
+        def fetch_query(self, query_name: str) -> str:
+            calls.append(("query", query_name))
+            return (
+                "<Qry:queryResource xmlns:Qry='http://www.sap.com/bw/modeling/query' "
+                "technicalName='ZQ_SALES_MARGIN' description='Sales Margin Query' />"
+            )
+
+        def close(self) -> None:
+            return None
+
+    fake = FakeBwClient()
+    client = TestClient(create_app(project_root=tmp_path, bw_client_factory=lambda _state: fake))
+    configured = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "bw": {
+                "url": "https://bw.example.invalid",
+                "user": "user",
+                "password": "secret-value",
+                "client": "100",
+                "language": "EN",
+                "verify_ssl": True,
+            }
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    ready = client.post(
+        "/api/v1/connection/test",
+        json={"confirm_read_only": True, "search_term": "Z*"},
+    )
+    assert ready.status_code == 200, ready.text
+    calls.clear()
+
+    response = client.post(
+        "/api/v1/snapshots/capture",
+        json={"confirm_read_only": True, "queries": ["ZQ_SALES_MARGIN"]},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["capture"]["operations"][0]["name"] == "bw_get_query"
+    assert payload["capture_scope"][0]["object_id"] == "ZQ_SALES_MARGIN"
+    assert payload["capture_scope"][0]["operation"] == "bw_get_query"
+    assert calls == [("query", "ZQ_SALES_MARGIN")]
+
+
 def test_v1_failed_fixture_capture_deletes_empty_snapshot_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1452,3 +1513,143 @@ def test_v1_failed_fixture_capture_deletes_empty_snapshot_row(
     listed = client.get("/api/v1/snapshots")
     assert listed.status_code == 200
     assert listed.json()["snapshots"] == []
+
+
+def test_object_fields_endpoint_returns_catalog_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    store = CatalogStore(tmp_path / "bwli-home" / "catalog.sqlite")
+    snapshot = store.create_snapshot(mode="test", source="fixture://fields")
+    store.replace_catalog(
+        snapshot.id,
+        objects=[
+            {
+                "id": "ZADSO_SALES",
+                "type": "ADSO",
+                "metadata": {"fields": [{"name": "NET_VALUE", "type": "CURR", "role": "data"}]},
+                "evidence_ids": ["fields:e1"],
+            }
+        ],
+        edges=[],
+    )
+
+    response = client.get(f"/api/v1/snapshots/{snapshot.id}/objects/ZADSO_SALES/fields")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["snapshot_id"] == snapshot.id
+    assert payload["object_id"] == "ZADSO_SALES"
+    assert payload["fields"] == [{"name": "NET_VALUE", "type": "CURR", "role": "data"}]
+
+
+def test_object_fields_endpoint_empty_when_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.get(f"/api/v1/snapshots/{snapshot_id}/objects/QRY/fields")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["fields"] == []
+
+
+def test_query_analyze_endpoint_snapshot_driven_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    client = TestClient(create_app(project_root=tmp_path))
+    writer = SnapshotWriter(tmp_path / "query-snapshot")
+    metadata = writer.write_payload(
+        payload_id="query-rich",
+        kind="bw_get_query",
+        source="bw://bw_get_query?queryName=ZQ_SALES_MARGIN",
+        payload=Path("tests/fixtures/query-analysis.xml").read_text(encoding="utf-8"),
+    )
+    writer.write_manifest(mode="live-read-only", payloads=[metadata])
+    captured = client.post(
+        "/api/v1/snapshots/capture",
+        json={"manifest_path": str(tmp_path / "query-snapshot" / "manifest.json")},
+    )
+    assert captured.status_code == 200, captured.text
+    snapshot_id = captured.json()["id"]
+
+    response = client.get(
+        f"/api/v1/snapshots/{snapshot_id}/query/analyze",
+        params={"query_name": "ZQ_SALES_MARGIN"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["read_only"] is True
+    assert payload["query_name"] == "ZQ_SALES_MARGIN"
+    assert payload["result"]["variables"][0]["technical_name"] == "ZVAR_CALMONTH"
+    assert payload["result"]["calculated_key_figures"][0]["technical_name"] == "ZCKF_MARGIN"
+    assert payload["result"]["providers"][0]["object_id"] == "ZC_SALES"
+
+
+def test_query_analyze_unknown_query_404(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.get(
+        f"/api/v1/snapshots/{snapshot_id}/query/analyze",
+        params={"query_name": "ZQ_DOES_NOT_EXIST"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_impact_brief_deterministic_fields_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/tour",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "CUSTOMER_ID",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "disabled"
+    assert payload["summary"]
+    assert payload["tour"]
+    assert all(step["description"] for step in payload["tour"])
+    assert payload["impact"]["deterministic"] is True
+    assert payload["citations"]
+
+
+def test_glossary_aggregate_and_lifecycle_are_local_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    aggregate = client.get("/api/v1/glossary/aggregate")
+    assert aggregate.status_code == 200, aggregate.text
+    assert aggregate.json()["total"] >= 1
+    assert (tmp_path / "bwli-home" / "glossary.sqlite").exists()
+
+    glossary = client.get(
+        f"/api/v1/snapshots/{snapshot_id}/glossary", params={"query": "Sales Query"}
+    )
+    assert glossary.status_code == 200, glossary.text
+    term_id = glossary.json()["items"][0]["id"]
+    updated = client.post(f"/api/v1/glossary/{term_id}/lifecycle", json={"lifecycle": "confirmed"})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["lifecycle"] == "confirmed"
+    assert "read_only_bw" in updated.json()["semantics"]
+
+    aggregate_after = client.get("/api/v1/glossary/aggregate", params={"query": "Sales Query"})
+    assert aggregate_after.status_code == 200, aggregate_after.text
+    assert aggregate_after.json()["confirmed"] >= 1

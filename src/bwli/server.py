@@ -77,6 +77,7 @@ from bwli.store import (
     parse_search_results,
 )
 from bwli.store.catalog import EdgeInput, ObjectInput
+from bwli.store.glossary_store import GlossaryLifecycleRecord, GlossaryStore, glossary_path_for
 from bwli.store.secret_guard import SecretPersistenceError, assert_no_persisted_secrets
 from bwli.traversal import BoundedLineageResult, bounded_lineage
 
@@ -402,6 +403,7 @@ class V1SnapshotCaptureRequest(BaseModel):
     manifest_path: str | None = None
     search_terms: list[str] = Field(default_factory=list)
     object_names: list[str] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list)
     include_dataflow: bool = True
     include_xref: bool = True
     include_request_freshness: bool = False
@@ -455,6 +457,32 @@ class V1GlossaryResponse(BaseModel):
     query: str | None = None
     count: int
     items: list[dict[str, object]]
+    counts: dict[str, int] | None = None
+
+
+class V1ObjectFieldsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: str
+    object_id: str
+    count: int
+    fields: list[dict[str, object]]
+
+
+class V1QueryAnalysisResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: str
+    query_name: str
+    read_only: bool = True
+    source: str = "snapshot"
+    result: dict[str, object]
+
+
+class V1GlossaryLifecycleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lifecycle: Literal["candidate", "confirmed", "rejected"]
 
 
 class V1LineageRequest(BaseModel):
@@ -580,6 +608,7 @@ def create_app(
     )
     runtime_config = _initial_runtime_config(runtime_env)
     catalog_store = CatalogStore(catalog_path_for(root))
+    glossary_store = GlossaryStore(glossary_path_for(root))
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_exception_handler(
@@ -787,6 +816,29 @@ def create_app(
             ],
         )
 
+    @app.get("/api/v1/glossary/aggregate")
+    def glossary_aggregate_v1(query: str | None = None) -> dict[str, object]:
+        _sync_glossary_for_all_snapshots(glossary_store, catalog_store)
+        aggregate = glossary_store.aggregate(query=query)
+        return {
+            **aggregate,
+            "query": query,
+            "semantics": ["local_only", "read_only_bw", "idempotent_backfill"],
+        }
+
+    @app.post("/api/v1/glossary/{term_id:path}/lifecycle")
+    def glossary_lifecycle_v1(
+        term_id: str,
+        request: V1GlossaryLifecycleRequest,
+    ) -> dict[str, object]:
+        try:
+            record = glossary_store.set_lifecycle(term_id, request.lifecycle)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        payload = _glossary_lifecycle_payload(record)
+        payload["semantics"] = ["local_only", "read_only_bw", "no_sap_mutation"]
+        return payload
+
     @app.get("/api/v1/snapshots/{snapshot_id}/glossary", response_model=V1GlossaryResponse)
     def glossary_v1(
         snapshot_id: str,
@@ -795,12 +847,14 @@ def create_app(
     ) -> V1GlossaryResponse:
         if catalog_store.get_snapshot(snapshot_id) is None:
             raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
-        terms = catalog_store.list_glossary_terms(snapshot_id, query=query, limit=limit)
+        _sync_glossary_for_snapshot(glossary_store, catalog_store, snapshot_id)
+        terms = glossary_store.list_terms(snapshot_id=snapshot_id, query=query, limit=limit)
         return V1GlossaryResponse(
             snapshot_id=snapshot_id,
             query=query,
             count=len(terms),
-            items=[term.model_dump(mode="json") for term in terms],
+            counts=glossary_store.aggregate(snapshot_id=snapshot_id, query=query),
+            items=[_glossary_lifecycle_payload(term) for term in terms],
         )
 
     @app.get("/api/v1/snapshots/{snapshot_id}/objects", response_model=V1ObjectListResponse)
@@ -847,6 +901,43 @@ def create_app(
                 detail=f"request_freshness not found for object: {object_id}",
             )
         return cast(dict[str, object], freshness)
+
+    @app.get(
+        "/api/v1/snapshots/{snapshot_id}/objects/{object_id:path}/fields",
+        response_model=V1ObjectFieldsResponse,
+    )
+    def get_snapshot_object_fields_v1(
+        snapshot_id: str,
+        object_id: str,
+    ) -> V1ObjectFieldsResponse:
+        if catalog_store.get_snapshot(snapshot_id) is None:
+            raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
+        try:
+            fields = catalog_store.get_object_fields(snapshot_id, object_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return V1ObjectFieldsResponse(
+            snapshot_id=snapshot_id,
+            object_id=object_id,
+            count=len(fields),
+            fields=fields,
+        )
+
+    @app.get(
+        "/api/v1/snapshots/{snapshot_id}/query/analyze", response_model=V1QueryAnalysisResponse
+    )
+    def query_analyze_v1(
+        snapshot_id: str,
+        query_name: str,
+    ) -> V1QueryAnalysisResponse:
+        result = _query_analysis_result(catalog_store, snapshot_id, query_name)
+        return V1QueryAnalysisResponse(
+            snapshot_id=snapshot_id,
+            query_name=query_name,
+            read_only=True,
+            source="snapshot",
+            result=result,
+        )
 
     @app.get("/api/v1/snapshots/{snapshot_id}/objects/{object_id:path}")
     def get_snapshot_object_v1(snapshot_id: str, object_id: str) -> dict[str, object]:
@@ -1241,9 +1332,7 @@ def _apply_runtime_config(state: RuntimeConfigState, request: RuntimeConfigReque
             and _bw_materially_changed(previous_bw, new_bw)
         ):
             state.connection_status = "stale"
-        elif previous_connection_status == "ok" and not _bw_materially_changed(
-            previous_bw, new_bw
-        ):
+        elif previous_connection_status == "ok" and not _bw_materially_changed(previous_bw, new_bw):
             state.connection_status = "ok"
         else:
             state.connection_status = "untested"
@@ -1447,9 +1536,7 @@ def _build_bw_state(
         raise ConfigError(f"missing BW runtime config fields: {', '.join(missing)}")
     assert password is not None
     ca_bundle = (
-        request.ca_bundle.strip()
-        if request.ca_bundle and request.ca_bundle.strip()
-        else None
+        request.ca_bundle.strip() if request.ca_bundle and request.ca_bundle.strip() else None
     )
     return RuntimeBwConfigState(
         source="ui",
@@ -1676,9 +1763,7 @@ def _repository_payload(
         count=len(cached),
         items=[node.model_dump(mode="json") for node in cached],
         action_required=(
-            None
-            if cached
-            else "refresh=true with confirm_read_only=true after Test connection"
+            None if cached else "refresh=true with confirm_read_only=true after Test connection"
         ),
     )
 
@@ -1793,10 +1878,11 @@ def _capture_v1_snapshot(
     out_dir = _resolve_local_output_dir(root, _live_snapshot_output_dir())
     search_terms = _unique_texts(request.search_terms)
     object_names = _unique_texts(request.object_names)
+    queries = _unique_texts(request.queries)
     source_system = _clean_optional_text(request.source_system)
     object_type = request.object_type.strip() or "ADSO"
-    if not search_terms and not object_names:
-        raise ValueError("live capture requires at least one search term or object name")
+    if not search_terms and not object_names and not queries:
+        raise ValueError("live capture requires at least one search term, object name, or query")
     if any(_is_broad_search_term(term) for term in search_terms):
         raise ValueError(
             "broad wildcard search terms are not allowed for live capture; "
@@ -1807,6 +1893,11 @@ def _capture_v1_snapshot(
             "broad wildcard object names are not allowed for live capture; "
             "use explicit BW object names"
         )
+    if any(_is_broad_search_term(query) for query in queries):
+        raise ValueError(
+            "broad wildcard query names are not allowed for live capture; "
+            "use explicit BW query names"
+        )
     if len(search_terms) > MAX_LIVE_CAPTURE_SEARCH_TERMS:
         raise ValueError(
             f"live capture is limited to {MAX_LIVE_CAPTURE_SEARCH_TERMS} search terms per call"
@@ -1815,11 +1906,16 @@ def _capture_v1_snapshot(
         raise ValueError(
             f"live capture is limited to {MAX_LIVE_CAPTURE_OBJECTS} object names per call"
         )
+    if len(queries) > MAX_LIVE_CAPTURE_OBJECTS:
+        raise ValueError(
+            f"live capture is limited to {MAX_LIVE_CAPTURE_OBJECTS} query names per call"
+        )
     result = collect_live_snapshot(
         out_dir=out_dir,
         client_factory=lambda: _build_runtime_bw_client(state, bw_client_factory),
         search_terms=search_terms,
         object_names=object_names,
+        queries=queries,
         include_dataflow=request.include_dataflow,
         include_xref=request.include_xref,
         include_request_freshness=request.include_request_freshness,
@@ -1863,6 +1959,7 @@ def _capture_v1_snapshot(
             request_freshness_top=request.request_freshness_top,
             operations=result.operations,
         ),
+        *_selected_query_scope_entries(queries, operations=result.operations),
         *_discovered_scope_entries(ingested.objects),
     ]
     capture_scope = _replace_scope_or_delete_snapshot(store, snapshot.id, scope_entries)
@@ -1886,7 +1983,11 @@ def _build_refresh_capture_request(
             "snapshot has no selected capture scope to refresh; "
             "run a live fetch with explicit object names first"
         )
-    object_names = _unique_texts([entry.object_id for entry in selected])
+    query_names = _unique_texts(
+        [entry.object_id for entry in selected if entry.operation == "bw_get_query"]
+    )
+    object_entries = [entry for entry in selected if entry.operation != "bw_get_query"]
+    object_names = _unique_texts([entry.object_id for entry in object_entries])
     include_dataflow = any(entry.operation == "bw_get_dataflow" for entry in selected)
     include_xref = any(entry.operation == "bw_xref" for entry in selected)
     include_request_freshness = any(
@@ -1895,15 +1996,16 @@ def _build_refresh_capture_request(
     return V1SnapshotCaptureRequest(
         confirm_read_only=confirm_read_only,
         object_names=object_names,
+        queries=query_names,
         include_dataflow=include_dataflow,
         include_xref=include_xref,
         include_request_freshness=include_request_freshness,
         request_freshness_top=_selected_request_freshness_top(selected),
         xref_direction=_selected_xref_direction(selected),
-        object_type=_selected_object_type(selected),
-        source_system=_selected_metadata_text(selected, "source_system"),
-        dataflow_direction=_selected_dataflow_direction(selected),
-        dataflow_levels=_selected_dataflow_levels(selected),
+        object_type=_selected_object_type(object_entries),
+        source_system=_selected_metadata_text(object_entries, "source_system"),
+        dataflow_direction=_selected_dataflow_direction(object_entries),
+        dataflow_levels=_selected_dataflow_levels(object_entries),
     )
 
 
@@ -1998,6 +2100,24 @@ def _selected_scope_entries(
     return entries
 
 
+def _selected_query_scope_entries(
+    query_names: Sequence[str],
+    *,
+    operations: Sequence[object],
+) -> list[CaptureScopeRecord]:
+    return [
+        _scope_entry_from_operations(
+            query_name,
+            object_type="QUERY",
+            operation="bw_get_query",
+            operations=operations,
+            capture_metadata={},
+            label_param="queryName",
+        )
+        for query_name in _unique_texts(query_names)
+    ]
+
+
 def _scope_entry_from_operations(
     object_name: str,
     *,
@@ -2005,13 +2125,15 @@ def _scope_entry_from_operations(
     operation: str,
     operations: Sequence[object],
     capture_metadata: dict[str, object],
+    label_param: str = "objectName",
 ) -> CaptureScopeRecord:
     entries_metadata = dict(capture_metadata)
+    label_tokens = {f"{label_param}={object_name}", f"{label_param}={quote(object_name, safe='')}"}
     matching = [
         op
         for op in operations
         if getattr(op, "name", "") == operation
-        and f"objectName={object_name}" in getattr(op, "label", "")
+        and any(token in getattr(op, "label", "") for token in label_tokens)
     ]
     if not matching:
         return CaptureScopeRecord(
@@ -2339,18 +2461,19 @@ def _lineage_tour_payload(
 ) -> dict[str, object]:
     domain_summary = summarize_lineage_domain(lineage_payload)
     if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        fallback = _deterministic_lineage_walkthrough(lineage_payload)
         return {
             "schema_version": "1.0",
             "status": "disabled",
             "advisory": True,
             "config_required": True,
             "message": (
-                "로컬 OpenAI-compatible LLM endpoint를 설정하면 Lineage guided tour를 "
-                "생성할 수 있습니다."
+                "LLM이 비활성화되어도 스냅샷 증거 기반 Evidence Walkthrough를 "
+                "로컬에서 생성했습니다."
             ),
-            "summary": "",
-            "tour": [],
-            "citations": [],
+            "summary": fallback["summary"],
+            "tour": fallback["tour"],
+            "citations": fallback["citations"],
             "domain_summary": domain_summary,
             "lineage": lineage_payload,
         }
@@ -2565,18 +2688,18 @@ def _impact_tour_payload(
 ) -> dict[str, object]:
     domain_summary = summarize_impact_domain(impact_payload)
     if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        fallback = _deterministic_impact_brief(impact_payload)
         return {
             "schema_version": "1.0",
             "status": "disabled",
             "advisory": True,
             "config_required": True,
             "message": (
-                "로컬 OpenAI-compatible LLM endpoint를 설정하면 Impact guided tour를 "
-                "생성할 수 있습니다."
+                "LLM이 비활성화되어도 스냅샷 증거 기반 Impact Brief를 로컬에서 생성했습니다."
             ),
-            "summary": "",
-            "tour": [],
-            "citations": [],
+            "summary": fallback["summary"],
+            "tour": fallback["tour"],
+            "citations": fallback["citations"],
             "domain_summary": domain_summary,
             "impact": impact_payload,
         }
@@ -2698,6 +2821,225 @@ def _sql_referenced_fields(result: SqlParseResult) -> list[dict[str, object]]:
             }
         )
     return fields
+
+
+def _sync_glossary_for_snapshot(
+    glossary_store: GlossaryStore,
+    catalog_store: CatalogStore,
+    snapshot_id: str,
+) -> dict[str, int]:
+    return glossary_store.backfill_from_catalog(catalog_store, snapshot_id)
+
+
+def _sync_glossary_for_all_snapshots(
+    glossary_store: GlossaryStore,
+    catalog_store: CatalogStore,
+) -> None:
+    for snapshot in catalog_store.list_snapshots():
+        with suppress(KeyError):
+            glossary_store.backfill_from_catalog(catalog_store, snapshot.id)
+
+
+def _glossary_lifecycle_payload(record: GlossaryLifecycleRecord) -> dict[str, object]:
+    payload = record.model_dump(mode="json")
+    payload["candidate"] = record.lifecycle == "candidate"
+    payload["local_only"] = True
+    return payload
+
+
+def _query_analysis_result(
+    store: CatalogStore,
+    snapshot_id: str,
+    query_name: str,
+) -> dict[str, object]:
+    if store.get_snapshot(snapshot_id) is None:
+        raise HTTPException(status_code=404, detail=f"snapshot not found: {snapshot_id}")
+    query_key = query_name.strip()
+    if not query_key:
+        raise HTTPException(status_code=400, detail="query_name is required")
+    item = store.get_object(snapshot_id, query_key)
+    if item is None:
+        matches, _next = store.list_objects(
+            snapshot_id,
+            q=query_key,
+            object_type="QUERY",
+            limit=10,
+            cursor=0,
+        )
+        exact = [
+            match
+            for match in matches
+            if match.id.upper() == query_key.upper()
+            or (match.name is not None and match.name.upper() == query_key.upper())
+        ]
+        if exact:
+            item = store.get_object(snapshot_id, exact[0].id)
+    if item is None or item.type.upper() != "QUERY":
+        raise HTTPException(status_code=404, detail=f"query not found: {query_name}")
+    analysis = item.metadata.get("query_analysis")
+    if isinstance(analysis, dict):
+        return cast(dict[str, object], analysis)
+    return {
+        "query_id": item.id,
+        "description": item.name,
+        "variables": [],
+        "calculated_key_figures": [],
+        "restricted_key_figures": [],
+        "filters": [],
+        "layout": {},
+        "providers": [],
+        "local_members": [],
+        "fields": store.get_object_fields(snapshot_id, item.id),
+        "metadata": {"unknown_reason": "PARSER_UNSUPPORTED"},
+    }
+
+
+def _deterministic_lineage_walkthrough(lineage_payload: dict[str, object]) -> dict[str, object]:
+    nodes = _dict_list(lineage_payload.get("nodes"))
+    edges = _dict_list(lineage_payload.get("edges"))
+    start_id = _text_value(lineage_payload.get("start_id")) or (
+        str(nodes[0].get("id")) if nodes else ""
+    )
+    citations = _lineage_citations(nodes, edges)
+    summary = (
+        f"Evidence Walkthrough covers {len(nodes)} object(s) and {len(edges)} read-only "
+        f"relationship(s) from {start_id or 'the selected object'}."
+    )
+    tour: list[dict[str, object]] = []
+    if nodes:
+        for index, node in enumerate(nodes[:6], start=1):
+            node_id = _text_value(node.get("id")) or f"node-{index}"
+            connected_edges = [
+                edge
+                for edge in edges
+                if node_id in {_text_value(edge.get("source")), _text_value(edge.get("target"))}
+            ]
+            edge_ids = [_text_value(edge.get("id")) for edge in connected_edges]
+            evidence_ids = _record_evidence_ids(node)
+            if not evidence_ids:
+                evidence_ids = [
+                    item for edge in connected_edges for item in _record_evidence_ids(edge)
+                ]
+            description = (
+                "Snapshot evidence places this object in the selected lineage path; "
+                "verify in BWMT if the business decision is high risk."
+            )
+            tour.append(
+                {
+                    "id": f"walkthrough-{index}",
+                    "title": f"{node.get('type') or 'BW object'} · {node_id}",
+                    "description": description,
+                    "body": description,
+                    "node_ids": [node_id],
+                    "edge_ids": [edge_id for edge_id in edge_ids if edge_id],
+                    "evidence_ids": sorted(set(evidence_ids)),
+                }
+            )
+    else:
+        description = "The bounded lineage result contained no nodes for this snapshot selection."
+        tour.append(
+            {
+                "id": "walkthrough-empty",
+                "title": "No lineage objects found",
+                "description": description,
+                "body": description,
+                "node_ids": [start_id] if start_id else [],
+                "edge_ids": [],
+                "evidence_ids": [],
+            }
+        )
+    return {"summary": summary, "tour": tour, "citations": citations}
+
+
+def _deterministic_impact_brief(impact_payload: dict[str, object]) -> dict[str, object]:
+    affected = _dict_list(impact_payload.get("affected_objects"))
+    scenario = (
+        impact_payload.get("scenario") if isinstance(impact_payload.get("scenario"), dict) else {}
+    )
+    scenario_id = (
+        _text_value(cast(dict[str, object], scenario).get("object_id"))
+        if isinstance(scenario, dict)
+        else ""
+    )
+    citations = sorted(
+        {item for affected_item in affected for item in _record_evidence_ids(affected_item)}
+    )
+    field = (
+        _text_value(cast(dict[str, object], scenario).get("field"))
+        if isinstance(scenario, dict)
+        else None
+    )
+    summary = (
+        f"Impact Brief found {len(affected)} affected object(s) for "
+        f"{scenario_id or 'the selected object'}"
+        f"{f' field {field}' if field else ''}."
+    )
+    tour: list[dict[str, object]] = []
+    for index, item in enumerate(affected[:6], start=1):
+        object_id = _text_value(item.get("object_id")) or f"affected-{index}"
+        evidence_ids = _record_evidence_ids(item)
+        raw_edge_ids = item.get("evidence_edge_ids")
+        edge_ids = raw_edge_ids if isinstance(raw_edge_ids, list) else []
+        description = str(
+            item.get("reason") or "Deterministic impact analysis identified this object."
+        )
+        tour.append(
+            {
+                "id": f"impact-brief-{index}",
+                "title": f"{item.get('severity') or 'UNKNOWN'} · {object_id}",
+                "description": description,
+                "body": description,
+                "node_ids": [object_id],
+                "edge_ids": [edge_id for edge_id in edge_ids if isinstance(edge_id, str)],
+                "evidence_ids": sorted(set(evidence_ids)),
+            }
+        )
+    if not tour:
+        description = (
+            "The deterministic scenario did not identify affected objects inside the "
+            "selected bounds."
+        )
+        tour.append(
+            {
+                "id": "impact-brief-empty",
+                "title": "No downstream impact found",
+                "description": description,
+                "body": description,
+                "node_ids": [scenario_id] if scenario_id else [],
+                "edge_ids": [],
+                "evidence_ids": [],
+            }
+        )
+    return {"summary": summary, "tour": tour, "citations": citations}
+
+
+def _lineage_citations(nodes: list[dict[str, object]], edges: list[dict[str, object]]) -> list[str]:
+    citations: set[str] = set()
+    for item in [*nodes, *edges]:
+        citations.update(_record_evidence_ids(item))
+    return sorted(citations)
+
+
+def _record_evidence_ids(record: dict[str, object]) -> list[str]:
+    evidence_ids = record.get("evidence_ids")
+    if isinstance(evidence_ids, list):
+        return [item for item in evidence_ids if isinstance(item, str)]
+    metadata = record.get("metadata")
+    if isinstance(metadata, dict):
+        raw = metadata.get("evidence_ids")
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, str)]
+    return []
+
+
+def _dict_list(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _text_value(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _glossary_terms_for_object(

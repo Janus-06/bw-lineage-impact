@@ -2,7 +2,7 @@ export type ConfigSource = 'env' | 'ui' | 'unset';
 export type ConnectionStatus = 'unconfigured' | 'untested' | 'ok' | 'failed' | 'stale';
 export type Direction = 'upstream' | 'downstream' | 'both';
 export type DataflowDirection = 'upwards' | 'downwards' | 'both';
-export type AppTab = 'lineage' | 'impact' | 'sql' | 'glossary';
+export type AppTab = 'lineage' | 'impact' | 'query' | 'sql' | 'glossary';
 export type ChangeType =
   | 'field_removed'
   | 'field_type_changed'
@@ -107,6 +107,8 @@ export interface GlossaryTerm {
   normalized_term: string;
   source: string;
   candidate: boolean;
+  lifecycle?: 'candidate' | 'confirmed' | 'rejected';
+  occurrences?: number;
   object_id: string | null;
   object_type: string | null;
   field_name: string | null;
@@ -227,7 +229,41 @@ export interface GlossaryResponse {
   snapshot_id: string;
   query: string | null;
   count: number;
+  counts?: GlossaryAggregateResponse | null;
   items: GlossaryTerm[];
+}
+
+export interface GlossaryAggregateResponse {
+  total: number;
+  candidate: number;
+  confirmed: number;
+  rejected: number;
+  object_count: number;
+  query?: string | null;
+  semantics?: string[];
+}
+
+export interface ObjectField {
+  name: string;
+  type?: string;
+  role?: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface ObjectFieldsResponse {
+  snapshot_id: string;
+  object_id: string;
+  count: number;
+  fields: ObjectField[];
+}
+
+export interface QueryAnalysisResponse {
+  snapshot_id: string;
+  query_name: string;
+  read_only: boolean;
+  source: 'snapshot' | string;
+  result: Record<string, unknown>;
 }
 
 export interface CatalogObject {
@@ -464,6 +500,17 @@ export async function getGlossary(snapshotId: string, query?: string): Promise<G
   return getJson<GlossaryResponse>(`/api/v1/snapshots/${encodeURIComponent(snapshotId)}/glossary${suffix}`);
 }
 
+export async function getGlossaryAggregate(query?: string): Promise<GlossaryAggregateResponse> {
+  const params = new URLSearchParams();
+  if (query?.trim()) params.set('query', query.trim());
+  const suffix = params.toString() ? `?${params}` : '';
+  return getJson<GlossaryAggregateResponse>(`/api/v1/glossary/aggregate${suffix}`);
+}
+
+export async function postGlossaryLifecycle(termId: string, lifecycle: 'candidate' | 'confirmed' | 'rejected'): Promise<GlossaryTerm> {
+  return postJson<GlossaryTerm>(`/api/v1/glossary/${encodeURIComponent(termId)}/lifecycle`, { lifecycle });
+}
+
 export async function captureFixtureSnapshot(fixturePath: string): Promise<SnapshotSummary> {
   return postJson<SnapshotSummary>('/api/v1/snapshots/capture', { fixture_path: fixturePath });
 }
@@ -472,6 +519,7 @@ export async function captureLiveSnapshot(options: {
   confirmReadOnly: boolean;
   objectNames: string[];
   searchTerms?: string[];
+  queries?: string[];
   objectType?: string;
   sourceSystem?: string;
   dataflowDirection?: DataflowDirection;
@@ -483,6 +531,7 @@ export async function captureLiveSnapshot(options: {
     confirm_read_only: options.confirmReadOnly,
     search_terms: options.searchTerms ?? [],
     object_names: options.objectNames,
+    queries: options.queries ?? [],
     include_dataflow: true,
     include_xref: true,
     include_request_freshness: options.includeRequestFreshness ?? false,
@@ -528,6 +577,25 @@ export async function getObjectFreshness(
 ): Promise<RequestFreshnessResponse> {
   return getJson<RequestFreshnessResponse>(
     `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/objects/${encodeURIComponent(objectId)}/freshness`,
+  );
+}
+
+export async function getObjectFields(
+  snapshotId: string,
+  objectId: string,
+): Promise<ObjectFieldsResponse> {
+  return getJson<ObjectFieldsResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/objects/${encodeURIComponent(objectId)}/fields`,
+  );
+}
+
+export async function getQueryAnalysis(
+  snapshotId: string,
+  queryName: string,
+): Promise<QueryAnalysisResponse> {
+  const params = new URLSearchParams({ query_name: queryName });
+  return getJson<QueryAnalysisResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/query/analyze?${params}`,
   );
 }
 

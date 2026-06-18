@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from bwli.live import LiveCollectionError, collect_live_snapshot
+from bwli.live import LiveCollectionError, collect_live_snapshot, run_live_smoke
 from bwli.snapshot import SnapshotReader
 from bwli.store import ingest_manifest
 
@@ -138,8 +138,7 @@ class MetadataFlakyLiveClient(RecordingLiveClient):
 
     def fetch_source_system(self, source_system: str) -> Any:
         raise RuntimeError(
-            "source system failed "
-            f"token={self._leak_value} url=https://bw.example.invalid/sap/bw"
+            f"source system failed token={self._leak_value} url=https://bw.example.invalid/sap/bw"
         )
 
 
@@ -267,10 +266,7 @@ def test_request_freshness_attached_to_provider_node(tmp_path) -> None:
     ]
 
     reader = SnapshotReader(tmp_path)
-    persisted = {
-        payload.kind: reader.read_payload(payload)
-        for payload in result.manifest.payloads
-    }
+    persisted = {payload.kind: reader.read_payload(payload) for payload in result.manifest.payloads}
     assert persisted["bw_list_requests"][0]["requestTsn"] == "TSN_NEW"
     assert persisted["bw_get_request"]["requestTsn"] == "TSN_NEW"
     assert "objectName=ZADSO_SALES" in result.manifest.payloads[0].source
@@ -366,3 +362,71 @@ def test_collect_live_snapshot_raises_when_all_calls_fail(tmp_path) -> None:
             include_xref=False,
             secret_values=["redaction-target-secret"],
         )
+
+
+def test_run_live_smoke_covers_optional_read_only_metadata() -> None:
+    class SmokeClient:
+        closed = False
+        calls: list[tuple[str, str]]
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def fetch_search(
+            self, search_term: str, *, object_type: str | None = None
+        ) -> dict[str, object]:
+            self.calls.append(("search", search_term))
+            return {"objects": []}
+
+        def fetch_dataflow(self, object_name: str, **_: object) -> str:
+            self.calls.append(("dataflow", object_name))
+            return "<dataflow />"
+
+        def fetch_xref(self, object_name: str, **_: object) -> str:
+            self.calls.append(("xref", object_name))
+            return "<feed />"
+
+        def fetch_query(self, query_name: str) -> str:
+            self.calls.append(("query", query_name))
+            return "<query />"
+
+        def fetch_datasource(self, datasource_name: str, source_system: str) -> str:
+            self.calls.append(("datasource", f"{datasource_name}/{source_system}"))
+            return "<datasource />"
+
+        def fetch_process_chain(self, chain_name: str) -> dict[str, object]:
+            self.calls.append(("process_chain", chain_name))
+            return {"oHeader": {"sProcessChainId": chain_name}}
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = SmokeClient()
+
+    result = run_live_smoke(
+        client_factory=lambda: client,
+        search_term="Z*",
+        object_name="ZADSO_SALES",
+        query_name="ZQ_SALES",
+        datasource=("ZDS_SALES", "S4H"),
+        process_chain="ZCHAIN_SALES",
+    )
+
+    assert client.closed is True
+    assert result.read_only is True
+    assert [op.name for op in result.operations] == [
+        "bw_search",
+        "bw_get_dataflow",
+        "bw_xref",
+        "bw_get_query",
+        "bw_get_datasource",
+        "bw_get_process_chain",
+    ]
+    assert client.calls == [
+        ("search", "Z*"),
+        ("dataflow", "ZADSO_SALES"),
+        ("xref", "ZADSO_SALES"),
+        ("query", "ZQ_SALES"),
+        ("datasource", "ZDS_SALES/S4H"),
+        ("process_chain", "ZCHAIN_SALES"),
+    ]
