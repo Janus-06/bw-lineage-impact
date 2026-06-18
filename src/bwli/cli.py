@@ -9,7 +9,7 @@ from typing import cast
 
 from bwli import __version__
 from bwli.client import BwClient
-from bwli.config import BwConnectionConfig, ConfigError
+from bwli.config import BwConnectionConfig, ConfigError, load_bw_cookie_file
 from bwli.field_lineage import (
     FieldOutputFormat,
     SqlOutputFormat,
@@ -265,15 +265,24 @@ def _collect(args: argparse.Namespace) -> int:
             return 2
 
         def factory() -> BwClient:
+            password = config.password.get_secret_value() if config.password is not None else None
             return BwClient(
                 base_url=config.url,
                 username=config.user,
-                password=config.password.get_secret_value(),
+                password=password,
                 sap_client=config.client,
                 language=config.language,
+                initial_cookies=(
+                    load_bw_cookie_file(config.cookie_file)
+                    if config.cookie_file is not None
+                    else None
+                ),
                 verify=config.httpx_verify_arg(),
                 trust_env=config.trust_env,
             )
+        secret_values = (
+            [config.password.get_secret_value()] if config.password is not None else []
+        )
 
         try:
             result = collect_live_snapshot(
@@ -287,7 +296,7 @@ def _collect(args: argparse.Namespace) -> int:
                 dataflow_source_system=args.source_system,
                 dataflow_direction=args.dataflow_direction,
                 dataflow_levels=args.dataflow_levels,
-                secret_values=[config.password.get_secret_value()],
+                secret_values=secret_values,
                 secret_urls=[config.url],
             )
         except Exception as exc:

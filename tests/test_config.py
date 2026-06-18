@@ -3,11 +3,20 @@ from __future__ import annotations
 import pytest
 
 import bwli.config as config_module
-from bwli.config import AppConfig, BwConnectionConfig, ConfigError, LlmConfig, LlmRuntimeConfig
+from bwli.config import (
+    AppConfig,
+    BwConnectionConfig,
+    ConfigError,
+    DataGateConfig,
+    LlmConfig,
+    LlmRuntimeConfig,
+    load_bw_cookie_file,
+)
 
 
 def test_bw_env_config_loads_reference_mcp_names(monkeypatch: pytest.MonkeyPatch) -> None:
     credential_value = "fakepass"
+    monkeypatch.delenv("BW_COOKIE_FILE", raising=False)
     monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
     monkeypatch.setenv("BW_USER", "fixture-user")
     monkeypatch.setenv("BW_PASSWORD", credential_value)
@@ -18,6 +27,7 @@ def test_bw_env_config_loads_reference_mcp_names(monkeypatch: pytest.MonkeyPatch
 
     assert config.url == "https://bw.example.invalid"
     assert config.user == "fixture-user"
+    assert config.password is not None
     assert config.password.get_secret_value() == credential_value
     assert config.client == "100"
     assert config.language == "KO"
@@ -27,6 +37,7 @@ def test_bw_env_config_accepts_optional_ca_bundle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
+    monkeypatch.delenv("BW_COOKIE_FILE", raising=False)
     ca_bundle = tmp_path / "corp-ca.pem"
     ca_bundle.write_text(
         "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
@@ -44,6 +55,89 @@ def test_bw_env_config_accepts_optional_ca_bundle(
     assert config.ca_bundle == str(ca_bundle)
     assert config.trust_env is True
     assert config.httpx_verify_arg() == str(ca_bundle)
+
+
+def test_cookie_file_requires_safe_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    cookie_file = tmp_path / "bw-cookies.txt"
+    cookie_file.write_text(
+        "SAP_SESSIONID=file-session; __VCAP_ID__=app-instance\n",
+        encoding="utf-8",
+    )
+    cookie_file.chmod(0o644)
+    monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
+    monkeypatch.setenv("BW_CLIENT", "100")
+    monkeypatch.setenv("BW_COOKIE_FILE", str(cookie_file))
+    monkeypatch.delenv("BW_USER", raising=False)
+    monkeypatch.delenv("BW_PASSWORD", raising=False)
+
+    with pytest.raises(ConfigError) as excinfo:
+        BwConnectionConfig.from_env()
+
+    assert "group/other accessible" in str(excinfo.value)
+    assert str(cookie_file) not in str(excinfo.value)
+
+
+def test_bw_env_config_cookie_file_allows_missing_basic_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    cookie_file = tmp_path / "bw-cookies.txt"
+    cookie_file.write_text(
+        ".example.invalid TRUE / TRUE 1893456000 SAP_SESSIONID file-session\n"
+        ".example.invalid TRUE / TRUE 1893456000 __VCAP_ID__ app-instance\n",
+        encoding="utf-8",
+    )
+    cookie_file.chmod(0o600)
+    monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
+    monkeypatch.setenv("BW_CLIENT", "100")
+    monkeypatch.setenv("BW_COOKIE_FILE", str(cookie_file))
+    monkeypatch.delenv("BW_USER", raising=False)
+    monkeypatch.delenv("BW_PASSWORD", raising=False)
+
+    config = BwConnectionConfig.from_env()
+
+    assert config.user is None
+    assert config.password is None
+    assert config.cookie_file == str(cookie_file)
+    assert load_bw_cookie_file(cookie_file) == {
+        "SAP_SESSIONID": "file-session",
+        "__VCAP_ID__": "app-instance",
+    }
+    assert "file-session" not in str(config.model_dump())
+
+
+def test_cookie_file_supports_raw_cookie_header(tmp_path) -> None:
+    cookie_file = tmp_path / "raw-cookies.txt"
+    cookie_file.write_text(
+        "Cookie: SAP_SESSIONID=file-session; __VCAP_ID__=app-instance\n",
+        encoding="utf-8",
+    )
+    cookie_file.chmod(0o600)
+
+    assert load_bw_cookie_file(cookie_file) == {
+        "SAP_SESSIONID": "file-session",
+        "__VCAP_ID__": "app-instance",
+    }
+
+
+def test_data_gate_defaults_and_row_cap() -> None:
+    disabled = DataGateConfig()
+
+    assert disabled.enabled is False
+    assert disabled.allow_llm_rows is False
+    with pytest.raises(ConfigError):
+        disabled.enforce_row_cap(10)
+
+    enabled = DataGateConfig(enabled=True, max_rows=25)
+
+    assert enabled.enforce_row_cap(None) == 25
+    assert enabled.enforce_row_cap(5) == 5
+    assert enabled.enforce_row_cap(500) == 25
+    with pytest.raises(ConfigError):
+        enabled.require_llm_rows_allowed()
 
 
 def test_bw_env_config_requires_runtime_values(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -458,6 +458,7 @@ def test_runtime_config_can_be_cleared() -> None:
 
 
 def test_legacy_runtime_config_clear_ignores_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BW_COOKIE_FILE", raising=False)
     monkeypatch.setenv("BW_URL", "https://bw.example.invalid")
     monkeypatch.setenv("BW_USER", "env-user")
     monkeypatch.setenv("BW_PASSWORD", "env-password")
