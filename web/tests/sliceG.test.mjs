@@ -167,7 +167,7 @@ test('Glossary object selection clears stale tour and freshness state before Lin
   assert.match(source, /function isCurrentAnalysisRequest\(requestId: number, snapshotId: string, objectId: string\): boolean/);
   assert.match(
     source,
-    /\['lineage', 'lineage-advice', 'lineage-tour', 'impact', 'impact-advice', 'impact-tour', 'live-analyze', 'refresh-bw'\]\.includes\(current\)/,
+    /\['lineage', 'lineage-advice', 'lineage-tour', 'impact', 'impact-advice', 'impact-tour', 'impact-agentic', 'live-analyze', 'refresh-bw'\]\.includes\(current\)/,
     'invalidating analysis requests should also clear analysis-owned busy states',
   );
   [
@@ -253,6 +253,42 @@ test('same-object stale detail is keyed off snapshot before detail and freshness
     freshnessMatch[1],
     /\bobjectDetail\b/,
     'selectedFreshness must read detail metadata only through the current snapshot/object guard',
+  );
+});
+
+test('Glossary is hidden behind a frontend feature flag for the current release', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+
+  assert.match(source, /const GLOSSARY_VISIBLE: boolean = false;/);
+  assert.match(
+    source,
+    /\{GLOSSARY_VISIBLE \? <TabButton id="glossary" active=\{activeTab\} onClick=\{setActiveTab\} label="Glossary" \/> : null\}/,
+    'Glossary tab must stay compiled but not render while the feature flag is false',
+  );
+  assert.match(
+    source,
+    /\{GLOSSARY_VISIBLE \? <TermsOverview terms=\{glossaryTerms\} onOpen=\{\(\) => setActiveTab\('glossary'\)\} \/> : null\}/,
+    'Glossary overview entry point must be hidden while the feature flag is false',
+  );
+  assert.match(
+    source,
+    /GLOSSARY_VISIBLE \? getGlossary\(snapshotId\) : Promise\.resolve\(null\)/,
+    'snapshot context refresh must not auto-fetch glossary while hidden',
+  );
+  assert.match(
+    source,
+    /GLOSSARY_VISIBLE && tabToRerun === 'glossary'/,
+    'refresh reruns must skip hidden Glossary tab work',
+  );
+  assert.match(
+    source,
+    /GLOSSARY_VISIBLE && activeTab === 'glossary'/,
+    'Glossary tab body must be guarded by the feature flag',
+  );
+  assert.match(
+    source,
+    /GLOSSARY_VISIBLE \? <GlossaryList terms=\{props\.objectGlossary\}/,
+    'object detail glossary terms must be hidden in the current release',
   );
 });
 
@@ -717,15 +753,15 @@ test('snapshot context and glossary writes are guarded by snapshot and request i
   );
   assert.match(
     refreshContextBody,
-    /if \(isCurrentGlossarySearchRequest\(glossaryRequestId, snapshotId\)\) \{\s*setGlossaryTerms\(glossaryResponse\.items\);/,
-    'snapshot glossary terms must be set only for the current glossary request',
+    /if \(GLOSSARY_VISIBLE && glossaryResponse && isCurrentGlossarySearchRequest\(glossaryRequestId, snapshotId\)\) \{\s*setGlossaryTerms\(glossaryResponse\.items\);/,
+    'snapshot glossary terms must be set only when Glossary is visible and the glossary request is current',
   );
   assert.match(refreshContextBody, /const contextStillCurrent = isCurrentSnapshotContextRequest\(contextRequestId, snapshotId\);/);
   assert.match(refreshContextBody, /const glossaryStillCurrent = isCurrentGlossarySearchRequest\(glossaryRequestId, snapshotId\);/);
   assert.match(
     refreshContextBody,
-    /if \(contextStillCurrent && glossaryStillCurrent\) \{\s*setError\(errorText\(err\)\);/,
-    'snapshot context errors must be guarded against stale snapshot or superseded glossary requests',
+    /if \(contextStillCurrent && \(!GLOSSARY_VISIBLE \|\| glossaryStillCurrent\)\) \{\s*setError\(errorText\(err\)\);/,
+    'snapshot context errors must be guarded against stale snapshot or superseded visible glossary requests',
   );
   assert.doesNotMatch(
     refreshContextBody,
@@ -836,16 +872,27 @@ test('App clears stale impact fields synchronously when selection changes', () =
   );
 });
 
-test('App source exposes Query tab, field auto-select, evidence/business labels, and sticky/wrapping CSS', () => {
+test('App source exposes unified Impact evidence UI, field auto-select, evidence/business labels, and sticky/wrapping CSS', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
   const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 
-  assert.match(app, /<TabButton id="query" active=\{activeTab\} onClick=\{setActiveTab\} label="Query Analysis" \/>/);
+  assert.match(app, /const IMPACT_UNIFIED: boolean = true;/);
+  assert.match(app, /!IMPACT_UNIFIED \? <TabButton id="query" active=\{activeTab\} onClick=\{setActiveTab\} label="Query Analysis" \/> : null/);
+  assert.match(app, /!IMPACT_UNIFIED \? <TabButton id="sql" active=\{activeTab\} onClick=\{setActiveTab\} label="SQL Analysis" \/> : null/);
+  assert.match(app, /postImpactReview\(requestSnapshotId, impactReviewRequestBody\(requestObjectId\)\)/);
+  assert.match(app, /<ImpactEvidenceCards review=\{props\.impactReview\} \/>/);
+  assert.match(app, /Query exposure evidence/);
+  assert.match(app, /SQL \/ Native SQL reference evidence/);
+  assert.match(app, /No BW query execution · No data preview/);
+  assert.match(app, /Parse only · DB execution disabled/);
+  assert.match(app, /impact\.py remains the final authority for severity, confidence, affected objects, and manual verification\./);
   assert.match(app, /getObjectFields\(selectedSnapshotId, selectedObjectId\)/);
   assert.match(app, /fieldSelectionRef/);
   assert.match(app, /nextImpactFieldName/);
   assert.match(app, /<select value=\{props\.fieldName\}/);
+  assert.match(api, /export interface ImpactReviewResponse/);
+  assert.match(api, /postImpactReview/);
   assert.match(api, /queries\?: string\[\];/);
   assert.match(api, /queries: options\.queries \?\? \[\]/);
   assert.match(app, /Evidence Walkthrough/);
@@ -858,5 +905,101 @@ test('App source exposes Query tab, field auto-select, evidence/business labels,
   assert.match(styles, /\.topStatus\.scrolled/);
   assert.match(styles, /\.detailsDrawer \{[\s\S]*?max-height: calc\(100vh - 96px\);[\s\S]*?overflow: auto;/);
   assert.match(styles, /\.objectItem strong[\s\S]*?-webkit-line-clamp: 2;/);
+  assert.match(styles, /\.evidenceCard/);
+  assert.match(styles, /\.authorityCallout/);
+  assert.match(styles, /\.evidenceChips code \{[\s\S]*?overflow-wrap: anywhere;[\s\S]*?white-space: normal;/);
   assert.match(styles, /\.evidencePill, \.tourEvidenceList code \{[\s\S]*?overflow-wrap: anywhere;[\s\S]*?white-space: normal;/);
+});
+
+test('Agentic review API client is typed and posts to the agentic impact review route', () => {
+  const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
+
+  [
+    'export interface AgenticReviewRun',
+    'export interface ReviewObjective',
+    'export interface ReviewHypothesis',
+    'export interface EvidenceGap',
+    'export interface ManualCheck',
+    'export interface AgenticReviewCard',
+    'export interface ReviewTraceStep',
+    'export interface AgenticReviewBudget',
+    'export interface AgenticReviewBudgetUsage',
+    'export interface EvidenceRequestDecision',
+    'export interface LlmAuditMetadata',
+    'export interface AgenticReviewRequest',
+  ].forEach((typeName) => assert.match(api, new RegExp(typeName)));
+
+  assert.match(api, /deterministic_pack: ImpactReviewResponse;/);
+  assert.match(api, /export async function postAgenticReview\(/);
+  assert.match(api, /\/api\/v1\/snapshots\/\$\{encodeURIComponent\(snapshotId\)\}\/impact\/review\/agentic/);
+});
+
+test('AgenticReviewWorkspace is nested below deterministic authority in the Impact tab', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+
+  assert.match(app, /function AgenticReviewWorkspace\(props:/);
+  assert.match(
+    app,
+    /<ImpactEvidenceCards review=\{props\.impactReview\} \/>[\s\S]*?<AuthorityCallout review=\{props\.impactReview\} \/>[\s\S]*?<AgenticReviewWorkspace[\s\S]*?review=\{props\.agenticReview\}/,
+    'agentic workspace must render below ImpactEvidenceCards and AuthorityCallout inside the Impact panel',
+  );
+  assert.doesNotMatch(
+    app,
+    /<TabButton id="agentic"/,
+    'agentic workspace must not introduce a new top-level tab',
+  );
+});
+
+test('Agentic review workspace preserves banners, provenance labels, copy boundaries, and required section headings', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+
+  [
+    'LLM disabled — deterministic findings only',
+    'Autonomous review failed validation — showing deterministic findings',
+    'Deterministic finding',
+    'LLM proposed concern',
+    'Manual verification required',
+    'No BW query execution · No data preview',
+    'Parse only · DB execution disabled',
+    'Review objective',
+    'Autonomous reasoning trace summary',
+    'Prioritized review cards',
+    'Evidence map',
+    'Missing evidence / gaps',
+    'Manual BWMT checklist',
+    'CAB / change summary',
+    'Validator + budget + audit',
+    'suggested_local_action',
+  ].forEach((literal) => assert.match(app, new RegExp(literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))));
+
+  [
+    '.agenticWorkspace',
+    '.agenticBanner',
+    '.agenticGrid',
+    '.agenticCard',
+    '.provenanceBadge',
+    '.citationChip',
+    '.traceList',
+    '.budgetGrid',
+  ].forEach((className) => assert.match(styles, new RegExp(className.replace('.', '\\.'))));
+});
+
+test('Agentic review request guard and busy invalidation follow existing analysis patterns', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const body = appFunctionBody(app, 'async function runAgenticReview', '\n  async function runImpactAdvice');
+  const runImpactBody = appFunctionBody(app, 'async function runImpact', '\n  async function runAgenticReview');
+
+  assert.match(body, /const requestSnapshotId = selectedSnapshotId;/);
+  assert.match(body, /const requestObjectId = selectedObjectId;/);
+  assert.match(body, /const requestId = nextAnalysisRequestId\(\);/);
+  assert.match(body, /setBusy\('impact-agentic'\);/);
+  assert.match(body, /postAgenticReview\(requestSnapshotId, \{\s*\.\.\.impactReviewRequestBody\(requestObjectId\),\s*question: agenticQuestion\.trim\(\) \|\| null,/);
+  assert.match(body, /if \(!isCurrentAnalysisRequest\(requestId, requestSnapshotId, requestObjectId\)\) return;/);
+  assert.match(body, /setAgenticReview\(response\);/);
+  assert.match(body, /setImpactReview\(response\.deterministic_pack\);/);
+  assert.match(body, /finally \{[\s\S]*?setBusy\(''\);[\s\S]*?\}/);
+  assert.match(app, /'impact-agentic'/);
+  assert.match(app, /agenticBusy=\{busy === 'impact-agentic'\}/);
+  assert.match(runImpactBody, /setAgenticReview\(null\);/, 'regular Impact scenarios must clear stale agentic results');
 });

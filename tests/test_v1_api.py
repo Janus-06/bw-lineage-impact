@@ -6,6 +6,15 @@ from pathlib import Path, PureWindowsPath
 import pytest
 from fastapi.testclient import TestClient
 
+from bwli.config import LlmRuntimeConfig
+from bwli.impact_evidence import ImpactEvidencePack
+from bwli.llm.agentic_review import (
+    AgenticReviewBudget,
+    AgenticReviewBudgetUsage,
+    AgenticReviewRun,
+    ReviewTraceStep,
+    deterministic_review_cards,
+)
 from bwli.llm.openai_compatible import LlmAuditMetadata, LlmCompletion
 from bwli.server import _project_relative_path, create_app
 from bwli.snapshot import SnapshotWriter
@@ -870,6 +879,294 @@ def test_v1_scenario_impact_applies_lineage_caps_before_analysis(
     payload = response.json()
     assert payload["lineage_bounds"]["truncated"] is True
     assert [item["object_id"] for item in payload["affected_objects"]] == ["TR"]
+
+
+def test_v1_impact_review_returns_deterministic_evidence_pack_without_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ["BWLI_LLM_BASE_URL", "BWLI_LLM_MODEL", "BWLI_LLM_API_KEY"]:
+        monkeypatch.delenv(name, raising=False)
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/review",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "AMOUNT",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+            "sql_views": [
+                {
+                    "view_id": "ZSQL_VIEW",
+                    "sql_file": str(FIXTURES / "native_sql_view.sql"),
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["deterministic"] is True
+    assert payload["read_only"] is True
+    assert payload["execution_blocked"] is True
+    assert payload["final_authority"] == "impact.py"
+    assert payload["impact"]["findings"][0]["confidence"] == "graph_rule"
+    assert [item["query_id"] for item in payload["query_evidence"]] == ["QRY"]
+    assert payload["query_evidence"][0]["metadata"]["unknown_reason"] == "PARSER_UNSUPPORTED"
+    assert payload["sql_evidence"][0]["view_id"] == "ZSQL_VIEW"
+    assert payload["sql_evidence"][0]["referenced_object_ids"] == [
+        "zsales_fact",
+        "zcustomer_dim",
+    ]
+    assert any(
+        "without executing database SQL" in note
+        for note in payload["sql_evidence"][0]["manual_check_notes"]
+    )
+    assert payload["coverage_summary"] == {
+        "impact_finding_count": 3,
+        "affected_object_count": 3,
+        "query_evidence_count": 1,
+        "sql_evidence_count": 1,
+        "freshness_evidence_count": 0,
+        "manual_gap_count": 2,
+        "query_matched_finding_count": 1,
+        "sql_matched_finding_count": 0,
+    }
+    assert {gap["source"] for gap in payload["manual_verification_gaps"]} == {"query", "sql"}
+    assert "llm_audit" not in payload
+
+
+def test_v1_impact_review_accepts_explicit_query_names_without_sql_views(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/review",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "AMOUNT",
+            "query_names": ["QRY"],
+            "include_impacted_queries": False,
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["deterministic"] is True
+    assert payload["execution_blocked"] is True
+    assert [item["query_id"] for item in payload["query_evidence"]] == ["QRY"]
+    assert payload["sql_evidence"] == []
+    assert payload["coverage_summary"]["query_evidence_count"] == 1
+    assert payload["coverage_summary"]["sql_evidence_count"] == 0
+
+
+def test_v1_impact_review_rejects_sql_evidence_without_parse_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/review",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "AMOUNT",
+            "sql_views": [{"view_id": "ZSQL_VIEW"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "sql_text or sql_file is required" in response.text
+
+
+def test_v1_agentic_review_disabled_returns_deterministic_cards_without_llm_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ["BWLI_LLM_BASE_URL", "BWLI_LLM_MODEL", "BWLI_LLM_API_KEY"]:
+        monkeypatch.delenv(name, raising=False)
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+
+    class ForbiddenAgenticClient:
+        def __init__(self, **_: object) -> None:
+            raise AssertionError("disabled agentic review must not construct an LLM client")
+
+    monkeypatch.setattr(
+        "bwli.llm.agentic_orchestrator.OpenAICompatibleClient",
+        ForbiddenAgenticClient,
+    )
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/review/agentic",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "AMOUNT",
+            "question": "Which deterministic findings need review?",
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "disabled"
+    assert payload["llm_disabled"] is True
+    assert payload["llm_enabled"] is False
+    assert payload["cards"]
+    assert payload["cards"][0]["kind"] == "deterministic_finding"
+    assert payload["deterministic_pack"]["snapshot_id"] == snapshot_id
+    assert payload["deterministic_pack"]["impact"]["findings"]
+    assert "fixture-api-key" not in response.text
+    assert "fixture-secret-value" not in response.text
+
+
+def test_v1_agentic_review_enabled_mock_returns_completed_run_secret_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+    configured = client.put(
+        "/api/v1/runtime-config",
+        json={
+            "llm": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "local-fixture-model",
+                "api_key": "fixture-api-key",
+            }
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    assert "fixture-api-key" not in configured.text
+
+    calls: list[str] = []
+
+    def fake_agentic_run(
+        self: object,
+        pack: ImpactEvidencePack,
+        *,
+        runtime: LlmRuntimeConfig,
+        question: str | None = None,
+        budget: AgenticReviewBudget | None = None,
+    ) -> AgenticReviewRun:
+        del self
+        active_budget = budget or AgenticReviewBudget()
+        assert runtime.api_key.get_secret_value() == "fixture-api-key"
+        calls.append(runtime.model)
+        cards = deterministic_review_cards(pack, max_cards=active_budget.max_cards)
+        citation_ids = cards[0].citation_ids if cards else []
+        citation = citation_ids[0] if citation_ids else ""
+        return AgenticReviewRun(
+            snapshot_id=pack.snapshot_id,
+            llm_enabled=True,
+            llm_disabled=False,
+            status="completed",
+            objective_question=question,
+            cards=cards,
+            cab_summary=f"Mock completed agentic review [{citation}]." if citation else "",
+            deterministic_pack=pack,
+            trace=[
+                ReviewTraceStep(
+                    stage="mock_agentic",
+                    round=0,
+                    summary="Mocked agentic assistant completed without network.",
+                    citation_validation="passed",
+                )
+            ],
+            budget=active_budget,
+            budget_usage=AgenticReviewBudgetUsage(llm_calls=1, cards=len(cards)),
+            audit_trail=[
+                LlmAuditMetadata(
+                    model=runtime.model,
+                    prompt_sha256="a" * 64,
+                    sanitized_input_sha256="b" * 64,
+                    request_citation_ids=citation_ids,
+                    citation_validation="passed",
+                    response_timestamp="2026-06-08T00:00:00+00:00",
+                )
+            ],
+        )
+
+    monkeypatch.setattr("bwli.server.AgenticReviewAssistant.run", fake_agentic_run)
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/review/agentic",
+        json={
+            "object_id": "SRC",
+            "change_type": "field_removed",
+            "field": "AMOUNT",
+            "question": "Mocked local review only",
+            "objectives_hint": ["Prioritize CAB-ready cards"],
+            "max_cards": 2,
+            "max_llm_calls": 4,
+            "depth": 3,
+            "node_cap": 25,
+            "edge_cap": 60,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert calls == ["local-fixture-model"]
+    assert payload["status"] == "completed"
+    assert payload["llm_disabled"] is False
+    assert payload["llm_enabled"] is True
+    assert payload["budget"]["max_cards"] == 2
+    assert payload["budget"]["max_llm_calls"] == 4
+    assert payload["budget_usage"]["llm_calls"] == 1
+    assert payload["audit_trail"]
+    assert "fixture-api-key" not in response.text
+
+
+@pytest.mark.parametrize(
+    "request_update",
+    [
+        {"question": "password=fixture-secret-value"},
+        {"objectives_hint": ["Bearer fixture-secret-value"]},
+    ],
+)
+def test_v1_agentic_review_secret_guard_rejects_prompt_secret_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_update: dict[str, object],
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+    snapshot_id = _capture_sample_graph(client)
+    body = {
+        "object_id": "SRC",
+        "change_type": "field_removed",
+        "field": "AMOUNT",
+        "depth": 3,
+        "node_cap": 25,
+        "edge_cap": 60,
+        **request_update,
+    }
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/impact/review/agentic",
+        json=body,
+    )
+
+    assert response.status_code == 400
+    assert "refusing to persist secret-like text" in response.text
+    assert "fixture-secret-value" not in response.text
 
 
 def test_v1_sql_assistant_explains_view_and_disables_draft_without_local_llm(
