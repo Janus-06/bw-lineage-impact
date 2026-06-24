@@ -400,6 +400,251 @@ export interface ImpactTourResponse extends GuidedTourResponseBase {
   impact: ImpactScenarioResponse;
 }
 
+export interface ImpactReportResponse {
+  schema_version: string;
+  changes: Array<{
+    id: string;
+    object_id: string;
+    object_type: string;
+    change_type: ChangeType;
+    field: string | null;
+    before: Record<string, unknown>;
+    after: Record<string, unknown>;
+    metadata: Record<string, unknown>;
+  }>;
+  findings: Array<{
+    id: string;
+    change_id: string;
+    impacted_object_id: string;
+    impacted_object_type: string;
+    severity: 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';
+    confidence: string;
+    reason: string;
+    evidence_node_ids: string[];
+    evidence_edge_ids: string[];
+    manual_verification: boolean;
+  }>;
+}
+
+export interface QueryExposureEvidence {
+  query_id: string;
+  description: string | null;
+  provider_object_ids: string[];
+  variable_names: string[];
+  calculated_key_figure_names: string[];
+  restricted_key_figure_names: string[];
+  field_names: string[];
+  filter_count: number;
+  layout_fields: string[];
+  exposed_object_ids: string[];
+  matched_finding_ids: string[];
+  manual_check_notes: string[];
+  metadata: Record<string, unknown>;
+}
+
+export interface SqlReferenceEvidence {
+  view_id: string;
+  parser: string;
+  confidence: string;
+  referenced_object_ids: string[];
+  referenced_column_names: string[];
+  reference_edge_ids: string[];
+  fragment_ids: string[];
+  matched_finding_ids: string[];
+  manual_check_notes: string[];
+}
+
+export interface FreshnessEvidence {
+  object_id: string;
+  object_type: string | null;
+  request_count: number;
+  latest_request_tsn: string | null;
+  latest_status: string | null;
+  latest_timestamp: string | null;
+  latest_records: number | null;
+  evidence_available: boolean;
+  manual_check_notes: string[];
+}
+
+export interface ManualVerificationGap {
+  id: string;
+  source: 'impact' | 'query' | 'sql' | 'freshness';
+  reason: string;
+  object_id: string | null;
+  object_type: string | null;
+  finding_id: string | null;
+  evidence_ids: string[];
+}
+
+export interface ImpactReviewResponse {
+  schema_version: string;
+  snapshot_id: string | null;
+  deterministic: boolean;
+  read_only: boolean;
+  execution_blocked: boolean;
+  final_authority: 'impact.py';
+  authority_note: string;
+  impact: ImpactReportResponse;
+  query_evidence: QueryExposureEvidence[];
+  sql_evidence: SqlReferenceEvidence[];
+  freshness_evidence: FreshnessEvidence[];
+  manual_verification_gaps: ManualVerificationGap[];
+  coverage_summary: Record<string, number>;
+}
+
+export type AgenticReviewStatus = 'completed' | 'disabled' | 'fallback' | 'failed';
+export type AgenticCitationValidationStatus = 'not_validated' | 'passed' | 'failed';
+export type AgenticReviewCardKind =
+  | 'deterministic_finding'
+  | 'llm_proposed_concern'
+  | 'manual_verification_required';
+
+export interface LlmAuditMetadata {
+  provider?: 'openai-compatible' | string;
+  endpoint?: string;
+  runtime_endpoint_source?: 'runtime' | string;
+  runtime_model_source?: 'runtime' | string;
+  model?: string;
+  prompt_sha256?: string;
+  sanitized_input_sha256?: string;
+  request_citation_ids?: string[];
+  citation_validation?: AgenticCitationValidationStatus | string;
+  response_timestamp?: string;
+  response_id?: string | null;
+  usage?: Record<string, unknown> | null;
+  [key: string]: unknown;
+}
+
+export interface ReviewObjective {
+  id: string;
+  title: string;
+  rationale: string;
+  citation_ids: string[];
+}
+
+export interface ReviewHypothesis {
+  id: string;
+  statement: string;
+  status: 'proposed' | 'supported' | 'refuted';
+  severity_opinion: 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN' | null;
+  supports_finding_ids: string[];
+  confidence_rationale: string;
+  citation_ids: string[];
+}
+
+export interface EvidenceGap {
+  id: string;
+  description: string;
+  missing_evidence: string;
+  suggested_local_action:
+    | 'reparse_query_xml'
+    | 'reparse_native_sql_view'
+    | 'lookup_request_freshness'
+    | 'recompute_impact_pack'
+    | null;
+  related_object_id: string | null;
+  citation_ids: string[];
+}
+
+export interface ManualCheck {
+  id: string;
+  title: string;
+  tool: 'BWMT' | 'Eclipse' | 'HANA_Studio' | 'manual';
+  steps_summary: string;
+  priority: 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';
+  related_finding_ids: string[];
+  citation_ids: string[];
+}
+
+export interface AgenticReviewCard {
+  id: string;
+  kind: AgenticReviewCardKind;
+  title: string;
+  body: string;
+  severity_label: 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN' | null;
+  review_priority: number;
+  source_finding_id: string | null;
+  citation_ids: string[];
+}
+
+export interface ReviewTraceStep {
+  stage: string;
+  round: number;
+  summary: string;
+  llm_audit: LlmAuditMetadata | null;
+  citation_validation: AgenticCitationValidationStatus;
+}
+
+export interface AgenticReviewBudget {
+  max_planner_rounds: number;
+  max_evidence_requests: number;
+  max_review_rounds: number;
+  max_llm_calls: number;
+  max_cards: number;
+  max_latency_ms: number;
+}
+
+export interface AgenticReviewBudgetUsage {
+  planner_rounds: number;
+  evidence_requests: number;
+  enrichers_executed: number;
+  review_rounds: number;
+  llm_calls: number;
+  cards: number;
+  elapsed_ms: number;
+}
+
+export interface EvidenceRequestDecision {
+  request_id: string;
+  allowed: boolean;
+  reason: string;
+}
+
+export interface AgenticReviewRun {
+  schema_version: string;
+  snapshot_id: string | null;
+  llm_enabled: boolean;
+  status: AgenticReviewStatus;
+  objective_question: string | null;
+  objectives: ReviewObjective[];
+  hypotheses: ReviewHypothesis[];
+  evidence_gaps: EvidenceGap[];
+  manual_checks: ManualCheck[];
+  cards: AgenticReviewCard[];
+  cab_summary: string;
+  deterministic_pack: ImpactReviewResponse;
+  trace: ReviewTraceStep[];
+  budget: AgenticReviewBudget;
+  budget_usage: AgenticReviewBudgetUsage;
+  policy_decisions: EvidenceRequestDecision[];
+  audit_trail: LlmAuditMetadata[];
+  llm_disabled: boolean;
+}
+
+export interface AgenticReviewRequest {
+  object_id: string;
+  change_type: ChangeType;
+  field?: string | null;
+  value_description?: string | null;
+  description?: string | null;
+  depth: number;
+  node_cap: number;
+  edge_cap: number;
+  query_names?: string[];
+  include_impacted_queries?: boolean;
+  include_freshness?: boolean;
+  sql_views?: Array<{ view_id: string; sql_file?: string; sql_text?: string }>;
+  question?: string | null;
+  objectives_hint?: string[];
+  include_korean_summary?: boolean;
+  max_planner_rounds?: number | null;
+  max_evidence_requests?: number | null;
+  max_review_rounds?: number | null;
+  max_llm_calls?: number | null;
+  max_cards?: number | null;
+  max_latency_ms?: number | null;
+}
+
 export interface SqlExplainResponse {
   schema_version: string;
   advisory: boolean;
@@ -699,6 +944,39 @@ export async function postImpactTour(
 ): Promise<ImpactTourResponse> {
   return postJson<ImpactTourResponse>(
     `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/tour`,
+    body,
+  );
+}
+
+export async function postImpactReview(
+  snapshotId: string,
+  body: {
+    object_id: string;
+    change_type: ChangeType;
+    field?: string | null;
+    value_description?: string | null;
+    description?: string | null;
+    depth: number;
+    node_cap: number;
+    edge_cap: number;
+    query_names?: string[];
+    include_impacted_queries?: boolean;
+    include_freshness?: boolean;
+    sql_views?: Array<{ view_id: string; sql_file?: string; sql_text?: string }>;
+  },
+): Promise<ImpactReviewResponse> {
+  return postJson<ImpactReviewResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/review`,
+    body,
+  );
+}
+
+export async function postAgenticReview(
+  snapshotId: string,
+  body: AgenticReviewRequest,
+): Promise<AgenticReviewRun> {
+  return postJson<AgenticReviewRun>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/review/agentic`,
     body,
   );
 }

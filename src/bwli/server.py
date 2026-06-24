@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
@@ -45,12 +45,14 @@ from bwli.impact import (
     ChangeEvent,
     ChangeSet,
     ChangeType,
+    ImpactReport,
     diff_graphs,
     load_changes,
     render_impact_report,
     render_snapshot_diff,
     run_impact_analysis,
 )
+from bwli.impact_evidence import ImpactEvidencePack, build_impact_evidence_pack
 from bwli.lineage import load_graph, render_lineage
 from bwli.live import (
     BwReadClient,
@@ -59,6 +61,7 @@ from bwli.live import (
     collect_live_snapshot,
     run_live_smoke,
 )
+from bwli.query_analysis import QueryAnalysisResult
 from bwli.redact import redact_text
 from bwli.repository import (
     normalize_repository_path,
@@ -520,6 +523,33 @@ class V1ImpactTourRequest(V1ImpactScenarioRequest):
     include_korean_summary: bool = False
 
 
+class V1ImpactReviewSqlEvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    view_id: str
+    sql_file: str | None = None
+    sql_text: str | None = None
+
+
+class V1ImpactReviewRequest(V1ImpactScenarioRequest):
+    query_names: list[str] = Field(default_factory=list)
+    sql_views: list[V1ImpactReviewSqlEvidenceRequest] = Field(default_factory=list)
+    include_impacted_queries: bool = True
+    include_freshness: bool = True
+
+
+class V1AgenticReviewRequest(V1ImpactReviewRequest):
+    question: str | None = None
+    objectives_hint: list[str] = Field(default_factory=list)
+    include_korean_summary: bool = False
+    max_planner_rounds: int | None = Field(default=None, ge=0, le=2)
+    max_evidence_requests: int | None = Field(default=None, ge=0, le=10)
+    max_review_rounds: int | None = Field(default=None, ge=0, le=3)
+    max_llm_calls: int | None = Field(default=None, ge=0, le=8)
+    max_cards: int | None = Field(default=None, ge=0, le=20)
+    max_latency_ms: int | None = Field(default=None, ge=0, le=120_000)
+
+
 class V1SqlExplainRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -589,6 +619,29 @@ class LineageTourFactory(Protocol):
         runtime: LlmRuntimeConfig,
         include_korean_summary: bool = False,
     ) -> dict[str, object]: ...
+
+
+class AgenticReviewAssistant:
+    """Lazy proxy that preserves the server monkeypatch seam for agentic review tests."""
+
+    def __init__(self, *, enricher: object | None = None) -> None:
+        assistant_cls = _agentic_review_assistant_class()
+        self._assistant: Any = assistant_cls(enricher=enricher)
+
+    def run(
+        self,
+        pack: ImpactEvidencePack,
+        *,
+        runtime: LlmRuntimeConfig | None,
+        question: str | None = None,
+        budget: object | None = None,
+    ) -> Any:
+        return self._assistant.run(
+            pack,
+            runtime=runtime,
+            question=question,
+            budget=budget,
+        )
 
 
 def create_app(
@@ -1013,6 +1066,42 @@ def create_app(
     ) -> dict[str, object]:
         try:
             return _run_v1_impact_scenario(catalog_store, snapshot_id, request)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post(
+        "/api/v1/snapshots/{snapshot_id}/impact/review",
+        response_model=ImpactEvidencePack,
+    )
+    def impact_review_v1(
+        snapshot_id: str,
+        request: V1ImpactReviewRequest,
+    ) -> ImpactEvidencePack:
+        try:
+            return _run_v1_impact_review(root, catalog_store, snapshot_id, request)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post(
+        "/api/v1/snapshots/{snapshot_id}/impact/review/agentic",
+    )
+    def impact_review_agentic_v1(
+        snapshot_id: str,
+        request: V1AgenticReviewRequest,
+    ) -> Any:
+        try:
+            assert_no_persisted_secrets(request.model_dump(mode="json"))
+            pack = _run_v1_impact_review(root, catalog_store, snapshot_id, request)
+            run = _agentic_review_payload(
+                root=root,
+                store=catalog_store,
+                snapshot_id=snapshot_id,
+                runtime_config=runtime_config,
+                request=request,
+                pack=pack,
+            )
+            assert_no_persisted_secrets(run.model_dump(mode="json"))
+            return run
         except Exception as exc:
             raise _http_error(exc) from exc
 
@@ -2615,6 +2704,309 @@ def _run_v1_impact_scenario(
             "cycles_detected": bounded.cycles_detected,
         },
     }
+
+
+def _run_v1_impact_review(
+    root: Path,
+    store: CatalogStore,
+    snapshot_id: str,
+    request: V1ImpactReviewRequest,
+) -> ImpactEvidencePack:
+    assert_no_persisted_secrets(
+        {
+            "object_id": request.object_id,
+            "change_type": request.change_type.value,
+            "field": request.field,
+            "value_description": request.value_description,
+            "description": request.description,
+            "depth": request.depth,
+            "node_cap": request.node_cap,
+            "edge_cap": request.edge_cap,
+            "query_names": request.query_names,
+            "sql_view_ids": [item.view_id for item in request.sql_views],
+        }
+    )
+    graph = store.load_graph(snapshot_id)
+    nodes_by_id = graph.node_map()
+    if request.object_id not in nodes_by_id:
+        raise ValueError(f"start node not found: {request.object_id}")
+    bounded = bounded_lineage(
+        graph,
+        snapshot_id=snapshot_id,
+        start_id=request.object_id,
+        direction=Direction.DOWNSTREAM,
+        depth=request.depth,
+        node_cap=request.node_cap,
+        edge_cap=request.edge_cap,
+    )
+    source_node = nodes_by_id[request.object_id]
+    change = ChangeEvent(
+        id=f"scenario:{request.object_id}:{request.change_type.value}",
+        object_id=request.object_id,
+        object_type=source_node.type,
+        change_type=request.change_type,
+        field=request.field,
+        metadata={
+            key: value
+            for key, value in {
+                "value_description": request.value_description,
+                "description": request.description,
+            }.items()
+            if value
+        },
+    )
+    capped_graph = BwGraph.model_validate(
+        {
+            "nodes": [
+                node.model_dump(mode="json", exclude={"evidence_ids"}) for node in bounded.nodes
+            ],
+            "edges": [
+                edge.model_dump(mode="json", exclude={"evidence_ids"}) for edge in bounded.edges
+            ],
+        }
+    )
+    impact_report = run_impact_analysis(
+        capped_graph,
+        ChangeSet(changes=[change]),
+        max_depth=request.depth,
+    )
+    return build_impact_evidence_pack(
+        impact_report,
+        snapshot_id=snapshot_id,
+        query_results=_impact_review_query_results(
+            store,
+            snapshot_id,
+            request=request,
+            report=impact_report,
+            source_object_id=request.object_id,
+            source_object_type=source_node.type,
+        ),
+        sql_results=_impact_review_sql_results(root, request.sql_views),
+        freshness_by_object_id=_impact_review_freshness(
+            nodes_by_id,
+            report=impact_report,
+            source_object_id=request.object_id,
+            include_freshness=request.include_freshness,
+        ),
+    )
+
+
+def _impact_review_query_results(
+    store: CatalogStore,
+    snapshot_id: str,
+    *,
+    request: V1ImpactReviewRequest,
+    report: ImpactReport,
+    source_object_id: str,
+    source_object_type: str,
+) -> list[QueryAnalysisResult]:
+    query_names = list(request.query_names)
+    if request.include_impacted_queries:
+        if source_object_type.upper() == "QUERY":
+            query_names.append(source_object_id)
+        query_names.extend(
+            finding.impacted_object_id
+            for finding in report.findings
+            if finding.impacted_object_type.upper() == "QUERY"
+        )
+    return [
+        QueryAnalysisResult.model_validate(_query_analysis_result(store, snapshot_id, query_name))
+        for query_name in _unique_texts(query_names)
+    ]
+
+
+def _impact_review_sql_results(
+    root: Path,
+    sql_views: Sequence[V1ImpactReviewSqlEvidenceRequest],
+) -> list[SqlParseResult]:
+    return [
+        _parse_v1_sql(
+            root,
+            V1SqlExplainRequest(
+                view_id=item.view_id,
+                sql_file=item.sql_file,
+                sql_text=item.sql_text,
+                format="json",
+            ),
+        )
+        for item in sql_views
+    ]
+
+
+def _impact_review_freshness(
+    nodes_by_id: Mapping[str, object],
+    *,
+    report: ImpactReport,
+    source_object_id: str,
+    include_freshness: bool,
+) -> dict[str, Mapping[str, object]]:
+    if not include_freshness:
+        return {}
+    object_ids = _unique_texts(
+        [source_object_id, *[finding.impacted_object_id for finding in report.findings]]
+    )
+    freshness_by_object_id: dict[str, Mapping[str, object]] = {}
+    for object_id in object_ids:
+        node = nodes_by_id.get(object_id)
+        metadata = getattr(node, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        freshness = metadata.get("request_freshness")
+        if isinstance(freshness, Mapping):
+            freshness_by_object_id[object_id] = cast(Mapping[str, object], freshness)
+    return freshness_by_object_id
+
+
+def _agentic_review_assistant_class() -> Any:
+    module = import_module("bwli.llm.agentic_orchestrator")
+    return module.AgenticReviewAssistant
+
+
+def _agentic_review_budget_class() -> Any:
+    module = import_module("bwli.llm.agentic_review")
+    return module.AgenticReviewBudget
+
+
+def _create_agentic_review_assistant(*, enricher: object | None = None) -> AgenticReviewAssistant:
+    return AgenticReviewAssistant(enricher=enricher)
+
+
+def _agentic_review_payload(
+    *,
+    root: Path,
+    store: CatalogStore,
+    snapshot_id: str,
+    runtime_config: RuntimeConfigState,
+    request: V1AgenticReviewRequest,
+    pack: ImpactEvidencePack,
+) -> Any:
+    budget = _agentic_review_budget(request)
+    if not runtime_config.llm.enabled or not runtime_config.llm.configured:
+        return _create_agentic_review_assistant().run(
+            pack,
+            runtime=None,
+            question=request.question,
+            budget=budget,
+        )
+    if (
+        not runtime_config.llm.base_url
+        or not runtime_config.llm.model
+        or not runtime_config.llm.api_key
+    ):
+        raise ConfigError("LLM runtime config is incomplete")
+    runtime = LlmRuntimeConfig(
+        base_url=runtime_config.llm.base_url,
+        model=runtime_config.llm.model,
+        api_key=SecretStr(runtime_config.llm.api_key),
+    )
+    assistant = _create_agentic_review_assistant(
+        enricher=_agentic_review_enricher(
+            root=root,
+            store=store,
+            snapshot_id=snapshot_id,
+            request=request,
+            pack=pack,
+        )
+    )
+    return assistant.run(
+        pack,
+        runtime=runtime,
+        question=request.question,
+        budget=budget,
+    )
+
+
+def _agentic_review_budget(request: V1AgenticReviewRequest) -> Any:
+    overrides = {
+        key: value
+        for key, value in {
+            "max_planner_rounds": request.max_planner_rounds,
+            "max_evidence_requests": request.max_evidence_requests,
+            "max_review_rounds": request.max_review_rounds,
+            "max_llm_calls": request.max_llm_calls,
+            "max_cards": request.max_cards,
+            "max_latency_ms": request.max_latency_ms,
+        }.items()
+        if value is not None
+    }
+    budget_cls = _agentic_review_budget_class()
+    return budget_cls(**overrides)
+
+
+def _agentic_review_enricher(
+    *,
+    root: Path,
+    store: CatalogStore,
+    snapshot_id: str,
+    request: V1AgenticReviewRequest,
+    pack: ImpactEvidencePack,
+) -> Any:
+    sql_views_by_id = {item.view_id.casefold(): item for item in request.sql_views}
+
+    def query_result(evidence_request: Any) -> QueryAnalysisResult | None:
+        try:
+            return QueryAnalysisResult.model_validate(
+                _query_analysis_result(store, snapshot_id, evidence_request.target)
+            )
+        except Exception:
+            return None
+
+    def sql_result(evidence_request: Any) -> SqlParseResult | None:
+        sql_view = sql_views_by_id.get(evidence_request.target.casefold())
+        if sql_view is None:
+            return None
+        try:
+            return _parse_v1_sql(
+                root,
+                V1SqlExplainRequest(
+                    view_id=sql_view.view_id,
+                    sql_file=sql_view.sql_file,
+                    sql_text=sql_view.sql_text,
+                    format="json",
+                ),
+            )
+        except Exception:
+            return None
+
+    def freshness(
+        evidence_request: Any,
+    ) -> Mapping[str, Mapping[str, object]] | None:
+        try:
+            nodes_by_id = store.load_graph(snapshot_id).node_map()
+        except Exception:
+            return None
+        node = _agentic_node_for_target(nodes_by_id, evidence_request.target)
+        metadata = getattr(node, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return None
+        request_freshness = metadata.get("request_freshness")
+        if not isinstance(request_freshness, Mapping):
+            return None
+        object_id = getattr(node, "id", evidence_request.target)
+        return {str(object_id): cast(Mapping[str, object], request_freshness)}
+
+    module = import_module("bwli.llm.agentic_enricher")
+    enricher_cls = module.AgenticEvidenceEnricher
+    sources_cls = module.AgenticEvidenceSources
+    return enricher_cls(
+        sources_cls(
+            impact_report=lambda: pack.impact,
+            query_result=query_result,
+            sql_result=sql_result,
+            freshness=freshness,
+        )
+    )
+
+
+def _agentic_node_for_target(nodes_by_id: Mapping[str, object], target: str) -> object | None:
+    node = nodes_by_id.get(target)
+    if node is not None:
+        return node
+    target_key = target.casefold()
+    for object_id, candidate in nodes_by_id.items():
+        if object_id.casefold() == target_key:
+            return candidate
+    return None
 
 
 def _impact_advice_payload(

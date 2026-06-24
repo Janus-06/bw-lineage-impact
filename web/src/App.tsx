@@ -17,7 +17,9 @@ import {
   listObjects,
   listSnapshots,
   postConnectionTest,
+  postAgenticReview,
   postImpactAdvice,
+  postImpactReview,
   postImpactScenario,
   postImpactTour,
   postLineage,
@@ -38,7 +40,9 @@ import {
   type Direction,
   type GlossaryAggregateResponse,
   type GlossaryTerm,
+  type AgenticReviewRun,
   type ImpactAdviceResponse,
+  type ImpactReviewResponse,
   type ImpactScenarioResponse,
   type ImpactTourResponse,
   type LineageAdviceResponse,
@@ -74,6 +78,8 @@ import {
 
 const fixtureGraphPath = 'tests/fixtures/sample-graph.json';
 const fixtureSqlPath = 'tests/fixtures/native_sql_view.sql';
+const GLOSSARY_VISIBLE: boolean = false;
+const IMPACT_UNIFIED: boolean = true;
 const bwObjectTypes = [
   'ADSO',
   'HCPR',
@@ -156,7 +162,7 @@ export default function App() {
   const [allowHiddenSelection, setAllowHiddenSelection] = useState(false);
   const [objectDetail, setObjectDetail] = useState<ObjectDetailState | null>(null);
   const [objectFreshness, setObjectFreshness] = useState<ObjectFreshnessState | null>(null);
-  const [activeTab, setActiveTab] = useState<AppTab>('lineage');
+  const [activeTab, setActiveTab] = useState<AppTab>(IMPACT_UNIFIED ? 'impact' : 'lineage');
   const [catalogQuery, setCatalogQuery] = useState('');
   const [objectType, setObjectType] = useState('');
   const [direction, setDirection] = useState<Direction>('downstream');
@@ -173,12 +179,16 @@ export default function App() {
   const [sqlViewId, setSqlViewId] = useState('ZSQL_VIEW');
   const [sqlFile, setSqlFile] = useState(fixtureSqlPath);
   const [sqlText, setSqlText] = useState('');
+  const [includeSqlEvidence, setIncludeSqlEvidence] = useState(false);
   const [sqlQuestion, setSqlQuestion] = useState('이 뷰의 주요 소스와 집계 로직을 설명하는 조회 초안');
   const [lineage, setLineage] = useState<LineageResponse | null>(null);
   const [lineageAdvice, setLineageAdvice] = useState<LineageAdviceResponse | null>(null);
   const [lineageTour, setLineageTour] = useState<LineageTourResponse | null>(null);
   const [lineageTourStepIndex, setLineageTourStepIndex] = useState(0);
   const [impact, setImpact] = useState<ImpactScenarioResponse | null>(null);
+  const [impactReview, setImpactReview] = useState<ImpactReviewResponse | null>(null);
+  const [agenticReview, setAgenticReview] = useState<AgenticReviewRun | null>(null);
+  const [agenticQuestion, setAgenticQuestion] = useState('');
   const [impactAdvice, setImpactAdvice] = useState<ImpactAdviceResponse | null>(null);
   const [impactTour, setImpactTour] = useState<ImpactTourResponse | null>(null);
   const [impactTourStepIndex, setImpactTourStepIndex] = useState(0);
@@ -284,6 +294,7 @@ export default function App() {
     if (snapshotId !== selectedSnapshotId) {
       resetImpactFieldSelection();
       invalidateQueryAnalysisRequests();
+      setAgenticReview(null);
     }
     setSelectedSnapshotIdState(snapshotId);
   }
@@ -292,6 +303,7 @@ export default function App() {
     if (objectId !== selectedObjectId) {
       resetImpactFieldSelection();
       invalidateQueryAnalysisRequests();
+      setAgenticReview(null);
     }
     setSelectedObjectIdState(objectId);
   }
@@ -373,6 +385,8 @@ export default function App() {
       setLineageTour(null);
       setLineageTourStepIndex(0);
       setImpact(null);
+      setImpactReview(null);
+      setAgenticReview(null);
       setImpactAdvice(null);
       setImpactTour(null);
       setImpactTourStepIndex(0);
@@ -435,7 +449,7 @@ export default function App() {
   function invalidateAnalysisRequests() {
     analysisRequestRef.current += 1;
     setBusy((current) => (
-      ['lineage', 'lineage-advice', 'lineage-tour', 'impact', 'impact-advice', 'impact-tour', 'live-analyze', 'refresh-bw'].includes(current)
+      ['lineage', 'lineage-advice', 'lineage-tour', 'impact', 'impact-advice', 'impact-tour', 'impact-agentic', 'live-analyze', 'refresh-bw'].includes(current)
         ? ''
         : current
     ));
@@ -519,6 +533,8 @@ export default function App() {
     setLineageTour(null);
     setLineageTourStepIndex(0);
     setImpact(null);
+    setImpactReview(null);
+    setAgenticReview(null);
     setImpactAdvice(null);
     setImpactTour(null);
     setImpactTourStepIndex(0);
@@ -539,6 +555,8 @@ export default function App() {
     setLineageTour(null);
     setLineageTourStepIndex(0);
     setImpact(null);
+    setImpactReview(null);
+    setAgenticReview(null);
     setImpactAdvice(null);
     setImpactTour(null);
     setImpactTourStepIndex(0);
@@ -696,13 +714,13 @@ export default function App() {
     try {
       const [scopeResponse, glossaryResponse, aggregateResponse] = await Promise.all([
         getCaptureScope(snapshotId),
-        getGlossary(snapshotId),
-        getGlossaryAggregate(),
+        GLOSSARY_VISIBLE ? getGlossary(snapshotId) : Promise.resolve(null),
+        GLOSSARY_VISIBLE ? getGlossaryAggregate() : Promise.resolve(null),
       ]);
       if (isCurrentSnapshotContextRequest(contextRequestId, snapshotId)) {
         setCaptureScope(scopeResponse.items);
       }
-      if (isCurrentGlossarySearchRequest(glossaryRequestId, snapshotId)) {
+      if (GLOSSARY_VISIBLE && glossaryResponse && isCurrentGlossarySearchRequest(glossaryRequestId, snapshotId)) {
         setGlossaryTerms(glossaryResponse.items);
         setGlossaryAggregate(glossaryResponse.counts ?? aggregateResponse);
       }
@@ -712,10 +730,10 @@ export default function App() {
       if (contextStillCurrent) {
         setCaptureScope([]);
       }
-      if (glossaryStillCurrent) {
+      if (GLOSSARY_VISIBLE && glossaryStillCurrent) {
         setGlossaryTerms([]);
       }
-      if (contextStillCurrent && glossaryStillCurrent) {
+      if (contextStillCurrent && (!GLOSSARY_VISIBLE || glossaryStillCurrent)) {
         setError(errorText(err));
       }
     }
@@ -951,6 +969,8 @@ export default function App() {
     setLineageTour(null);
     setLineageTourStepIndex(0);
     setImpact(null);
+    setImpactReview(null);
+    setAgenticReview(null);
     setImpactAdvice(null);
     setImpactTour(null);
     setImpactTourStepIndex(0);
@@ -986,6 +1006,8 @@ export default function App() {
       setLineageTour(null);
       setLineageTourStepIndex(0);
       setImpact(null);
+      setImpactReview(null);
+      setAgenticReview(null);
       setImpactAdvice(null);
       setImpactTour(null);
       setImpactTourStepIndex(0);
@@ -1043,7 +1065,7 @@ export default function App() {
         setImpactAdvice(null);
         setImpactTour(null);
         setImpactTourStepIndex(0);
-      } else if (tabToRerun === 'glossary') {
+      } else if (GLOSSARY_VISIBLE && tabToRerun === 'glossary') {
         const response = await getGlossary(refreshedSnapshotId, glossaryQuery.trim() || undefined);
         if (analysisRequestRef.current !== rerunRequestId) return;
         setGlossaryTerms(response.items);
@@ -1235,19 +1257,71 @@ export default function App() {
     };
   }
 
+  function impactReviewRequestBody(objectId: string) {
+    const sqlViews = includeSqlEvidence && sqlViewId.trim() && (sqlText.trim() || sqlFile.trim())
+      ? [
+          {
+            view_id: sqlViewId.trim(),
+            ...(sqlText.trim() ? { sql_text: sqlText } : { sql_file: sqlFile.trim() }),
+          },
+        ]
+      : [];
+    return {
+      ...impactRequestBody(),
+      object_id: objectId,
+      query_names: parseObjectNamesText(queryName),
+      include_impacted_queries: true,
+      include_freshness: true,
+      sql_views: sqlViews,
+    };
+  }
+
   async function runImpact() {
     if (!selectedSnapshotId || !selectedObjectId) return;
     const requestSnapshotId = selectedSnapshotId;
     const requestObjectId = selectedObjectId;
     const requestId = nextAnalysisRequestId();
     setBusy('impact');
+    setAgenticReview(null);
     try {
-      const response = await postImpactScenario(requestSnapshotId, { ...impactRequestBody(), object_id: requestObjectId });
+      const scenarioBody = { ...impactRequestBody(), object_id: requestObjectId };
+      const [scenarioResponse, reviewResponse] = await Promise.all([
+        postImpactScenario(requestSnapshotId, scenarioBody),
+        postImpactReview(requestSnapshotId, impactReviewRequestBody(requestObjectId)),
+      ]);
       if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
-      setImpact(response);
+      setImpact(scenarioResponse);
+      setImpactReview(reviewResponse);
       setImpactAdvice(null);
       setImpactTour(null);
       setImpactTourStepIndex(0);
+      setError('');
+    } catch (err) {
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setError(errorText(err));
+      }
+    } finally {
+      if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
+        setBusy('');
+      }
+    }
+  }
+
+  async function runAgenticReview() {
+    if (!selectedSnapshotId || !selectedObjectId) return;
+    const requestSnapshotId = selectedSnapshotId;
+    const requestObjectId = selectedObjectId;
+    const requestId = nextAnalysisRequestId();
+    setBusy('impact-agentic');
+    setAgenticReview(null);
+    try {
+      const response = await postAgenticReview(requestSnapshotId, {
+        ...impactReviewRequestBody(requestObjectId),
+        question: agenticQuestion.trim() || null,
+      });
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
+      setAgenticReview(response);
+      setImpactReview(response.deterministic_pack);
       setError('');
     } catch (err) {
       if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
@@ -1900,7 +1974,7 @@ export default function App() {
             </div>
           ) : null}
 
-          <TermsOverview terms={glossaryTerms} onOpen={() => setActiveTab('glossary')} />
+          {GLOSSARY_VISIBLE ? <TermsOverview terms={glossaryTerms} onOpen={() => setActiveTab('glossary')} /> : null}
 
           <input
             className="catalogSearch"
@@ -1944,6 +2018,8 @@ export default function App() {
                     setLineageTour(null);
                     setLineageTourStepIndex(0);
                     setImpact(null);
+                setImpactReview(null);
+                setAgenticReview(null);
                     setImpactAdvice(null);
                     setImpactTour(null);
                     setImpactTourStepIndex(0);
@@ -1975,9 +2051,9 @@ export default function App() {
           <nav className="tabBar">
             <TabButton id="lineage" active={activeTab} onClick={setActiveTab} label="Lineage" />
             <TabButton id="impact" active={activeTab} onClick={setActiveTab} label="Impact" />
-            <TabButton id="query" active={activeTab} onClick={setActiveTab} label="Query Analysis" />
-            <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Analysis" />
-            <TabButton id="glossary" active={activeTab} onClick={setActiveTab} label="Glossary" />
+            {!IMPACT_UNIFIED ? <TabButton id="query" active={activeTab} onClick={setActiveTab} label="Query Analysis" /> : null}
+            {!IMPACT_UNIFIED ? <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Analysis" /> : null}
+            {GLOSSARY_VISIBLE ? <TabButton id="glossary" active={activeTab} onClick={setActiveTab} label="Glossary" /> : null}
           </nav>
 
           {activeTab === 'lineage' ? (
@@ -2011,6 +2087,8 @@ export default function App() {
                 setLineageTour(null);
                 setLineageTourStepIndex(0);
                 setImpact(null);
+                setImpactReview(null);
+                setAgenticReview(null);
                 setImpactAdvice(null);
                 setImpactTour(null);
               }}
@@ -2021,6 +2099,8 @@ export default function App() {
                 setLineageTour(null);
                 setLineageTourStepIndex(0);
                 setImpact(null);
+                setImpactReview(null);
+                setAgenticReview(null);
                 setImpactAdvice(null);
                 setImpactTour(null);
                 void runLineage(id);
@@ -2046,10 +2126,26 @@ export default function App() {
               onRun={() => void runImpact()}
               onAdvice={() => void runImpactAdvice()}
               impact={impact}
+              impactReview={impactReview}
+              agenticReview={agenticReview}
+              agenticQuestion={agenticQuestion}
+              setAgenticQuestion={setAgenticQuestion}
+              onAgenticReview={() => void runAgenticReview()}
               impactAdvice={impactAdvice}
               impactTour={impactTour}
               objectFreshness={selectedFreshness}
+              queryName={queryName}
+              setQueryName={setQueryNameFromInput}
+              includeSqlEvidence={includeSqlEvidence}
+              setIncludeSqlEvidence={setIncludeSqlEvidence}
+              sqlViewId={sqlViewId}
+              setSqlViewId={setSqlViewId}
+              sqlFile={sqlFile}
+              setSqlFile={setSqlFile}
+              sqlText={sqlText}
+              setSqlText={setSqlText}
               busy={busy === 'impact'}
+              agenticBusy={busy === 'impact-agentic'}
               adviceBusy={busy === 'impact-advice'}
               tourBusy={busy === 'impact-tour'}
               onTour={() => void runImpactTour()}
@@ -2058,7 +2154,7 @@ export default function App() {
             />
           ) : null}
 
-          {activeTab === 'query' ? (
+          {!IMPACT_UNIFIED && activeTab === 'query' ? (
             <QueryTab
               selectedSnapshot={selectedSnapshot}
               selectedObject={selectedObject}
@@ -2070,7 +2166,7 @@ export default function App() {
             />
           ) : null}
 
-          {activeTab === 'sql' ? (
+          {!IMPACT_UNIFIED && activeTab === 'sql' ? (
             <SqlTab
               runtime={runtime}
               viewId={sqlViewId}
@@ -2089,7 +2185,7 @@ export default function App() {
             />
           ) : null}
 
-          {activeTab === 'glossary' ? (
+          {GLOSSARY_VISIBLE && activeTab === 'glossary' ? (
             <GlossaryTab
               selectedSnapshot={selectedSnapshot}
               query={glossaryQuery}
@@ -2108,6 +2204,8 @@ export default function App() {
                 setLineageTour(null);
                 setLineageTourStepIndex(0);
                 setImpact(null);
+                setImpactReview(null);
+                setAgenticReview(null);
                 setImpactAdvice(null);
                 setImpactTour(null);
                 setImpactTourStepIndex(0);
@@ -2266,7 +2364,7 @@ function LineageTab(props: {
                 {props.objectDetail.tags.slice(0, 8).map((tag) => <span key={tag}>{tag}</span>)}
               </div>
             ) : null}
-            <GlossaryList terms={props.objectGlossary} title="Glossary" emptyText="Glossary 용어 없음" />
+            {GLOSSARY_VISIBLE ? <GlossaryList terms={props.objectGlossary} title="Glossary" emptyText="Glossary 용어 없음" /> : null}
             <button className="secondaryButton wide" onClick={() => props.onExpand(props.objectDetail!.id)}>
               Expand from node
             </button>
@@ -2301,10 +2399,26 @@ function ImpactTab(props: {
   onAdvice: () => void;
   onTour: () => void;
   impact: ImpactScenarioResponse | null;
+  impactReview: ImpactReviewResponse | null;
+  agenticReview: AgenticReviewRun | null;
+  agenticQuestion: string;
+  setAgenticQuestion: (value: string) => void;
+  onAgenticReview: () => void;
   impactAdvice: ImpactAdviceResponse | null;
   impactTour: ImpactTourResponse | null;
   objectFreshness: RequestFreshnessResponse | null;
+  queryName: string;
+  setQueryName: (value: string) => void;
+  includeSqlEvidence: boolean;
+  setIncludeSqlEvidence: (value: boolean) => void;
+  sqlViewId: string;
+  setSqlViewId: (value: string) => void;
+  sqlFile: string;
+  setSqlFile: (value: string) => void;
+  sqlText: string;
+  setSqlText: (value: string) => void;
   busy: boolean;
+  agenticBusy: boolean;
   adviceBusy: boolean;
   tourBusy: boolean;
   tourStepIndex: number;
@@ -2342,13 +2456,48 @@ function ImpactTab(props: {
           <textarea value={props.description} onChange={(event) => props.setDescription(event.target.value)} rows={4} />
         </label>
         <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
-        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
+        <details className="advancedSection evidenceDrawer">
+          <summary>Evidence sources · Query / SQL</summary>
+          <p className="mutedSmall">Query Analysis와 SQL Analysis는 Impact Review 내부 evidence로만 사용합니다.</p>
+          <label>Query evidence names
+            <input
+              value={props.queryName}
+              placeholder="비워두면 impacted QUERY 자동 포함"
+              onChange={(event) => props.setQueryName(event.target.value)}
+            />
+          </label>
+          <label className="checkField compactCheck">
+            <input
+              type="checkbox"
+              checked={props.includeSqlEvidence}
+              onChange={(event) => props.setIncludeSqlEvidence(event.target.checked)}
+            />
+            SQL / Native SQL reference evidence 포함
+          </label>
+          <label>SQL view ID
+            <input value={props.sqlViewId} onChange={(event) => props.setSqlViewId(event.target.value)} disabled={!props.includeSqlEvidence} />
+          </label>
+          <label>SQL text
+            <textarea
+              rows={4}
+              value={props.sqlText}
+              placeholder="SQL text가 있으면 file보다 우선합니다. DB SQL 실행 없음."
+              disabled={!props.includeSqlEvidence}
+              onChange={(event) => props.setSqlText(event.target.value)}
+            />
+          </label>
+          <label>SQL file
+            <input value={props.sqlFile} onChange={(event) => props.setSqlFile(event.target.value)} disabled={!props.includeSqlEvidence} />
+          </label>
+          <p className="policyNote">No BW query execution · No data preview · Parse only · DB execution disabled</p>
+        </details>
+        <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.agenticBusy || props.adviceBusy || props.tourBusy}>
           Impact 실행
         </button>
-        <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
+        <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.agenticBusy || props.adviceBusy || props.tourBusy}>
           Impact Brief
         </button>
-        <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
+        <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.agenticBusy || props.adviceBusy || props.tourBusy}>
           Business Summary
         </button>
       </section>
@@ -2378,25 +2527,7 @@ function ImpactTab(props: {
           </div>
         </div>
 
-        <GuidedTourPanel
-          title="Impact Brief"
-          response={props.impactTour}
-          steps={tourSteps}
-          currentIndex={currentTourIndex}
-          onStepIndex={props.setTourStepIndex}
-          onRun={props.onTour}
-          busy={props.tourBusy}
-        />
-
         <span className="eyebrow">Affected</span>
-        {props.impactAdvice ? (
-          <div className={`llmAdviceBox ${props.impactAdvice.status}`}>
-            <h3>Business Summary</h3>
-            <p>{props.impactAdvice.message}</p>
-            {props.impactAdvice.advice ? <pre>{props.impactAdvice.advice}</pre> : null}
-            <small>Citations: {props.impactAdvice.citations.join(', ') || 'none'}</small>
-          </div>
-        ) : null}
         {props.impact ? (
           <div className="severityList">
             {props.impact.affected_objects.map((item) => (
@@ -2407,7 +2538,7 @@ function ImpactTab(props: {
                 </div>
                 <b>{item.severity}</b>
                 <p>{item.reason}</p>
-                {item.glossary_terms && item.glossary_terms.length > 0 ? (
+                {GLOSSARY_VISIBLE && item.glossary_terms && item.glossary_terms.length > 0 ? (
                   <div className="inlineTerms">
                     {item.glossary_terms.slice(0, 4).map((term) => <span key={term.id} title={term.evidence_ids.join(', ')}>{term.term}</span>)}
                   </div>
@@ -2418,9 +2549,494 @@ function ImpactTab(props: {
             {props.impact.affected_objects.length === 0 ? <div className="emptyState">이 범위 내 영향 없음 (깊이 기준 확인 필요)</div> : null}
           </div>
         ) : <div className="emptyState">변경 시나리오(예: 필드 삭제)를 고르면 영향 객체를 심각도순으로 보여드립니다. Lineage에서 본 객체가 자동으로 선택됩니다.</div>}
+
+        <ImpactEvidenceCards review={props.impactReview} />
+        <AuthorityCallout review={props.impactReview} />
+        <AgenticReviewWorkspace
+          review={props.agenticReview}
+          deterministicPack={props.impactReview}
+          question={props.agenticQuestion}
+          setQuestion={props.setAgenticQuestion}
+          onRun={props.onAgenticReview}
+          busy={props.agenticBusy}
+          disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}
+        />
+
+        <GuidedTourPanel
+          title="Impact Brief"
+          response={props.impactTour}
+          steps={tourSteps}
+          currentIndex={currentTourIndex}
+          onStepIndex={props.setTourStepIndex}
+          onRun={props.onTour}
+          busy={props.tourBusy}
+        />
+
+        {props.impactAdvice ? (
+          <div className={`llmAdviceBox ${props.impactAdvice.status}`}>
+            <h3>Business Summary</h3>
+            <p>{props.impactAdvice.message}</p>
+            {props.impactAdvice.advice ? <pre>{props.impactAdvice.advice}</pre> : null}
+            <small>Citations: {props.impactAdvice.citations.join(', ') || 'none'}</small>
+          </div>
+        ) : null}
       </section>
     </div>
   );
+}
+
+function AgenticReviewWorkspace(props: {
+  review: AgenticReviewRun | null;
+  deterministicPack: ImpactReviewResponse | null;
+  question: string;
+  setQuestion: (value: string) => void;
+  onRun: () => void;
+  busy: boolean;
+  disabled: boolean;
+}) {
+  const review = props.review;
+  const deterministicPack = review?.deterministic_pack ?? props.deterministicPack;
+  const cards = [...(review?.cards ?? [])].sort((left, right) => left.review_priority - right.review_priority);
+  const objectives = review?.objectives ?? [];
+  const hypotheses = review?.hypotheses ?? [];
+  const gaps = review?.evidence_gaps ?? [];
+  const manualChecks = review?.manual_checks ?? [];
+  const trace = review?.trace ?? [];
+  const budgetEntries = review ? Object.entries(review.budget) : [];
+  const budgetUsageEntries = review ? Object.entries(review.budget_usage) : [];
+  const coverageEntries = Object.entries(deterministicPack?.coverage_summary ?? {});
+  const policyDecisions = review?.policy_decisions ?? [];
+  const auditTrail = review?.audit_trail ?? [];
+
+  return (
+    <section className="agenticWorkspace" aria-label="Agentic Review Workspace">
+      <div className="agenticWorkspaceHeader">
+        <div>
+          <span className="eyebrow">Agentic Review Workspace</span>
+          <h2>Autonomous impact review</h2>
+          <p>Deterministic evidence remains authoritative; agentic output is citation-bound review workspace context only.</p>
+        </div>
+        <div className="agenticBoundaryCopy" aria-label="agentic copy boundaries">
+          <span>No BW query execution · No data preview</span>
+          <span>Parse only · DB execution disabled</span>
+        </div>
+      </div>
+
+      {review?.status === 'disabled' ? (
+        <div className="agenticBanner disabled">LLM disabled — deterministic findings only</div>
+      ) : null}
+      {review?.status === 'fallback' ? (
+        <div className="agenticBanner fallback">Autonomous review failed validation — showing deterministic findings</div>
+      ) : null}
+
+      <div className="agenticGrid">
+        <article className="agenticSectionCard review-objective">
+          <div className="agenticSectionTitle">
+            <span className="eyebrow">Review objective</span>
+            <h3>Question and review plan</h3>
+          </div>
+          <label>Review objective
+            <textarea
+              value={props.question}
+              rows={3}
+              placeholder="Optional: ask what the reviewer should focus on, e.g. CAB risk, query exposure, freshness, or BWMT manual checks."
+              onChange={(event) => props.setQuestion(event.target.value)}
+            />
+          </label>
+          <button className="primaryButton wide" onClick={props.onRun} disabled={props.disabled || props.busy}>
+            {props.busy ? 'Running agentic review…' : 'Run agentic review'}
+          </button>
+          {objectives.length > 0 ? (
+            <div className="agenticList">
+              {objectives.map((objective) => (
+                <div key={objective.id} className="agenticMiniItem">
+                  <strong>{objective.title}</strong>
+                  <p>{objective.rationale}</p>
+                  <CitationChipList citationIds={objective.citation_ids} />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="emptyState">Run agentic review to render citation-bound objectives. Disabled LLM mode can still render deterministic cards.</div>
+          )}
+        </article>
+
+        <article className="agenticSectionCard reasoning-trace">
+          <div className="agenticSectionTitle">
+            <span className="eyebrow">Autonomous reasoning trace summary</span>
+            <h3>Stage trace, no raw chat</h3>
+          </div>
+          <p className="mutedSmall">Summaries only; raw chat and chain-of-thought are not rendered.</p>
+          {trace.length > 0 ? (
+            <ol className="traceList">
+              {trace.map((step, index) => (
+                <li key={`${step.stage}-${step.round}-${index}`}>
+                  <strong>{step.stage}</strong>
+                  <span>round {step.round} · citation_validation={step.citation_validation}</span>
+                  <p>{step.summary}</p>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <div className="emptyState">No autonomous trace yet.</div>
+          )}
+        </article>
+      </div>
+
+      <article className="agenticSectionCard prioritized-review-cards">
+        <div className="agenticSectionTitle">
+          <span className="eyebrow">Prioritized review cards</span>
+          <h3>Sorted by review priority</h3>
+        </div>
+        {cards.length > 0 ? (
+          <div className="agenticCardList">
+            {cards.map((card) => (
+              <article key={card.id} className="agenticCard">
+                <div className="agenticCardHeader">
+                  <span className={`provenanceBadge ${card.kind}`}>{provenanceLabel(card.kind)}</span>
+                  <span className="reviewPriority">Priority {card.review_priority}</span>
+                </div>
+                <h4>{card.title}</h4>
+                <p>{card.body}</p>
+                <div className="agenticCardMeta">
+                  <span>Severity: {card.severity_label ?? 'n/a'}</span>
+                  <span>Source finding: {card.source_finding_id ?? 'n/a'}</span>
+                </div>
+                <CitationChipList citationIds={card.citation_ids} />
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="emptyState">No review cards yet.</div>
+        )}
+      </article>
+
+      <div className="agenticGrid">
+        <article className="agenticSectionCard evidence-map">
+          <div className="agenticSectionTitle">
+            <span className="eyebrow">Evidence map</span>
+            <h3>Card and hypothesis citations</h3>
+          </div>
+          <div className="budgetGrid coverageGrid">
+            {coverageEntries.length > 0 ? coverageEntries.map(([key, value]) => (
+              <Metric key={key} label={key.replace(/_/g, ' ')} value={String(value)} />
+            )) : <Metric label="Coverage" value="0" />}
+          </div>
+          <div className="agenticCitationMap">
+            <strong>Card citations</strong>
+            {cards.length > 0 ? cards.map((card) => (
+              <div key={card.id} className="agenticMiniItem">
+                <span>{card.title}</span>
+                <CitationChipList citationIds={card.citation_ids} />
+              </div>
+            )) : <p className="mutedSmall">No card citations yet.</p>}
+            <strong>Hypothesis citations</strong>
+            {hypotheses.length > 0 ? hypotheses.map((hypothesis) => (
+              <div key={hypothesis.id} className="agenticMiniItem">
+                <span>{hypothesis.statement}</span>
+                <small>{hypothesis.status} · severity opinion {hypothesis.severity_opinion ?? 'n/a'}</small>
+                <p>{hypothesis.confidence_rationale}</p>
+                <CitationChipList citationIds={hypothesis.citation_ids} />
+              </div>
+            )) : <p className="mutedSmall">No hypotheses yet.</p>}
+          </div>
+        </article>
+
+        <article className="agenticSectionCard missing-evidence-gaps">
+          <div className="agenticSectionTitle">
+            <span className="eyebrow">Missing evidence / gaps</span>
+            <h3>Evidence still needed</h3>
+          </div>
+          {gaps.length > 0 ? (
+            <div className="agenticList">
+              {gaps.map((gap) => (
+                <div key={gap.id} className="agenticMiniItem">
+                  <strong>{gap.description}</strong>
+                  <p>{gap.missing_evidence}</p>
+                  {gap.suggested_local_action ? <small>suggested_local_action: {gap.suggested_local_action}</small> : null}
+                  {gap.related_object_id ? <small>related_object_id: {gap.related_object_id}</small> : null}
+                  <CitationChipList citationIds={gap.citation_ids} />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="emptyState">No agentic evidence gaps returned. Manual deterministic gaps still appear in the evidence cards above.</div>
+          )}
+        </article>
+      </div>
+
+      <div className="agenticGrid">
+        <article className="agenticSectionCard manual-bwmt-checklist">
+          <div className="agenticSectionTitle">
+            <span className="eyebrow">Manual BWMT checklist</span>
+            <h3>Human-only verification steps</h3>
+          </div>
+          {manualChecks.length > 0 ? (
+            <div className="agenticList">
+              {manualChecks.map((check) => (
+                <div key={check.id} className="agenticMiniItem">
+                  <strong>{check.title}</strong>
+                  <small>{check.tool} · priority {check.priority}</small>
+                  <p>{check.steps_summary}</p>
+                  {check.related_finding_ids.length > 0 ? <small>Findings: {check.related_finding_ids.join(', ')}</small> : null}
+                  <CitationChipList citationIds={check.citation_ids} />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="emptyState">No manual BWMT checklist items returned.</div>
+          )}
+        </article>
+
+        <article className="agenticSectionCard cab-change-summary">
+          <div className="agenticSectionTitle">
+            <span className="eyebrow">CAB / change summary</span>
+            <h3>Copy-safe advisory summary</h3>
+          </div>
+          {review?.cab_summary ? (
+            <>
+              <pre className="agenticCabSummary">{review.cab_summary}</pre>
+              <button className="secondaryButton" onClick={() => void copyCabSummary(review.cab_summary)}>
+                Copy CAB summary
+              </button>
+            </>
+          ) : (
+            <div className="emptyState">No CAB summary yet.</div>
+          )}
+        </article>
+      </div>
+
+      <article className="agenticSectionCard validator-budget-audit">
+        <div className="agenticSectionTitle">
+          <span className="eyebrow">Validator + budget + audit</span>
+          <h3>Status, policy decisions, and citation validation</h3>
+        </div>
+        <div className="budgetGrid">
+          <Metric label="status" value={review?.status ?? 'not run'} />
+          <Metric label="llm enabled" value={review ? String(review.llm_enabled) : 'n/a'} />
+          <Metric label="llm disabled" value={review ? String(review.llm_disabled) : 'n/a'} />
+          <Metric label="snapshot" value={review?.snapshot_id ?? deterministicPack?.snapshot_id ?? 'n/a'} />
+        </div>
+        <div className="agenticGrid compact">
+          <div className="agenticAuditBox">
+            <strong>budget</strong>
+            <div className="budgetGrid">
+              {budgetEntries.length > 0 ? budgetEntries.map(([key, value]) => (
+                <Metric key={key} label={key.replace(/_/g, ' ')} value={String(value)} />
+              )) : <Metric label="budget" value="n/a" />}
+            </div>
+          </div>
+          <div className="agenticAuditBox">
+            <strong>budget_usage</strong>
+            <div className="budgetGrid">
+              {budgetUsageEntries.length > 0 ? budgetUsageEntries.map(([key, value]) => (
+                <Metric key={key} label={key.replace(/_/g, ' ')} value={String(value)} />
+              )) : <Metric label="usage" value="n/a" />}
+            </div>
+          </div>
+        </div>
+        <div className="agenticGrid compact">
+          <div className="agenticAuditBox">
+            <strong>Policy decisions</strong>
+            {policyDecisions.length > 0 ? (
+              <ul className="plainList">
+                {policyDecisions.map((decision) => (
+                  <li key={decision.request_id}>
+                    <b>{decision.allowed ? 'allowed' : 'blocked'} · {decision.request_id}</b>
+                    <span>{decision.reason}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : <p className="mutedSmall">No policy decisions recorded.</p>}
+          </div>
+          <div className="agenticAuditBox">
+            <strong>Audit citation validation</strong>
+            {auditTrail.length > 0 ? (
+              <ul className="plainList">
+                {auditTrail.map((audit, index) => (
+                  <li key={`${audit.prompt_sha256 ?? 'audit'}-${index}`}>
+                    <b>{audit.model ?? 'model n/a'} · citation_validation={String(audit.citation_validation ?? 'not_validated')}</b>
+                    <span>prompt_sha256={audit.prompt_sha256 ?? 'n/a'}</span>
+                    <span>sanitized_input_sha256={audit.sanitized_input_sha256 ?? 'n/a'}</span>
+                    {audit.response_id ? <span>response_id={audit.response_id}</span> : null}
+                  </li>
+                ))}
+              </ul>
+            ) : <p className="mutedSmall">No LLM audit entries recorded.</p>}
+          </div>
+        </div>
+      </article>
+    </section>
+  );
+}
+
+function ImpactEvidenceCards(props: { review: ImpactReviewResponse | null }) {
+  const review = props.review;
+  const queryEvidence = review?.query_evidence ?? [];
+  const sqlEvidence = review?.sql_evidence ?? [];
+  const gaps = review?.manual_verification_gaps ?? [];
+  const variableCount = queryEvidence.reduce((total, item) => total + item.variable_names.length, 0);
+  const keyFigureCount = queryEvidence.reduce(
+    (total, item) => total + item.calculated_key_figure_names.length + item.restricted_key_figure_names.length,
+    0,
+  );
+  const referencedObjectCount = new Set(sqlEvidence.flatMap((item) => item.referenced_object_ids)).size;
+  const referencedColumnCount = new Set(sqlEvidence.flatMap((item) => item.referenced_column_names)).size;
+
+  return (
+    <div className="evidenceStack impactEvidenceStack" aria-label="Impact evidence source cards">
+      <article className="evidenceCard query-evidence">
+        <div className="evidenceCardHeader">
+          <div>
+            <span className="eyebrow">Query exposure evidence</span>
+            <h3>BW Query evidence inside Impact Review</h3>
+          </div>
+          <span className="evidenceStatus">No BW query execution · No data preview</span>
+        </div>
+        <div className="metaGrid evidenceMetricGrid">
+          <Metric label="Queries" value={String(queryEvidence.length)} />
+          <Metric label="Matched findings" value={coverageValue(review, 'query_matched_finding_count')} />
+          <Metric label="Variables" value={String(variableCount)} />
+          <Metric label="CKF/RKF" value={String(keyFigureCount)} />
+        </div>
+        {queryEvidence.length > 0 ? (
+          <div className="evidenceRows">
+            {queryEvidence.map((item) => (
+              <div key={item.query_id} className="evidenceRow">
+                <strong>{item.query_id}</strong>
+                <small>{item.description || 'Snapshot parser evidence'}</small>
+                <EvidenceChipList label="Providers" items={item.provider_object_ids} />
+                <EvidenceChipList label="Variables" items={item.variable_names} empty="no variables" />
+                <EvidenceChipList label="Key figures" items={[...item.calculated_key_figure_names, ...item.restricted_key_figure_names]} empty="no CKF/RKF" />
+                {item.manual_check_notes.length > 0 ? <p>{item.manual_check_notes.join(' ')}</p> : null}
+                <details className="advancedSection evidenceDrawer">
+                  <summary>Advanced · Query Analysis parser output</summary>
+                  <pre>{JSON.stringify(item, null, 2)}</pre>
+                </details>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="emptyState">Impact 실행 후 impacted QUERY 또는 explicit query name이 있으면 Query evidence가 여기에 표시됩니다.</div>
+        )}
+      </article>
+
+      <article className="evidenceCard sql-evidence">
+        <div className="evidenceCardHeader">
+          <div>
+            <span className="eyebrow">SQL / Native SQL reference evidence</span>
+            <h3>SQL reference evidence inside Impact Review</h3>
+          </div>
+          <span className="evidenceStatus">Parse only · DB execution disabled</span>
+        </div>
+        <div className="metaGrid evidenceMetricGrid">
+          <Metric label="Views" value={String(sqlEvidence.length)} />
+          <Metric label="Matched findings" value={coverageValue(review, 'sql_matched_finding_count')} />
+          <Metric label="Objects" value={String(referencedObjectCount)} />
+          <Metric label="Columns" value={String(referencedColumnCount)} />
+        </div>
+        {sqlEvidence.length > 0 ? (
+          <div className="evidenceRows">
+            {sqlEvidence.map((item) => (
+              <div key={item.view_id} className="evidenceRow">
+                <strong>{item.view_id}</strong>
+                <small>{item.parser} · confidence {item.confidence}</small>
+                <EvidenceChipList label="Referenced objects" items={item.referenced_object_ids} />
+                <EvidenceChipList label="Referenced columns" items={item.referenced_column_names.slice(0, 12)} empty="no parsed columns" />
+                {item.manual_check_notes.length > 0 ? <p>{item.manual_check_notes.join(' ')}</p> : null}
+                <details className="advancedSection evidenceDrawer">
+                  <summary>Advanced · SQL Analysis parser output</summary>
+                  <pre>{JSON.stringify(item, null, 2)}</pre>
+                </details>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="emptyState">SQL evidence는 좌측 advanced source에서 명시적으로 켠 경우에만 parse-only로 포함됩니다.</div>
+        )}
+      </article>
+
+      <article className="evidenceCard gaps-evidence">
+        <div className="evidenceCardHeader">
+          <div>
+            <span className="eyebrow">Manual verification gaps</span>
+            <h3>Human review points</h3>
+          </div>
+          <span className="evidenceStatus">{coverageValue(review, 'manual_gap_count')} gaps</span>
+        </div>
+        {gaps.length > 0 ? (
+          <ul className="manualGapList">
+            {gaps.map((gap) => (
+              <li key={gap.id}>
+                <strong>{gap.source.toUpperCase()}{gap.object_id ? ` · ${gap.object_id}` : ''}</strong>
+                <span>{gap.reason}</span>
+                {gap.evidence_ids.length > 0 ? <small>Evidence IDs: {gap.evidence_ids.join(', ')}</small> : null}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="emptyState">Impact evidence pack이 생성되면 수동 확인 포인트를 모읍니다.</div>
+        )}
+      </article>
+    </div>
+  );
+}
+
+function AuthorityCallout(props: { review: ImpactReviewResponse | null }) {
+  return (
+    <aside className="authorityCallout">
+      <strong>Deterministic authority boundary</strong>
+      <p>
+        impact.py remains the final authority for severity, confidence, affected objects, and manual verification.
+      </p>
+      <small>
+        {props.review
+          ? `${props.review.final_authority} · deterministic=${String(props.review.deterministic)} · read_only=${String(props.review.read_only)} · execution_blocked=${String(props.review.execution_blocked)}`
+          : 'Impact Review evidence pack 대기 중 · LLM 권위 없음 · execution disabled'}
+      </small>
+    </aside>
+  );
+}
+
+function EvidenceChipList(props: { label: string; items: string[]; empty?: string }) {
+  return (
+    <div className="evidenceChips">
+      <span>{props.label}</span>
+      {props.items.length > 0
+        ? props.items.map((item) => <code key={item}>{item}</code>)
+        : <em>{props.empty ?? '—'}</em>}
+    </div>
+  );
+}
+
+function CitationChipList(props: { citationIds: string[] }) {
+  return (
+    <div className="citationChipList" aria-label="citation ids">
+      {props.citationIds.length > 0
+        ? props.citationIds.map((id) => <code key={id} className="citationChip">{id}</code>)
+        : <em>No citations</em>}
+    </div>
+  );
+}
+
+function provenanceLabel(kind: AgenticReviewRun['cards'][number]['kind']): string {
+  if (kind === 'deterministic_finding') return 'Deterministic finding';
+  if (kind === 'llm_proposed_concern') return 'LLM proposed concern';
+  return 'Manual verification required';
+}
+
+async function copyCabSummary(text: string): Promise<void> {
+  if (!text.trim() || !navigator.clipboard?.writeText) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_err) {
+    // Clipboard is best-effort in local builds and can be unavailable in tests or HTTP contexts.
+  }
+}
+
+function coverageValue(review: ImpactReviewResponse | null, key: string): string {
+  const value = review?.coverage_summary[key];
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : '0';
 }
 
 
@@ -2563,7 +3179,7 @@ function SqlTab(props: {
                 </ul>
               </div>
             </div>
-            <GlossaryList terms={props.explain.glossary_terms} title="Glossary" emptyText="Glossary 용어 없음" />
+            {GLOSSARY_VISIBLE ? <GlossaryList terms={props.explain.glossary_terms} title="Glossary" emptyText="Glossary 용어 없음" /> : null}
             <pre>{JSON.stringify(props.explain.result.reference_edges, null, 2)}</pre>
           </div>
         ) : <div className="emptyState">Native SQL View 정의를 붙여넣으면 참조 객체·컬럼을 결정적으로 추출합니다. DB 실행은 하지 않습니다.</div>}
@@ -2905,7 +3521,7 @@ function LineageGraph(props: {
   selectedFreshness: RequestFreshnessResponse | null;
 }) {
   if (!props.lineage) {
-    return <div className="emptyState graphEmpty">왼쪽에서 객체를 찾고 선택한 뒤 Lineage를 실행하세요. 객체명을 몰라도 Find in BW 또는 Glossary로 검색할 수 있습니다.</div>;
+    return <div className="emptyState graphEmpty">왼쪽에서 객체를 찾고 선택한 뒤 Lineage를 실행하세요. 객체명을 몰라도 Find in BW로 후보를 검색할 수 있습니다.</div>;
   }
   const groups = groupNodesByDisplayLayer(props.lineage.nodes);
   const visibleLayers = DISPLAY_LAYER_ORDER
