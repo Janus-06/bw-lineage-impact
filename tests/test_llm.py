@@ -6,10 +6,15 @@ from pathlib import Path
 import httpcore
 import httpx
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from bwli.config import ConfigError, LlmConfig, LlmRuntimeConfig
 from bwli.field_lineage import SqlFragment, SqlParseResult, parse_native_sql_view
+from bwli.llm.assistant import review_assistant, validate_assistant_answer_citations
+from bwli.llm.assistant_context import (
+    AssistantEvidenceContext,
+    AssistantReviewRequest,
+)
 from bwli.llm.explainer import (
     LlmCitationError,
     LlmEvidenceError,
@@ -38,6 +43,71 @@ def _sample_sql_result() -> SqlParseResult:
         GROUP BY s.customer_id
         """,
         view_id="ZSQL_SALES_VIEW",
+    )
+
+
+def test_assistant_models_reject_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        AssistantReviewRequest.model_validate(
+            {"prompt": "Review impact", "context": [], "unexpected": True}
+        )
+
+    with pytest.raises(ValidationError):
+        AssistantEvidenceContext.model_validate(
+            {
+                "id": "ctx-1",
+                "kind": "impact",
+                "title": "Impact",
+                "body": "Finding body",
+                "raw_snapshot_payload": {"must": "not pass"},
+            }
+        )
+
+
+def test_assistant_disabled_returns_cited_fallback_and_manual_checks() -> None:
+    request = AssistantReviewRequest(
+        prompt="Review CAB risk and manual BWMT checks.",
+        context=[
+            AssistantEvidenceContext(
+                id="impact:finding-1",
+                kind="impact",
+                title="HIGH impact · ZQUERY",
+                body=(
+                    "Deterministic impact.py finding: ZQUERY is downstream of the changed "
+                    "provider. Manual verification=True."
+                ),
+                object_id="ZQUERY",
+                object_type="QUERY",
+                citation_id="impact:finding-1",
+                source_ids=["node:ZQUERY", "edge:ZPROV->ZQUERY"],
+            )
+        ],
+    )
+
+    response = review_assistant(request, runtime=None)
+
+    assert response.status == "disabled"
+    assert response.safety.llm_used is False
+    assert response.safety.no_live_bw_calls is True
+    assert response.safety.citation_validation == "passed"
+    assert "impact.py" in response.answer
+    assert "ctx:impact:finding-1" in response.citations
+    assert response.unknowns
+    assert response.manual_checks
+    assert response.manual_checks[0].tool == "BWMT"
+    assert response.manual_checks[0].citation_ids
+
+
+def test_assistant_citation_validator_rejects_unsupported_answer_line() -> None:
+    with pytest.raises(LlmCitationError):
+        validate_assistant_answer_citations(
+            "This unsupported answer has no deterministic citation.",
+            ["ctx:impact:finding-1"],
+        )
+
+    validate_assistant_answer_citations(
+        "Unknown / needs manual verification: runtime BW values are unavailable.",
+        ["ctx:impact:finding-1"],
     )
 
 

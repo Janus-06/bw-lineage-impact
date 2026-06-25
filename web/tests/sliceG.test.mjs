@@ -122,6 +122,48 @@ test('normalizes legacy tour body text as description', () => {
   assert.equal(steps[0].description, 'Backend deterministic walkthrough body should remain visible.');
 });
 
+test('Slice 2 Lineage IA keeps default controls task-first with progressive advanced limits', () => {
+  const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  const lineageBody = appFunctionBody(source, 'function LineageTab', '\nfunction ImpactTab');
+  const controlStart = lineageBody.indexOf('<section className="controlCard">');
+  const advancedStart = lineageBody.indexOf('<details className="lineageAdvancedControls">');
+  assert.notEqual(controlStart, -1, 'LineageTab should keep a control card');
+  assert.notEqual(advancedStart, -1, 'LineageTab should use progressive disclosure for advanced limits');
+
+  assert.match(lineageBody, /Trace Lineage \/ 흐름 보기/, 'Lineage copy should be task-first');
+  assert.match(lineageBody, /aria-label="selected object context"/, 'selected object context should remain visible');
+  assert.match(lineageBody, /className=\{props\.direction === option\.value \? 'directionChip active' : 'directionChip'\}/);
+  ['Upstream', 'Downstream', 'Both'].forEach((label) => {
+    assert.match(lineageBody, new RegExp(`label: '${label}'`), `${label} direction chip should be declared`);
+  });
+  assert.doesNotMatch(lineageBody, /<select value=\{props\.direction\}/, 'direction should no longer be an always-visible select control');
+  assert.match(lineageBody, /className="primaryButton wide"[\s\S]*흐름 보기/, 'the primary Lineage task CTA should be 흐름 보기');
+  assert.doesNotMatch(lineageBody, />Run Lineage</, 'old feature-tool CTA copy should not remain');
+
+  const defaultControlBody = lineageBody.slice(controlStart, advancedStart);
+  ['Depth', 'Node cap', 'Edge cap'].forEach((label) => {
+    assert.doesNotMatch(defaultControlBody, new RegExp(`label="${label}"`), `${label} must not be in always-visible controls`);
+  });
+  const advancedBody = lineageBody.slice(advancedStart, lineageBody.indexOf('<AssistantPresetLinks', advancedStart));
+  assert.match(advancedBody, /<summary>Advanced limits<\/summary>/);
+  ['Depth', 'Node cap', 'Edge cap'].forEach((label) => {
+    assert.match(advancedBody, new RegExp(`label="${label}"`), `${label} should remain available inside Advanced limits`);
+  });
+
+  ['Dataflow', 'Where-used', 'Object detail', 'Freshness'].forEach((label) => {
+    assert.match(lineageBody, new RegExp(`'${label}'|>${label}<`), `${label} evidence health label should be visible`);
+  });
+  assert.match(lineageBody, /Evidence panel/, 'Evidence Walkthrough should be de-emphasized as evidence panel preset content');
+  assert.match(lineageBody, /Evidence Walkthrough preset/, 'legacy walkthrough remains available only as an assistant preset');
+  assert.doesNotMatch(lineageBody, /title="Evidence Walkthrough"/, 'walkthrough should not be a primary drawer title');
+  assert.doesNotMatch(lineageBody, /Generate Evidence Walkthrough/, 'walkthrough should not be presented as the default action copy');
+
+  assert.match(styles, /\.directionChipGroup\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(styles, /\.evidenceHealthSummary\s*\{[\s\S]*?background:\s*linear-gradient/);
+  assert.match(styles, /\.lineageAdvancedControls\s*\{[\s\S]*?border:/);
+});
+
 test('Glossary object selection clears stale tour and freshness state before Lineage', () => {
   const source = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   const handlerMatch = source.match(
@@ -911,10 +953,87 @@ test('App source exposes unified Impact evidence UI, field auto-select, evidence
   assert.match(styles, /\.evidencePill, \.tourEvidenceList code \{[\s\S]*?overflow-wrap: anywhere;[\s\S]*?white-space: normal;/);
 });
 
-test('Agentic review API client is typed and posts to the agentic impact review route', () => {
+test('Slice 3 Impact IA is scenario-first with deterministic result hierarchy', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
+  const impactBody = appFunctionBody(app, 'function ImpactTab(props:', '\nfunction AgenticReviewWorkspace');
+  const changeTypeBlock = api.match(/export type ChangeType =([\s\S]*?);/);
+  assert.ok(changeTypeBlock, 'ChangeType union should be present');
+  const existingChangeTypes = new Set([...changeTypeBlock[1].matchAll(/'([^']+)'/g)].map((match) => match[1]));
+  const cardBlockStart = app.indexOf('const impactScenarioCards');
+  const cardBlockEnd = app.indexOf('const impactScenarioDefaultDescriptions', cardBlockStart);
+  assert.notEqual(cardBlockStart, -1, 'scenario card definitions should be present');
+  assert.notEqual(cardBlockEnd, -1, 'scenario card definitions should be bounded before derived defaults');
+  const cardBlock = app.slice(cardBlockStart, cardBlockEnd);
+  const cardChangeTypes = [...cardBlock.matchAll(/changeType: '([^']+)'/g)].map((match) => match[1]);
+  assert.ok(cardChangeTypes.length >= 5, 'Slice 3 should expose the requested scenario cards');
+  cardChangeTypes.forEach((changeType) => {
+    assert.ok(existingChangeTypes.has(changeType), `${changeType} must reuse an existing backend ChangeType`);
+  });
+  [
+    'ADSO / InfoObject field change',
+    'Transformation logic change',
+    'DTP / Process Chain change',
+    'CompositeProvider / Query change',
+    'Recent load / freshness risk',
+  ].forEach((title) => assert.match(cardBlock, new RegExp(title.replace(/\//g, '\\/'))));
+
+  const controlStart = impactBody.indexOf('<section className="controlCard impactScenarioWorkspace">');
+  const cardsStart = impactBody.indexOf('<div className="impactScenarioCards"');
+  const advancedStart = impactBody.indexOf('<details className="advancedSection evidenceScopeAdvanced">');
+  assert.notEqual(controlStart, -1, 'Impact controls should use the scenario workspace');
+  assert.notEqual(cardsStart, -1, 'scenario cards should be the lead control');
+  assert.notEqual(advancedStart, -1, 'advanced evidence scope should be present');
+  assert.ok(controlStart < cardsStart, 'scenario cards should appear near the top of controls');
+  assert.doesNotMatch(
+    impactBody.slice(controlStart, advancedStart),
+    /<label>Change type/,
+    'raw Change type dropdown must no longer be the lead/default control',
+  );
+
+  assert.match(impactBody, /activeScenario\.fieldOriented \? \(/, 'field controls should be conditional by scenario');
+  assert.match(impactBody, /aria-label="field-oriented scenario controls"/);
+  assert.match(impactBody, /aria-label="field selector not required"/);
+  assert.match(app, /const field = isFieldOrientedChangeType\(changeType\) \? fieldName\.trim\(\) \|\| null : null;/);
+
+  const defaultControls = impactBody.slice(controlStart, advancedStart);
+  ['Impact depth', 'Query evidence names', 'SQL text', 'SQL file'].forEach((label) => {
+    assert.doesNotMatch(defaultControls, new RegExp(label), `${label} should not be in default controls`);
+  });
+  const advancedControls = impactBody.slice(advancedStart, impactBody.indexOf('<button className="primaryButton wide"', advancedStart));
+  assert.match(advancedControls, /<summary>Evidence scope \(Advanced\)<\/summary>/);
+  assert.match(advancedControls, /<NumberField label="Impact depth"/);
+  assert.match(advancedControls, /Query evidence names/);
+  assert.match(advancedControls, /SQL text/);
+  assert.match(advancedControls, /SQL file/);
+  assert.match(impactBody, /영향 보기 \/ Assess Impact/);
+
+  const gradeIndex = impactBody.indexOf('aria-label="change grade impact summary"');
+  const severityIndex = impactBody.indexOf('<section className="affectedSeverityGroups"');
+  const evidenceIndex = impactBody.indexOf('<ImpactEvidenceCards review={props.impactReview} />');
+  const manualIndex = impactBody.indexOf('<ManualVerificationChecklist review={props.impactReview} impact={props.impact} />');
+  const assistantIndex = impactBody.indexOf('<AssistantPresetLinks', manualIndex);
+  [gradeIndex, severityIndex, evidenceIndex, manualIndex, assistantIndex].forEach((index) => {
+    assert.notEqual(index, -1, 'result hierarchy anchor should be present');
+  });
+  assert.ok(
+    gradeIndex < severityIndex && severityIndex < evidenceIndex && evidenceIndex < manualIndex && manualIndex < assistantIndex,
+    'Impact result hierarchy should be grade -> severity groups -> evidence cards -> manual checklist -> assistant links',
+  );
+  assert.match(impactBody, /impactSeverityOrder\.map/);
+  assert.match(impactBody, /label: 'Ask BW \/ Review'/, 'Ask BW / Review should remain an assistant preset link in Impact');
+  assert.doesNotMatch(impactBody, /<AgenticReviewWorkspace/, 'Impact must not nest the agentic review workspace');
+});
+
+test('Review assistant API clients are typed and post to citation-bound review routes', () => {
   const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
 
   [
+    'export interface AssistantEvidenceContext',
+    'export interface AssistantManualCheck',
+    'export interface AssistantSafety',
+    'export interface AssistantReviewRequest',
+    'export interface AssistantReviewResponse',
     'export interface AgenticReviewRun',
     'export interface ReviewObjective',
     'export interface ReviewHypothesis',
@@ -930,19 +1049,63 @@ test('Agentic review API client is typed and posts to the agentic impact review 
   ].forEach((typeName) => assert.match(api, new RegExp(typeName)));
 
   assert.match(api, /deterministic_pack: ImpactReviewResponse;/);
+  assert.match(api, /export async function postAssistantReview\(/);
+  assert.match(api, /\/api\/v1\/snapshots\/\$\{encodeURIComponent\(snapshotId\)\}\/assistant\/review/);
   assert.match(api, /export async function postAgenticReview\(/);
   assert.match(api, /\/api\/v1\/snapshots\/\$\{encodeURIComponent\(snapshotId\)\}\/impact\/review\/agentic/);
 });
 
-test('AgenticReviewWorkspace is nested below deterministic authority in the Impact tab', () => {
+test('Slice 1 IA centers Lineage, Impact, and Ask BW Review with one primary run CTA per analysis tab', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
+  const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 
-  assert.match(app, /function AgenticReviewWorkspace\(props:/);
+  assert.match(api, /export type AppTab = 'lineage' \| 'impact' \| 'ask' \| 'query' \| 'sql' \| 'glossary';/);
+  assert.match(app, /BW Lineage \/ Impact \/ Ask BW Review/);
+  assert.match(app, /Enterprise metadata workbench · local-first · evidence-bound LLM/);
   assert.match(
     app,
-    /<ImpactEvidenceCards review=\{props\.impactReview\} \/>[\s\S]*?<AuthorityCallout review=\{props\.impactReview\} \/>[\s\S]*?<AgenticReviewWorkspace[\s\S]*?review=\{props\.agenticReview\}/,
-    'agentic workspace must render below ImpactEvidenceCards and AuthorityCallout inside the Impact panel',
+    /<TabButton id="lineage" active=\{activeTab\} onClick=\{setActiveTab\} label="Lineage" \/>[\s\S]*?<TabButton id="impact" active=\{activeTab\} onClick=\{setActiveTab\} label="Impact" \/>[\s\S]*?<TabButton id="ask" active=\{activeTab\} onClick=\{setActiveTab\} label="Ask BW \/ Review" \/>/,
+    'task-first tabs should render as Lineage, Impact, Ask BW / Review',
   );
+  assert.match(app, /<WorkspaceContextBar[\s\S]*?activeTab=\{activeTab\}/);
+  assert.match(app, /Read-only metadata · no BW query execution · no data preview · local-first · evidence-bound LLM/);
+  assert.match(styles, /\.appFrame\s*\{[^}]*grid-template-columns:\s*252px\s+minmax\(0,\s*1fr\)/);
+  assert.match(styles, /\.workspaceContextBar\s*\{[\s\S]*?min-height:\s*56px;/);
+
+  const lineageBody = appFunctionBody(app, 'function LineageTab(props:', '\nfunction ImpactTab');
+  const impactBody = appFunctionBody(app, 'function ImpactTab(props:', '\nfunction AgenticReviewWorkspace');
+  assert.equal((lineageBody.match(/className="primaryButton wide"/g) ?? []).length, 1, 'Lineage should keep one primary CTA');
+  assert.equal((impactBody.match(/className="primaryButton wide"/g) ?? []).length, 1, 'Impact should keep one primary CTA');
+  assert.match(lineageBody, /<AssistantPresetLinks[\s\S]*?title="Assistant presets"/);
+  assert.match(impactBody, /<AssistantPresetLinks[\s\S]*?title="Assistant presets"/);
+  assert.doesNotMatch(lineageBody, /<button className="secondaryButton wide"[\s\S]*?Evidence Walkthrough/);
+  assert.doesNotMatch(impactBody, /<button className="secondaryButton wide"[\s\S]*?Impact Brief/);
+  assert.match(impactBody, /<details className="advancedSection evidenceScopeAdvanced">[\s\S]*?<summary>Evidence scope \(Advanced\)<\/summary>/);
+});
+
+test('Ask BW / Review tab hosts AgenticReviewWorkspace outside deterministic Impact tab', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
+  const askReviewBody = appFunctionBody(app, 'function AskReviewTab(props:', '\nfunction LineageTab');
+  const impactBody = appFunctionBody(app, 'function ImpactTab(props:', '\nfunction AgenticReviewWorkspace');
+
+  assert.match(app, /function AgenticReviewWorkspace\(props:/);
+  assert.match(app, /<TabButton id="ask" active=\{activeTab\} onClick=\{setActiveTab\} label="Ask BW \/ Review" \/>/);
+  assert.match(app, /activeTab === 'ask' \? \([\s\S]*?<AskReviewTab/);
+  assert.match(
+    askReviewBody,
+    /<span className="eyebrow">Ask BW \/ Review<\/span>[\s\S]*?<AgenticReviewWorkspace[\s\S]*?review=\{props\.agenticReview\}/,
+    'agentic workspace must render inside the Ask BW / Review surface',
+  );
+  assert.match(
+    impactBody,
+    /<ImpactEvidenceCards review=\{props\.impactReview\} \/>[\s\S]*?<AuthorityCallout review=\{props\.impactReview\} \/>/,
+    'Impact should keep deterministic evidence cards and authority callout',
+  );
+  assert.doesNotMatch(impactBody, /<AgenticReviewWorkspace/, 'agentic workspace must not render inside the Impact panel');
+  assert.match(api, /export type AppTab = 'lineage' \| 'impact' \| 'ask'/);
+  assert.doesNotMatch(api, /export type AppTab = [^;]*'agentic'/, 'legacy top-level agentic tab id must not return');
   assert.doesNotMatch(
     app,
     /<TabButton id="agentic"/,
@@ -955,32 +1118,43 @@ test('Agentic review workspace preserves banners, provenance labels, copy bounda
   const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 
   [
+    'Ask BW / Review',
+    'Citation-bound answer area',
+    'LLM disabled — deterministic assistant fallback',
+    'LLM validation fallback — deterministic assistant answer',
     'LLM disabled — deterministic findings only',
     'Autonomous review failed validation — showing deterministic findings',
     'Deterministic finding',
     'LLM proposed concern',
     'Manual verification required',
-    'No BW query execution · No data preview',
-    'Parse only · DB execution disabled',
+    'Read-only metadata',
+    'No BW query execution',
+    'No data preview',
+    'Local-first · evidence-bound LLM',
     'Review objective',
-    'Autonomous reasoning trace summary',
-    'Prioritized review cards',
+    'Facts, review cards, and citations',
     'Evidence map',
     'Missing evidence / gaps',
     'Manual BWMT checklist',
-    'CAB / change summary',
-    'Validator + budget + audit',
+    'Safety + validation',
+    'Status without audit log details',
+    'unified assistant review endpoint',
+    'no live BW calls, query execution, data preview, or raw snapshot payload',
     'suggested_local_action',
   ].forEach((literal) => assert.match(app, new RegExp(literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))));
+  assert.doesNotMatch(app, /Audit citation validation|prompt_sha256=|sanitized_input_sha256=|response_id=|Validator \+ budget \+ audit/);
 
   [
+    '.workspaceContextBar',
+    '.assistantPresetButton',
+    '.assistantAnswerArea',
+    '.agenticAdvancedEvidence',
     '.agenticWorkspace',
     '.agenticBanner',
     '.agenticGrid',
     '.agenticCard',
     '.provenanceBadge',
     '.citationChip',
-    '.traceList',
     '.budgetGrid',
   ].forEach((className) => assert.match(styles, new RegExp(className.replace('.', '\\.'))));
 });
@@ -994,12 +1168,14 @@ test('Agentic review request guard and busy invalidation follow existing analysi
   assert.match(body, /const requestObjectId = selectedObjectId;/);
   assert.match(body, /const requestId = nextAnalysisRequestId\(\);/);
   assert.match(body, /setBusy\('impact-agentic'\);/);
-  assert.match(body, /postAgenticReview\(requestSnapshotId, \{\s*\.\.\.impactReviewRequestBody\(requestObjectId\),\s*question: agenticQuestion\.trim\(\) \|\| null,/);
+  assert.match(body, /postImpactReview\(requestSnapshotId, impactReviewRequestBody\(requestObjectId\)\)/);
+  assert.match(body, /postAssistantReview\(requestSnapshotId, \{[\s\S]*prompt: agenticQuestion\.trim\(\) \|\| 'Review selected BW lineage and impact evidence\.',[\s\S]*preset: assistantPreset,[\s\S]*context: buildAssistantContexts/);
   assert.match(body, /if \(!isCurrentAnalysisRequest\(requestId, requestSnapshotId, requestObjectId\)\) return;/);
-  assert.match(body, /setAgenticReview\(response\);/);
-  assert.match(body, /setImpactReview\(response\.deterministic_pack\);/);
+  assert.match(body, /setAssistantReview\(response\);/);
+  assert.match(body, /setImpactReview\(deterministicPack\);/);
   assert.match(body, /finally \{[\s\S]*?setBusy\(''\);[\s\S]*?\}/);
   assert.match(app, /'impact-agentic'/);
   assert.match(app, /agenticBusy=\{busy === 'impact-agentic'\}/);
   assert.match(runImpactBody, /setAgenticReview\(null\);/, 'regular Impact scenarios must clear stale agentic results');
+  assert.match(runImpactBody, /setAssistantReview\(null\);/, 'regular Impact scenarios must clear stale assistant results');
 });

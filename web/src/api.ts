@@ -2,7 +2,7 @@ export type ConfigSource = 'env' | 'ui' | 'unset';
 export type ConnectionStatus = 'unconfigured' | 'untested' | 'ok' | 'failed' | 'stale';
 export type Direction = 'upstream' | 'downstream' | 'both';
 export type DataflowDirection = 'upwards' | 'downwards' | 'both';
-export type AppTab = 'lineage' | 'impact' | 'query' | 'sql' | 'glossary';
+export type AppTab = 'lineage' | 'impact' | 'ask' | 'query' | 'sql' | 'glossary';
 export type ChangeType =
   | 'field_removed'
   | 'field_type_changed'
@@ -492,6 +492,66 @@ export interface ImpactReviewResponse {
   coverage_summary: Record<string, number>;
 }
 
+export type AssistantContextKind =
+  | 'object'
+  | 'lineage'
+  | 'impact'
+  | 'impact_review'
+  | 'freshness'
+  | 'manual_check';
+export type AssistantReviewStatus = 'ok' | 'disabled' | 'fallback';
+
+export interface AssistantEvidenceContext {
+  id: string;
+  kind: AssistantContextKind;
+  title: string;
+  body: string;
+  object_id?: string | null;
+  object_type?: string | null;
+  citation_id?: string | null;
+  source_ids?: string[];
+}
+
+export interface AssistantManualCheck {
+  id: string;
+  title: string;
+  tool: 'BWMT' | 'Eclipse' | 'HANA_Studio' | 'manual';
+  steps_summary: string;
+  related_context_ids: string[];
+  citation_ids: string[];
+}
+
+export interface AssistantSafety {
+  read_only: boolean;
+  no_live_bw_calls: boolean;
+  no_bw_query_execution: boolean;
+  no_data_preview: boolean;
+  no_raw_snapshot_payload: boolean;
+  deterministic_authority: 'impact.py';
+  llm_used: boolean;
+  citation_validation: AgenticCitationValidationStatus;
+  fallback_reason: string | null;
+}
+
+export interface AssistantReviewRequest {
+  prompt: string;
+  snapshot_id?: string | null;
+  object_id?: string | null;
+  preset?: string | null;
+  context?: AssistantEvidenceContext[];
+  max_context_items?: number;
+}
+
+export interface AssistantReviewResponse {
+  status: AssistantReviewStatus;
+  answer: string;
+  citations: string[];
+  unknowns: string[];
+  confidence: 'high' | 'medium' | 'low' | 'unknown';
+  manual_checks: AssistantManualCheck[];
+  safety: AssistantSafety;
+}
+
 export type AgenticReviewStatus = 'completed' | 'disabled' | 'fallback' | 'failed';
 export type AgenticCitationValidationStatus = 'not_validated' | 'passed' | 'failed';
 export type AgenticReviewCardKind =
@@ -977,6 +1037,16 @@ export async function postAgenticReview(
 ): Promise<AgenticReviewRun> {
   return postJson<AgenticReviewRun>(
     `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/impact/review/agentic`,
+    body,
+  );
+}
+
+export async function postAssistantReview(
+  snapshotId: string,
+  body: AssistantReviewRequest,
+): Promise<AssistantReviewResponse> {
+  return postJson<AssistantReviewResponse>(
+    `/api/v1/snapshots/${encodeURIComponent(snapshotId)}/assistant/review`,
     body,
   );
 }

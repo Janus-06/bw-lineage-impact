@@ -15,6 +15,7 @@ from bwli.endpoints import (
     ACCEPT_HEADERS,
     build_adso_endpoint,
     build_dataflow_endpoint,
+    build_discovery_endpoint,
     build_get_request_endpoint,
     build_hcpr_endpoint,
     build_list_requests_endpoint,
@@ -34,24 +35,29 @@ def test_bw_client_public_surface_is_get_only_read_api() -> None:
     names = set(public_method_names(BwClient))
 
     forbidden = {
-        "post",
-        "put",
-        "patch",
-        "delete",
+        "activate",
+        "activate_request",
         "create",
+        "delete",
+        "filter_values",
+        "move",
+        "patch",
+        "post",
+        "preview",
+        "push",
+        "put",
+        "query_data",
+        "raw_get",
+        "raw_post",
+        "run",
+        "run_dtp",
+        "transport",
+        "unlock",
         "update",
         "write",
-        "activate",
-        "transport",
-        "run",
-        "push",
-        "move",
-        "unlock",
     }
     assert names.isdisjoint(forbidden)
-    assert not {
-        name for name in names if any(token in name.lower().split("_") for token in forbidden)
-    }
+    assert not {name for name in names if any(token in name.lower() for token in forbidden)}
     expected = {
         "fetch_search",
         "fetch_dataflow",
@@ -92,6 +98,7 @@ def test_run_dtp_and_activate_request_absent_from_surface() -> None:
 
 
 def test_endpoint_builders_use_expected_read_only_paths() -> None:
+    discovery = build_discovery_endpoint()
     search = build_search_endpoint("ADSO", object_type="ADSO")
     dataflow = build_dataflow_endpoint(
         "ZSALES",
@@ -105,6 +112,9 @@ def test_endpoint_builders_use_expected_read_only_paths() -> None:
     repository_root = build_repository_contents_endpoint()
     repository_child = build_repository_contents_endpoint("/InfoArea/ZSALES/")
 
+    assert discovery.path == "/sap/bw/modeling/discovery"
+    assert discovery.params == {}
+    assert discovery.accept == "application/atomsvc+xml"
     assert search.path == "/sap/bw/modeling/repo/is/bwsearch"
     assert search.params["searchTerm"] == "ADSO"
     assert search.params["objectType"] == "ADSO"
@@ -316,7 +326,7 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
     finally:
         client.close()
 
-    assert seen_methods == ["GET"] * 14
+    assert seen_methods == ["GET"] * 15
     assert seen_paths == [
         "/sap/bw/modeling/repo/is/systeminfo",
         "/sap/bw/modeling/repo/is/bwsearch",
@@ -330,6 +340,7 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
         "/sap/bw/modeling/dtpa/zdtp_sales/m",
         "/sap/bw/modeling/rsds/ZDS_SALES/S4H/m",
         "/sap/bw/modeling/lsys/s4h/a",
+        "/sap/bw/modeling/discovery",
         "/sap/bw/modeling/query/zq_sales/a",
         "/sap/bw/modeling/hcpr/zcp_sales/m",
     ]
@@ -346,6 +357,7 @@ def test_bw_client_fetch_uses_http_get_only() -> None:
         ACCEPT_HEADERS["dtp"],
         ACCEPT_HEADERS["datasource"],
         ACCEPT_HEADERS["source_system"],
+        ACCEPT_HEADERS["discovery"],
         ACCEPT_HEADERS["query"],
         ACCEPT_HEADERS["hcpr"],
     ]
@@ -447,8 +459,9 @@ def test_bw_client_fetch_query_falls_back_to_inactive_metadata_on_404() -> None:
     finally:
         client.close()
 
-    assert seen_methods == ["GET", "GET", "GET"]
+    assert seen_methods == ["GET", "GET", "GET", "GET"]
     assert seen_paths == [
+        "/sap/bw/modeling/discovery",
         "/sap/bw/modeling/repo/is/systeminfo",
         "/sap/bw/modeling/query/zq_sales/a",
         "/sap/bw/modeling/query/zq_sales/m",
@@ -939,6 +952,122 @@ def test_query_accept_prefers_discovered_media_type_then_static_range() -> None:
     assert accept.count("application/vnd.sap.bw.modeling.query-v1_12_0+xml") == 1
 
 
+def test_bw_client_fetch_query_prefers_discovered_media_type_and_caches_in_memory() -> None:
+    seen_paths: list[str] = []
+    seen_accepts: list[str] = []
+
+    discovery_xml = """
+    <app:service xmlns:app="http://www.w3.org/2007/app">
+      <app:workspace>
+        <app:collection href="/sap/bw/modeling/query">
+          <app:accept>application/vnd.sap.bw.modeling.query-v1_10_0+json</app:accept>
+          <app:accept>application/vnd.sap.bw.modeling.query-v1_11_0+xml</app:accept>
+          <app:accept>application/vnd.sap.bw.modeling.query-v1_12_0+xml</app:accept>
+        </app:collection>
+      </app:workspace>
+    </app:service>
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        seen_accepts.append(request.headers["accept"])
+        if request.url.path == "/sap/bw/modeling/discovery":
+            return httpx.Response(
+                200,
+                text=discovery_xml,
+                headers={"content-type": "application/atomsvc+xml"},
+            )
+        if request.url.path == "/sap/bw/modeling/repo/is/systeminfo":
+            return httpx.Response(
+                200,
+                text="<systeminfo />",
+                headers={"x-csrf-token": "csrf-token"},
+            )
+        return httpx.Response(
+            200,
+            text='<Qry:queryResource technicalName="ZQ_SALES" />',
+            headers={"content-type": "application/vnd.sap.bw.modeling.query-v1_12_0+xml"},
+        )
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username="fixture-user",
+        password="[REDACTED]",
+        sap_client="100",
+        language="EN",
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+
+    try:
+        assert client.fetch_query("ZQ_SALES") == '<Qry:queryResource technicalName="ZQ_SALES" />'
+        assert client.fetch_query("ZQ_SALES") == '<Qry:queryResource technicalName="ZQ_SALES" />'
+    finally:
+        client.close()
+
+    assert seen_paths == [
+        "/sap/bw/modeling/discovery",
+        "/sap/bw/modeling/repo/is/systeminfo",
+        "/sap/bw/modeling/query/zq_sales/a",
+        "/sap/bw/modeling/query/zq_sales/a",
+    ]
+    query_accepts = [accept for accept in seen_accepts if "query-" in accept]
+    assert len(query_accepts) == 2
+    for accept in query_accepts:
+        assert accept.startswith("application/vnd.sap.bw.modeling.query-v1_12_0+xml, ")
+        assert "application/vnd.sap.bw.modeling.query-v1_8_0+xml" in accept
+        assert "application/vnd.sap.bw.modeling.query-v1_10_0+json" not in accept
+
+
+def test_bw_client_discovery_failure_keeps_query_static_accept_fallback() -> None:
+    seen_paths: list[str] = []
+    seen_accepts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        seen_accepts.append(request.headers["accept"])
+        if request.url.path == "/sap/bw/modeling/discovery":
+            return httpx.Response(
+                500,
+                text="password=leaky-secret Cookie: SAP_SESSIONID=leaky",
+            )
+        if request.url.path == "/sap/bw/modeling/repo/is/systeminfo":
+            return httpx.Response(
+                200,
+                text="<systeminfo />",
+                headers={"x-csrf-token": "csrf-token"},
+            )
+        return httpx.Response(
+            200,
+            text='<Qry:queryResource technicalName="ZQ_SALES" />',
+            headers={"content-type": ACCEPT_HEADERS["query"]},
+        )
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username="fixture-user",
+        password="[REDACTED]",
+        sap_client="100",
+        language="EN",
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+
+    try:
+        assert client.fetch_query("ZQ_SALES") == '<Qry:queryResource technicalName="ZQ_SALES" />'
+    finally:
+        client.close()
+
+    assert seen_paths == [
+        "/sap/bw/modeling/discovery",
+        "/sap/bw/modeling/repo/is/systeminfo",
+        "/sap/bw/modeling/query/zq_sales/a",
+    ]
+    assert seen_accepts[-1] == ACCEPT_HEADERS["query"]
+    assert "leaky-secret" not in seen_accepts[-1]
+    assert "SAP_SESSIONID" not in seen_accepts[-1]
+
+
 def test_bw_client_fetch_query_negotiates_on_406_415_then_404() -> None:
     seen_paths: list[str] = []
     seen_methods: list[str] = []
@@ -975,9 +1104,49 @@ def test_bw_client_fetch_query_negotiates_on_406_415_then_404() -> None:
     finally:
         client.close()
 
-    assert seen_methods == ["GET", "GET", "GET"]
+    assert seen_methods == ["GET", "GET", "GET", "GET"]
     assert seen_paths == [
+        "/sap/bw/modeling/discovery",
         "/sap/bw/modeling/repo/is/systeminfo",
         "/sap/bw/modeling/query/zq_sales/a",
         "/sap/bw/modeling/query/zq_sales/m",
     ]
+
+
+def test_request_monitor_error_is_redacted() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sap/bw/modeling/repo/is/systeminfo":
+            return httpx.Response(
+                200,
+                text="<systeminfo />",
+                headers={"x-csrf-token": "csrf-token"},
+            )
+        return httpx.Response(
+            500,
+            text=(
+                "request monitor failed password=leaky-secret "
+                "url=https://bw.example.invalid/sap/bw"
+            ),
+        )
+
+    client = BwClient(
+        base_url="https://bw.example.invalid",
+        username="fixture-user",
+        password="[REDACTED]",
+        sap_client="100",
+        language="EN",
+        transport=httpx.MockTransport(handler),
+        trust_env=False,
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            client.fetch_list_requests("ZADSO_SALES")
+    finally:
+        client.close()
+
+    message = str(exc_info.value)
+    assert "HTTP 500" in message
+    assert "redacted" in message
+    assert "leaky-secret" not in message
+    assert "bw.example.invalid" not in message

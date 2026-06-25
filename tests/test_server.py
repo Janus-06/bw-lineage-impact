@@ -841,3 +841,68 @@ def test_capture_snapshot_returns_error_when_every_live_call_fails(tmp_path: Pat
     assert "bw_get_dataflow" in response.text
     assert "mock-leaked-bw-password" not in response.text
     assert "bw.example.invalid" not in response.text
+
+
+def test_assistant_review_endpoint_is_read_only_fallback_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BWLI_HOME", str(tmp_path / "bwli-home"))
+    for name in ["BWLI_LLM_BASE_URL", "BWLI_LLM_MODEL", "BWLI_LLM_API_KEY"]:
+        monkeypatch.delenv(name, raising=False)
+    fake = FakeLiveBwClient()
+    client = TestClient(create_app(project_root=Path.cwd(), bw_client_factory=lambda _state: fake))
+    captured = client.post(
+        "/api/v1/snapshots/capture",
+        json={"fixture_path": str(FIXTURES / "sample-graph.json")},
+    )
+    assert captured.status_code == 200, captured.text
+    snapshot_id = captured.json()["id"]
+
+    response = client.post(
+        f"/api/v1/snapshots/{snapshot_id}/assistant/review",
+        json={
+            "object_id": "SRC",
+            "prompt": (
+                "Review CAB risk. password=do-not-render-secret "
+                "raw_snapshot_payload: do-not-render-raw"
+            ),
+            "context": [
+                {
+                    "id": "impact:finding-1",
+                    "kind": "impact",
+                    "title": "HIGH impact · TR",
+                    "body": (
+                        "Deterministic impact finding for TR. "
+                        "password=do-not-render-secret raw_snapshot_payload: do-not-render-raw"
+                    ),
+                    "object_id": "TR",
+                    "object_type": "TRFN",
+                    "citation_id": "impact:finding-1",
+                    "source_ids": ["node:TR", "edge:SRC->TR"],
+                },
+                {
+                    "id": "manual:gap-1",
+                    "kind": "manual_check",
+                    "title": "Manual BWMT gap",
+                    "body": "Verify activation and transport scope in Eclipse/BWMT.",
+                    "object_id": "TR",
+                    "object_type": "TRFN",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert fake.calls == []
+    assert "do-not-render-secret" not in response.text
+    assert "do-not-render-raw" not in response.text
+    payload = response.json()
+    assert payload["status"] == "disabled"
+    assert payload["safety"]["no_live_bw_calls"] is True
+    assert payload["safety"]["no_bw_query_execution"] is True
+    assert payload["safety"]["no_data_preview"] is True
+    assert payload["safety"]["deterministic_authority"] == "impact.py"
+    assert any(citation.startswith("ctx:") for citation in payload["citations"])
+    assert payload["manual_checks"]
+    assert {check["tool"] for check in payload["manual_checks"]} >= {"BWMT", "Eclipse"}

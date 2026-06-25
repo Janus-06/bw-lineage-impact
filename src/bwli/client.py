@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
+from xml.etree import ElementTree
 
 import httpx
 
@@ -16,6 +18,7 @@ from bwli.endpoints import (
     build_composite_provider_endpoint,
     build_dataflow_endpoint,
     build_datasource_endpoint,
+    build_discovery_endpoint,
     build_dtp_endpoint,
     build_get_request_endpoint,
     build_hcpr_endpoint,
@@ -40,6 +43,7 @@ ECLIPSE_USER_AGENT = (
 _ADT_PROFILING = "server-time"
 _ADT_SESSION_TYPE = "stateful"
 _BWMT_LEVEL = "50"
+_VERSIONED_XML_MEDIA_TYPE_RE = re.compile(r"-v(\d+)_(\d+)_(\d+)\+xml$")
 
 
 class BwClient:
@@ -72,6 +76,8 @@ class BwClient:
         self._frozen_cookie_names = set(
             frozen_cookie_names if frozen_cookie_names is not None else self._cookies
         )
+        self._discovery_attempted = False
+        self._discovered_accept_media_types: dict[str, str] = {}
         if self._cookie_mode and not self._cookies:
             raise ValueError("cookie mode requires at least one initial cookie")
         if self._cookie_mode:
@@ -170,10 +176,19 @@ class BwClient:
         return self._fetch(build_source_system_endpoint(source_system))
 
     def fetch_query(self, query_name: str) -> Any:
+        discovered_accept = self._discovered_accept_media_type("query")
         return self._fetch_with_fallback(
             [
-                build_query_endpoint(query_name, active=True),
-                build_query_endpoint(query_name, active=False),
+                build_query_endpoint(
+                    query_name,
+                    active=True,
+                    discovered_accept=discovered_accept,
+                ),
+                build_query_endpoint(
+                    query_name,
+                    active=False,
+                    discovered_accept=discovered_accept,
+                ),
             ],
             fallback_statuses={404, 406, 415},
         )
@@ -216,15 +231,17 @@ class BwClient:
         if not self._read_requests_use_frozen_cookies():
             self._ensure_session()
         response: httpx.Response | None = None
+        requested_endpoint: Endpoint | None = None
         for index, endpoint in enumerate(endpoints):
+            requested_endpoint = endpoint
             response = self._request_read_with_auth_retry(endpoint)
             is_last = index == len(endpoints) - 1
             if not is_last and response.status_code in fallback_statuses:
                 continue
             break
-        if response is None:
+        if response is None or requested_endpoint is None:
             raise RuntimeError("no BW endpoint was requested")
-        return self._response_payload(response)
+        return self._response_payload(response, endpoint=requested_endpoint)
 
     def _request_read_with_auth_retry(self, endpoint: Endpoint) -> httpx.Response:
         response = self._request_read(endpoint)
@@ -234,7 +251,7 @@ class BwClient:
         self._ensure_session()
         return self._request_read(endpoint)
 
-    def _response_payload(self, response: httpx.Response) -> Any:
+    def _response_payload(self, response: httpx.Response, *, endpoint: Endpoint) -> Any:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -242,6 +259,11 @@ class BwClient:
                 raise RuntimeError(
                     "BW cookie authentication failed "
                     f"(HTTP {response.status_code}); refresh BW_COOKIE_FILE and retry."
+                ) from exc
+            if _is_request_monitor_endpoint(endpoint):
+                raise RuntimeError(
+                    "BW request monitor read failed "
+                    f"(HTTP {response.status_code}); response details were redacted."
                 ) from exc
             raise
         content_type = response.headers.get("content-type", "")
@@ -269,6 +291,33 @@ class BwClient:
         )
         self._update_cookies(response)
         return response
+
+    def _discovered_accept_media_type(self, kind: str) -> str | None:
+        self._ensure_discovery_media_types_loaded()
+        return self._discovered_accept_media_types.get(kind)
+
+    def _ensure_discovery_media_types_loaded(self) -> None:
+        """Best-effort in-memory discovery for read-only Accept negotiation.
+
+        Discovery failures are deliberately non-fatal: the static Accept ranges in
+        bwli.endpoints remain the compatibility fallback, and no response body,
+        URL, cookie, or credential details are retained.
+        """
+
+        if self._discovery_attempted:
+            return
+        self._discovery_attempted = True
+        try:
+            response = self._request_read(build_discovery_endpoint())
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"BW discovery read failed (HTTP {response.status_code})"
+                )
+            self._discovered_accept_media_types = _extract_discovery_accept_media_types(
+                response.text
+            )
+        except Exception:
+            self._discovered_accept_media_types = {}
 
     def _ensure_session(self) -> None:
         if not self._csrf_session_is_stale():
@@ -380,3 +429,47 @@ def _no_proxy_covers_host(entries: list[str], host: str) -> bool:
         ):
             return True
     return False
+
+
+def _is_request_monitor_endpoint(endpoint: Endpoint) -> bool:
+    return endpoint.path.startswith("/sap/bc/http/sap/bw4/v1/manage/requests")
+
+
+def _extract_discovery_accept_media_types(xml: str) -> dict[str, str]:
+    """Return highest versioned XML Accept media type per discovery collection."""
+
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return {}
+
+    discovered: dict[str, str] = {}
+    for collection in root.iter():
+        if _xml_local_name(collection.tag) != "collection":
+            continue
+        href = collection.attrib.get("href", "").strip()
+        key = href.rstrip("/").rsplit("/", 1)[-1].lower()
+        if not key:
+            continue
+        scored: list[tuple[tuple[int, int, int], str]] = []
+        for child in collection:
+            if _xml_local_name(child.tag) != "accept" or child.text is None:
+                continue
+            media_type = child.text.strip()
+            score = _media_type_version_score(media_type)
+            if score is not None:
+                scored.append((score, media_type))
+        if scored:
+            discovered[key] = max(scored, key=lambda item: item[0])[1]
+    return discovered
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _media_type_version_score(media_type: str) -> tuple[int, int, int] | None:
+    match = _VERSIONED_XML_MEDIA_TYPE_RE.search(media_type)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))

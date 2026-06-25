@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from bwli import __version__
 from bwli.client import BwClient
@@ -1102,6 +1102,28 @@ def create_app(
             )
             assert_no_persisted_secrets(run.model_dump(mode="json"))
             return run
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/v1/snapshots/{snapshot_id}/assistant/review")
+    def assistant_review_v1(
+        snapshot_id: str,
+        request: dict[str, object],
+    ) -> dict[str, object]:
+        try:
+            _ensure_snapshot_exists(catalog_store, snapshot_id)
+            assistant_request = _assistant_review_request(
+                catalog_store,
+                snapshot_id=snapshot_id,
+                payload=request,
+            )
+            response = _assistant_review_payload(
+                runtime_config=runtime_config,
+                request=assistant_request,
+            )
+            response_payload = response.model_dump(mode="json")
+            assert_no_persisted_secrets(response_payload)
+            return cast(dict[str, object], response_payload)
         except Exception as exc:
             raise _http_error(exc) from exc
 
@@ -2931,6 +2953,100 @@ def _agentic_review_budget(request: V1AgenticReviewRequest) -> Any:
     }
     budget_cls = _agentic_review_budget_class()
     return budget_cls(**overrides)
+
+
+def _assistant_review_request_class() -> Any:
+    module = import_module("bwli.llm.assistant_context")
+    return module.AssistantReviewRequest
+
+
+def _assistant_review_module() -> Any:
+    return import_module("bwli.llm.assistant")
+
+
+def _assistant_review_request(
+    store: CatalogStore,
+    *,
+    snapshot_id: str,
+    payload: Mapping[str, object],
+) -> Any:
+    request_payload = dict(payload)
+    request_payload["snapshot_id"] = snapshot_id
+    raw_context_items = request_payload.get("context")
+    context_items = list(raw_context_items) if isinstance(raw_context_items, list) else []
+    object_id = _text_value(request_payload.get("object_id"))
+    if object_id:
+        object_context = _assistant_object_context(store, snapshot_id, object_id)
+        object_context_id = str(object_context["id"]) if object_context is not None else ""
+        if object_context is not None and not _context_has_id(context_items, object_context_id):
+            context_items.insert(0, object_context)
+    request_payload["context"] = context_items
+    request_cls = _assistant_review_request_class()
+    try:
+        return request_cls.model_validate(request_payload)
+    except ValidationError as exc:
+        message = _safe_model_validation_error(exc, model_name="assistant review request")
+        raise ValueError(message) from exc
+
+
+def _assistant_review_payload(
+    *,
+    runtime_config: RuntimeConfigState,
+    request: Any,
+) -> Any:
+    runtime: LlmRuntimeConfig | None = None
+    if runtime_config.llm.enabled and runtime_config.llm.configured:
+        if (
+            not runtime_config.llm.base_url
+            or not runtime_config.llm.model
+            or not runtime_config.llm.api_key
+        ):
+            raise ConfigError("LLM runtime config is incomplete")
+        runtime = LlmRuntimeConfig(
+            base_url=runtime_config.llm.base_url,
+            model=runtime_config.llm.model,
+            api_key=SecretStr(runtime_config.llm.api_key),
+        )
+    module = _assistant_review_module()
+    return module.review_assistant(request, runtime=runtime)
+
+
+def _assistant_object_context(
+    store: CatalogStore,
+    snapshot_id: str,
+    object_id: str,
+) -> dict[str, object] | None:
+    item = store.get_object(snapshot_id, object_id)
+    if item is None:
+        return None
+    summary = item.label or item.name or f"Selected snapshot object {item.id}."
+    counts = f"incoming={item.incoming_count}; outgoing={item.outgoing_count}"
+    return {
+        "id": f"object:{item.id}",
+        "kind": "object",
+        "title": f"{item.type} · {item.id}",
+        "body": f"{summary} Snapshot metadata only. {counts}.",
+        "object_id": item.id,
+        "object_type": item.type,
+        "citation_id": f"node:{item.id}",
+        "source_ids": item.evidence_ids,
+    }
+
+
+def _context_has_id(context_items: Sequence[object], context_id: str) -> bool:
+    return any(
+        isinstance(item, Mapping) and item.get("id") == context_id for item in context_items
+    )
+
+
+def _safe_model_validation_error(exc: ValidationError, *, model_name: str) -> str:
+    locations = []
+    for error in exc.errors(include_input=False):
+        loc = error.get("loc")
+        if isinstance(loc, tuple):
+            locations.append(".".join(str(part) for part in loc))
+    suffix = f": {', '.join(locations[:6])}" if locations else ""
+    return f"invalid {model_name}{suffix}"
 
 
 def _agentic_review_enricher(

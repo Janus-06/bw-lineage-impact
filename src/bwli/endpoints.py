@@ -29,6 +29,7 @@ _HCPR_ACCEPT = ",".join(
 )
 
 ACCEPT_HEADERS: dict[str, str] = {
+    "discovery": "application/atomsvc+xml",
     "search": "application/atom+xml;type=feed",
     "xref": "application/xml, application/atom+xml;type=feed",
     "dataflow": "application/vnd.sap.bw.modeling.dmod-v1_0_0+xml",
@@ -66,6 +67,14 @@ class Endpoint:
     params: dict[str, Any]
     accept: str
     headers: dict[str, str] = field(default_factory=dict)
+
+
+def build_discovery_endpoint() -> Endpoint:
+    return Endpoint(
+        path="/sap/bw/modeling/discovery",
+        params={},
+        accept=ACCEPT_HEADERS["discovery"],
+    )
 
 
 def build_search_endpoint(search_term: str, *, object_type: str | None = None) -> Endpoint:

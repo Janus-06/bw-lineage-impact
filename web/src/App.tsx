@@ -16,6 +16,7 @@ import {
   getRuntimeConfig,
   listObjects,
   listSnapshots,
+  postAssistantReview,
   postConnectionTest,
   postAgenticReview,
   postImpactAdvice,
@@ -30,6 +31,8 @@ import {
   refreshSnapshotFromBw,
   searchBwObjects,
   type AppTab,
+  type AssistantEvidenceContext,
+  type AssistantReviewResponse,
   type BwSearchItem,
   type CaptureScopeItem,
   type CatalogObject,
@@ -103,6 +106,94 @@ const changeTypes: ChangeType[] = [
   'dtp_filter_changed',
   'compositeprovider_mapping_changed',
 ];
+const fieldOrientedChangeTypes: ChangeType[] = [
+  'field_removed',
+  'field_type_changed',
+  'infoobject_attribute_changed',
+  'infoobject_type_changed',
+];
+type ImpactScenarioId = 'field-change' | 'transformation-logic' | 'dtp-chain' | 'provider-query' | 'freshness-risk';
+interface ImpactScenarioCard {
+  id: ImpactScenarioId;
+  title: string;
+  description: string;
+  changeType: ChangeType;
+  changeTypes: ChangeType[];
+  fieldOriented: boolean;
+  defaultDescription: string;
+  hint: string;
+}
+const impactScenarioCards: ImpactScenarioCard[] = [
+  {
+    id: 'field-change',
+    title: 'ADSO / InfoObject field change',
+    description: 'Field removal, type change, or InfoObject attribute/type metadata change.',
+    changeType: 'field_removed',
+    changeTypes: fieldOrientedChangeTypes,
+    fieldOriented: true,
+    defaultDescription: 'ADSO / InfoObject field change impact review',
+    hint: 'Auto-selects a field from metadata when available; manual entry remains available for sparse snapshots.',
+  },
+  {
+    id: 'transformation-logic',
+    title: 'Transformation logic change',
+    description: 'Routine, formula, or mapping logic changed in the transformation layer.',
+    changeType: 'routine_changed',
+    changeTypes: ['routine_changed'],
+    fieldOriented: false,
+    defaultDescription: 'Transformation logic change impact review',
+    hint: 'No field input is required; describe the changed routine or formula if known.',
+  },
+  {
+    id: 'dtp-chain',
+    title: 'DTP / Process Chain change',
+    description: 'DTP filter, extraction scope, or process-chain orchestration changed.',
+    changeType: 'dtp_filter_changed',
+    changeTypes: ['dtp_filter_changed'],
+    fieldOriented: false,
+    defaultDescription: 'DTP / Process Chain change impact review',
+    hint: 'Uses existing DTP filter change semantics; verify process-chain scheduling manually.',
+  },
+  {
+    id: 'provider-query',
+    title: 'CompositeProvider / Query change',
+    description: 'CompositeProvider mapping or semantic query exposure changed.',
+    changeType: 'compositeprovider_mapping_changed',
+    changeTypes: ['compositeprovider_mapping_changed'],
+    fieldOriented: false,
+    defaultDescription: 'CompositeProvider / Query change impact review',
+    hint: 'Focuses on semantic exposure and query evidence; field input is not forced.',
+  },
+  {
+    id: 'freshness-risk',
+    title: 'Recent load / freshness risk',
+    description: 'Review recent request freshness or load timing risk without adding a backend enum.',
+    changeType: 'dtp_filter_changed',
+    changeTypes: ['dtp_filter_changed'],
+    fieldOriented: false,
+    defaultDescription: 'Recent load / freshness risk review',
+    hint: 'Explanatory scenario only: reuses the existing DTP-safe change type and surfaces freshness/manual checks.',
+  },
+];
+const impactScenarioDefaultDescriptions = new Set(impactScenarioCards.map((card) => card.defaultDescription));
+const askReviewPresets = [
+  {
+    label: 'CAB risk review',
+    prompt: 'Review the selected BW change for CAB risk. Cite deterministic impact findings and call out manual BWMT checks only.',
+  },
+  {
+    label: 'Query exposure',
+    prompt: 'Explain which BW queries may be exposed by this change. Use only query evidence and evidence IDs; do not infer runtime data.',
+  },
+  {
+    label: 'Freshness gaps',
+    prompt: 'Summarize stale, missing, or unknown request freshness evidence for the selected object and downstream impact.',
+  },
+  {
+    label: 'Evidence summary',
+    prompt: 'Produce an evidence-bound answer for the selected object using lineage, impact, and citation IDs. Separate facts from follow-up review items.',
+  },
+];
 
 function parseObjectNamesText(value: string): string[] {
   return value
@@ -115,8 +206,107 @@ function joinObjectNames(values: string[]): string {
   return Array.from(new Set(values)).join(', ');
 }
 
+function isFieldOrientedChangeType(value: ChangeType): boolean {
+  return fieldOrientedChangeTypes.includes(value);
+}
+
+function isImpactScenarioDefaultDescription(value: string): boolean {
+  const description = value.trim();
+  return description === '컬럼/로직 변경 영향 검토' || impactScenarioDefaultDescriptions.has(description);
+}
+
 function isBroadLiveSearchTerm(term: string): boolean {
   return term.trim().replace(/[*%]/g, '').trim() === '';
+}
+
+function buildAssistantContexts(options: {
+  selectedObject: CatalogObject | null;
+  lineage: LineageResponse | null;
+  impactReview: ImpactReviewResponse | null;
+}): AssistantEvidenceContext[] {
+  const contexts: AssistantEvidenceContext[] = [];
+  const { selectedObject, lineage, impactReview } = options;
+  if (selectedObject) {
+    contexts.push({
+      id: `object:${selectedObject.id}`,
+      kind: 'object',
+      title: `${selectedObject.type} · ${selectedObject.id}`,
+      body: `${selectedObject.label || selectedObject.name || selectedObject.id}. Snapshot metadata only; no raw snapshot payload or data preview is sent.`,
+      object_id: selectedObject.id,
+      object_type: selectedObject.type,
+      citation_id: `node:${selectedObject.id}`,
+      source_ids: selectedObject.evidence_ids,
+    });
+  }
+  if (lineage) {
+    contexts.push({
+      id: `lineage:${lineage.start_id}`,
+      kind: 'lineage',
+      title: `Lineage context · ${lineage.start_id}`,
+      body: `${lineage.direction} lineage contains ${lineage.nodes.length} node(s), ${lineage.edges.length} edge(s), depth ${lineage.depth}, truncated=${String(lineage.truncated)}.`,
+      object_id: lineage.start_id,
+      citation_id: `node:${lineage.start_id}`,
+      source_ids: lineage.evidence_ids.slice(0, 30),
+    });
+  }
+  if (impactReview) {
+    impactReview.impact.findings.slice(0, 8).forEach((finding) => {
+      contexts.push({
+        id: `impact:${finding.id}`,
+        kind: 'impact',
+        title: `${finding.severity} impact · ${finding.impacted_object_id}`,
+        body: `${finding.reason} Confidence=${finding.confidence}. Manual verification=${String(finding.manual_verification)}. Severity is deterministic from impact.py.`,
+        object_id: finding.impacted_object_id,
+        object_type: finding.impacted_object_type,
+        citation_id: `impact:${finding.id}`,
+        source_ids: [...finding.evidence_node_ids, ...finding.evidence_edge_ids],
+      });
+    });
+    impactReview.query_evidence.slice(0, 3).forEach((query) => {
+      contexts.push({
+        id: `query:${query.query_id}`,
+        kind: 'impact_review',
+        title: `Query evidence · ${query.query_id}`,
+        body: `Providers=${query.provider_object_ids.join(', ') || 'none'}; variables=${query.variable_names.join(', ') || 'none'}; filters=${query.filter_count}; manual notes=${query.manual_check_notes.join(' ') || 'none'}.`,
+        object_id: query.query_id,
+        object_type: 'QUERY',
+      });
+    });
+    impactReview.sql_evidence.slice(0, 3).forEach((sql) => {
+      contexts.push({
+        id: `sql:${sql.view_id}`,
+        kind: 'impact_review',
+        title: `SQL reference evidence · ${sql.view_id}`,
+        body: `Parse-only SQL references ${sql.referenced_object_ids.join(', ') || 'no objects'} and ${sql.referenced_column_names.slice(0, 12).join(', ') || 'no columns'}; parser=${sql.parser}; confidence=${sql.confidence}.`,
+        object_id: sql.view_id,
+        object_type: 'NATIVE_SQL_VIEW',
+        source_ids: [...sql.reference_edge_ids, ...sql.fragment_ids],
+      });
+    });
+    impactReview.freshness_evidence.slice(0, 4).forEach((freshness) => {
+      contexts.push({
+        id: `freshness:${freshness.object_id}`,
+        kind: 'freshness',
+        title: `Freshness evidence · ${freshness.object_id}`,
+        body: `Request count=${freshness.request_count}; latest status=${freshness.latest_status ?? 'unknown'}; timestamp=${freshness.latest_timestamp ?? 'unknown'}; evidence_available=${String(freshness.evidence_available)}.`,
+        object_id: freshness.object_id,
+        object_type: freshness.object_type,
+      });
+    });
+    impactReview.manual_verification_gaps.slice(0, 6).forEach((gap) => {
+      contexts.push({
+        id: `manual:${gap.id}`,
+        kind: 'manual_check',
+        title: `Manual verification · ${gap.source}`,
+        body: gap.reason,
+        object_id: gap.object_id,
+        object_type: gap.object_type,
+        citation_id: gap.finding_id ? `impact:${gap.finding_id}` : null,
+        source_ids: gap.evidence_ids,
+      });
+    });
+  }
+  return contexts.slice(0, 12);
 }
 
 interface SetupForm {
@@ -162,7 +352,7 @@ export default function App() {
   const [allowHiddenSelection, setAllowHiddenSelection] = useState(false);
   const [objectDetail, setObjectDetail] = useState<ObjectDetailState | null>(null);
   const [objectFreshness, setObjectFreshness] = useState<ObjectFreshnessState | null>(null);
-  const [activeTab, setActiveTab] = useState<AppTab>(IMPACT_UNIFIED ? 'impact' : 'lineage');
+  const [activeTab, setActiveTab] = useState<AppTab>('lineage');
   const [catalogQuery, setCatalogQuery] = useState('');
   const [objectType, setObjectType] = useState('');
   const [direction, setDirection] = useState<Direction>('downstream');
@@ -170,6 +360,7 @@ export default function App() {
   const [nodeCap, setNodeCap] = useState(25);
   const [edgeCap, setEdgeCap] = useState(60);
   const [changeType, setChangeType] = useState<ChangeType>('field_removed');
+  const [impactScenarioId, setImpactScenarioId] = useState<ImpactScenarioId>('field-change');
   const [fieldName, setFieldName] = useState('AMOUNT');
   const [objectFields, setObjectFields] = useState<ObjectField[]>([]);
   const [queryName, setQueryNameState] = useState('');
@@ -187,6 +378,8 @@ export default function App() {
   const [lineageTourStepIndex, setLineageTourStepIndex] = useState(0);
   const [impact, setImpact] = useState<ImpactScenarioResponse | null>(null);
   const [impactReview, setImpactReview] = useState<ImpactReviewResponse | null>(null);
+  const [assistantReview, setAssistantReview] = useState<AssistantReviewResponse | null>(null);
+  const [assistantPreset, setAssistantPreset] = useState<string | null>(null);
   const [agenticReview, setAgenticReview] = useState<AgenticReviewRun | null>(null);
   const [agenticQuestion, setAgenticQuestion] = useState('');
   const [impactAdvice, setImpactAdvice] = useState<ImpactAdviceResponse | null>(null);
@@ -295,6 +488,7 @@ export default function App() {
       resetImpactFieldSelection();
       invalidateQueryAnalysisRequests();
       setAgenticReview(null);
+      setAssistantReview(null);
     }
     setSelectedSnapshotIdState(snapshotId);
   }
@@ -304,6 +498,7 @@ export default function App() {
       resetImpactFieldSelection();
       invalidateQueryAnalysisRequests();
       setAgenticReview(null);
+      setAssistantReview(null);
     }
     setSelectedObjectIdState(objectId);
   }
@@ -387,6 +582,7 @@ export default function App() {
       setImpact(null);
       setImpactReview(null);
       setAgenticReview(null);
+      setAssistantReview(null);
       setImpactAdvice(null);
       setImpactTour(null);
       setImpactTourStepIndex(0);
@@ -535,6 +731,7 @@ export default function App() {
     setImpact(null);
     setImpactReview(null);
     setAgenticReview(null);
+      setAssistantReview(null);
     setImpactAdvice(null);
     setImpactTour(null);
     setImpactTourStepIndex(0);
@@ -557,6 +754,7 @@ export default function App() {
     setImpact(null);
     setImpactReview(null);
     setAgenticReview(null);
+      setAssistantReview(null);
     setImpactAdvice(null);
     setImpactTour(null);
     setImpactTourStepIndex(0);
@@ -971,6 +1169,7 @@ export default function App() {
     setImpact(null);
     setImpactReview(null);
     setAgenticReview(null);
+      setAssistantReview(null);
     setImpactAdvice(null);
     setImpactTour(null);
     setImpactTourStepIndex(0);
@@ -1008,6 +1207,7 @@ export default function App() {
       setImpact(null);
       setImpactReview(null);
       setAgenticReview(null);
+      setAssistantReview(null);
       setImpactAdvice(null);
       setImpactTour(null);
       setImpactTourStepIndex(0);
@@ -1246,10 +1446,11 @@ export default function App() {
   }
 
   function impactRequestBody() {
+    const field = isFieldOrientedChangeType(changeType) ? fieldName.trim() || null : null;
     return {
       object_id: selectedObjectId,
       change_type: changeType,
-      field: fieldName.trim() || null,
+      field,
       description: scenarioDescription.trim() || null,
       depth: Math.max(impactDepth, 1),
       node_cap: nodeCap,
@@ -1283,6 +1484,7 @@ export default function App() {
     const requestId = nextAnalysisRequestId();
     setBusy('impact');
     setAgenticReview(null);
+      setAssistantReview(null);
     try {
       const scenarioBody = { ...impactRequestBody(), object_id: requestObjectId };
       const [scenarioResponse, reviewResponse] = await Promise.all([
@@ -1314,14 +1516,25 @@ export default function App() {
     const requestId = nextAnalysisRequestId();
     setBusy('impact-agentic');
     setAgenticReview(null);
+    setAssistantReview(null);
     try {
-      const response = await postAgenticReview(requestSnapshotId, {
-        ...impactReviewRequestBody(requestObjectId),
-        question: agenticQuestion.trim() || null,
+      const deterministicPack = impactReview
+        ?? await postImpactReview(requestSnapshotId, impactReviewRequestBody(requestObjectId));
+      if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
+      const response = await postAssistantReview(requestSnapshotId, {
+        prompt: agenticQuestion.trim() || 'Review selected BW lineage and impact evidence.',
+        object_id: requestObjectId,
+        preset: assistantPreset,
+        context: buildAssistantContexts({
+          selectedObject,
+          lineage,
+          impactReview: deterministicPack,
+        }),
+        max_context_items: 12,
       });
       if (!isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) return;
-      setAgenticReview(response);
-      setImpactReview(response.deterministic_pack);
+      setAssistantReview(response);
+      setImpactReview(deterministicPack);
       setError('');
     } catch (err) {
       if (isCurrentAnalysisRequest(requestId, requestSnapshotId, requestObjectId)) {
@@ -1474,15 +1687,15 @@ export default function App() {
       <header className={`topStatus ${topStatusScrolled ? 'scrolled' : ''}`}>
         <div className="brandBlock">
           <div>
-            <strong>BW Lineage Impact Workbench · Slice G</strong>
-            <span>Layer lanes · Evidence Walkthroughs · Read-only metadata</span>
+            <strong>BW Lineage / Impact / Ask BW Review</strong>
+            <span>Enterprise metadata workbench · local-first · evidence-bound LLM</span>
           </div>
         </div>
         <div className="statusStrip">
           <StatusPill label="BW" value={bwStatus(runtime)} tone={runtime?.connection_status === 'ok' ? 'ok' : runtime?.bw.configured ? 'warn' : 'warn'} />
           <StatusPill label="Basis" value={latestSnapshotLabel} tone={selectedSnapshot ? 'info' : 'warn'} />
           <StatusPill label="LLM" value={runtime?.llm.configured ? 'local 설정됨' : 'disabled'} tone="neutral" />
-          <StatusPill label="Safety" value="read-only · no rows" tone="ok" />
+          <StatusPill label="Safety" value="read-only metadata · no rows" tone="ok" />
         </div>
         <button className="ghostButton" onClick={() => setDiagnosticsOpen((value) => !value)}>
           Settings
@@ -2020,6 +2233,7 @@ export default function App() {
                     setImpact(null);
                 setImpactReview(null);
                 setAgenticReview(null);
+      setAssistantReview(null);
                     setImpactAdvice(null);
                     setImpactTour(null);
                     setImpactTourStepIndex(0);
@@ -2051,10 +2265,19 @@ export default function App() {
           <nav className="tabBar">
             <TabButton id="lineage" active={activeTab} onClick={setActiveTab} label="Lineage" />
             <TabButton id="impact" active={activeTab} onClick={setActiveTab} label="Impact" />
+            <TabButton id="ask" active={activeTab} onClick={setActiveTab} label="Ask BW / Review" />
             {!IMPACT_UNIFIED ? <TabButton id="query" active={activeTab} onClick={setActiveTab} label="Query Analysis" /> : null}
             {!IMPACT_UNIFIED ? <TabButton id="sql" active={activeTab} onClick={setActiveTab} label="SQL Analysis" /> : null}
             {GLOSSARY_VISIBLE ? <TabButton id="glossary" active={activeTab} onClick={setActiveTab} label="Glossary" /> : null}
           </nav>
+
+          <WorkspaceContextBar
+            activeTab={activeTab}
+            selectedObject={selectedObject}
+            selectedSnapshot={selectedSnapshot}
+            lineage={lineage}
+            impactReview={impactReview}
+          />
 
           {activeTab === 'lineage' ? (
             <LineageTab
@@ -2077,6 +2300,7 @@ export default function App() {
               onRun={() => void runLineage()}
               onAdvice={() => void runLineageAdvice()}
               onTour={() => void runLineageTour()}
+              onOpenAsk={() => setActiveTab('ask')}
               tourStepIndex={lineageTourStepIndex}
               setTourStepIndex={setLineageTourStepIndex}
               onSelect={(id) => {
@@ -2089,6 +2313,7 @@ export default function App() {
                 setImpact(null);
                 setImpactReview(null);
                 setAgenticReview(null);
+      setAssistantReview(null);
                 setImpactAdvice(null);
                 setImpactTour(null);
               }}
@@ -2101,6 +2326,7 @@ export default function App() {
                 setImpact(null);
                 setImpactReview(null);
                 setAgenticReview(null);
+      setAssistantReview(null);
                 setImpactAdvice(null);
                 setImpactTour(null);
                 void runLineage(id);
@@ -2114,6 +2340,8 @@ export default function App() {
           {activeTab === 'impact' ? (
             <ImpactTab
               selectedObject={selectedObject}
+              scenarioId={impactScenarioId}
+              setScenarioId={setImpactScenarioId}
               changeType={changeType}
               setChangeType={setChangeType}
               fieldName={fieldName}
@@ -2127,10 +2355,6 @@ export default function App() {
               onAdvice={() => void runImpactAdvice()}
               impact={impact}
               impactReview={impactReview}
-              agenticReview={agenticReview}
-              agenticQuestion={agenticQuestion}
-              setAgenticQuestion={setAgenticQuestion}
-              onAgenticReview={() => void runAgenticReview()}
               impactAdvice={impactAdvice}
               impactTour={impactTour}
               objectFreshness={selectedFreshness}
@@ -2151,6 +2375,29 @@ export default function App() {
               onTour={() => void runImpactTour()}
               tourStepIndex={impactTourStepIndex}
               setTourStepIndex={setImpactTourStepIndex}
+              onOpenAsk={() => setActiveTab('ask')}
+            />
+          ) : null}
+
+          {activeTab === 'ask' ? (
+            <AskReviewTab
+              selectedObject={selectedObject}
+              lineage={lineage}
+              impact={impact}
+              impactReview={impactReview}
+              assistantReview={assistantReview}
+              agenticReview={agenticReview}
+              agenticQuestion={agenticQuestion}
+              setAgenticQuestion={(value) => {
+                setAgenticQuestion(value);
+                setAssistantPreset(null);
+              }}
+              setAssistantPreset={setAssistantPreset}
+              onAgenticReview={() => void runAgenticReview()}
+              onOpenLineage={() => setActiveTab('lineage')}
+              onOpenImpact={() => setActiveTab('impact')}
+              busy={busy === 'impact-agentic'}
+              disabled={!selectedObject || busy === 'impact' || busy === 'impact-advice' || busy === 'impact-tour'}
             />
           ) : null}
 
@@ -2206,6 +2453,7 @@ export default function App() {
                 setImpact(null);
                 setImpactReview(null);
                 setAgenticReview(null);
+      setAssistantReview(null);
                 setImpactAdvice(null);
                 setImpactTour(null);
                 setImpactTourStepIndex(0);
@@ -2218,6 +2466,150 @@ export default function App() {
           ) : null}
         </section>
       </main>
+    </div>
+  );
+}
+
+function WorkspaceContextBar(props: {
+  activeTab: AppTab;
+  selectedObject: CatalogObject | null;
+  selectedSnapshot: SnapshotSummary | null;
+  lineage: LineageResponse | null;
+  impactReview: ImpactReviewResponse | null;
+}) {
+  const activeTask = props.activeTab === 'lineage'
+    ? 'Lineage'
+    : props.activeTab === 'impact'
+      ? 'Impact'
+      : props.activeTab === 'ask'
+        ? 'Ask BW / Review'
+        : props.activeTab;
+  const objectLabel = props.selectedObject
+    ? `${props.selectedObject.type} · ${props.selectedObject.id}`
+    : 'No object selected';
+  const evidenceLabel = props.impactReview
+    ? `${props.impactReview.impact.findings.length} findings · ${props.impactReview.manual_verification_gaps.length} manual checks`
+    : props.lineage
+      ? `${props.lineage.nodes.length} lineage nodes · ${props.lineage.evidence_ids.length} evidence IDs`
+      : 'Run Lineage or Impact to build evidence';
+
+  return (
+    <div className="workspaceContextBar" aria-label="selected object and safety context">
+      <div>
+        <span className="eyebrow">Selected object</span>
+        <strong>{objectLabel}</strong>
+      </div>
+      <div>
+        <span className="eyebrow">Task</span>
+        <strong>{activeTask}</strong>
+      </div>
+      <div>
+        <span className="eyebrow">Evidence</span>
+        <strong>{evidenceLabel}</strong>
+      </div>
+      <div>
+        <span className="eyebrow">Safety</span>
+        <strong>Read-only metadata · no BW query execution · no data preview · local-first · evidence-bound LLM</strong>
+      </div>
+      <div>
+        <span className="eyebrow">Basis</span>
+        <strong>{props.selectedSnapshot ? compactDate(props.selectedSnapshot.created_at) : 'none'}</strong>
+      </div>
+    </div>
+  );
+}
+
+interface AssistantPresetLink {
+  label: string;
+  description: string;
+  onClick: () => void;
+  disabled?: boolean;
+}
+
+function AssistantPresetLinks(props: { title: string; presets: AssistantPresetLink[] }) {
+  return (
+    <div className="assistantPresetBlock" aria-label={props.title}>
+      <span className="eyebrow">{props.title}</span>
+      <div className="assistantPresetGrid">
+        {props.presets.map((preset) => (
+          <button
+            key={preset.label}
+            type="button"
+            className="assistantPresetButton"
+            onClick={preset.onClick}
+            disabled={preset.disabled}
+          >
+            <strong>{preset.label}</strong>
+            <small>{preset.description}</small>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AskReviewTab(props: {
+  selectedObject: CatalogObject | null;
+  lineage: LineageResponse | null;
+  impact: ImpactScenarioResponse | null;
+  impactReview: ImpactReviewResponse | null;
+  assistantReview: AssistantReviewResponse | null;
+  agenticReview: AgenticReviewRun | null;
+  agenticQuestion: string;
+  setAgenticQuestion: (value: string) => void;
+  setAssistantPreset: (value: string | null) => void;
+  onAgenticReview: () => void;
+  onOpenLineage: () => void;
+  onOpenImpact: () => void;
+  busy: boolean;
+  disabled: boolean;
+}) {
+  const impactSummary = deriveImpactSummary(props.impact);
+  const reviewDisabled = props.disabled || !props.selectedObject;
+  return (
+    <div className="askReviewLayout">
+      <section className="controlCard askLauncherCard">
+        <span className="eyebrow">Ask BW / Review</span>
+        <h1>Ask over lineage and impact evidence</h1>
+        <p className="tabPurpose">
+          Assistant answers are bounded to local metadata, deterministic impact evidence, and citation IDs through the unified assistant review endpoint.
+        </p>
+        <div className="scenarioObject">선택 object: <strong>{props.selectedObject?.id ?? '없음'}</strong></div>
+        <div className="assistantReadinessGrid">
+          <Metric label="Lineage evidence" value={props.lineage ? `${props.lineage.nodes.length} nodes` : 'not run'} />
+          <Metric label="Impact grade" value={impactSummary.gradeLabel} />
+          <Metric label="Review pack" value={props.impactReview ? `${props.impactReview.impact.findings.length} findings` : 'not run'} />
+        </div>
+        <AssistantPresetLinks
+          title="Preset questions"
+          presets={askReviewPresets.map((preset) => ({
+            label: preset.label,
+            description: 'Fill review objective',
+            onClick: () => {
+              props.setAgenticQuestion(preset.prompt);
+              props.setAssistantPreset(preset.label);
+            },
+            disabled: !props.selectedObject,
+          }))}
+        />
+        <div className="assistantLinkRow" aria-label="evidence setup links">
+          <button type="button" className="ghostButton" onClick={props.onOpenLineage}>Open Lineage</button>
+          <button type="button" className="ghostButton" onClick={props.onOpenImpact}>Open Impact</button>
+        </div>
+        <p className="policyNote">Read-only metadata · no BW query execution · no data preview · local-first · evidence-bound LLM.</p>
+      </section>
+      <section className="resultCard assistantResultCard">
+        <AgenticReviewWorkspace
+          assistantReview={props.assistantReview}
+          review={props.agenticReview}
+          deterministicPack={props.impactReview}
+          question={props.agenticQuestion}
+          setQuestion={props.setAgenticQuestion}
+          onRun={props.onAgenticReview}
+          busy={props.busy}
+          disabled={reviewDisabled}
+        />
+      </section>
     </div>
   );
 }
@@ -2242,6 +2634,7 @@ function LineageTab(props: {
   onRun: () => void;
   onAdvice: () => void;
   onTour: () => void;
+  onOpenAsk: () => void;
   tourStepIndex: number;
   setTourStepIndex: (value: number) => void;
   onSelect: (id: string) => void;
@@ -2262,6 +2655,17 @@ function LineageTab(props: {
   const selectedFreshnessDisplay = classifyFreshness(props.objectFreshness ?? freshnessFromMetadata(props.objectDetail?.metadata) ?? freshnessFromMetadata(props.selectedObject?.metadata));
   const tourSteps = normalizeGuidedTourSteps(props.lineageTour);
   const currentTourIndex = clampTourIndex(props.tourStepIndex, tourSteps);
+  const directionOptions: Array<{ value: Direction; label: string; hint: string }> = [
+    { value: 'upstream', label: 'Upstream', hint: '소스/상위 의존성' },
+    { value: 'downstream', label: 'Downstream', hint: '소비/하위 영향' },
+    { value: 'both', label: 'Both', hint: '양방향 흐름' },
+  ];
+  const evidenceHealth: Array<{ label: string; value: string; tone: 'ok' | 'warn' | 'info' | 'neutral' }> = [
+    lineageHealthItem('Dataflow', props.selectedObject, props.lineage),
+    whereUsedHealthItem('Where-used', props.selectedObject, props.lineage, props.direction),
+    objectDetailHealthItem('Object detail', props.selectedObject, props.objectDetail),
+    freshnessHealthItem('Freshness', selectedFreshnessDisplay, props.objectFreshness),
+  ];
 
   return (
     <div className="workspaceGrid sliceGWorkspaceGrid">
@@ -2295,31 +2699,83 @@ function LineageTab(props: {
       <section className="controlCard">
         <div className="sectionTitle">
           <span className="eyebrow">Lineage</span>
-          <h1>{props.selectedObject?.id ?? '객체 선택'}</h1>
-          <p className="tabPurpose">Layer lanes show Source → Transform → Model → Semantic → Runtime with request freshness context.</p>
+          <h1>Trace Lineage / 흐름 보기</h1>
+          <p className="tabPurpose">Source → Transform → Model → Semantic → Runtime lane flow. Read-only metadata only; no data rows or BW query execution.</p>
           <p>{props.graphStats}</p>
         </div>
-        <div className="compactForm three">
-          <label>Direction
-            <select value={props.direction} onChange={(event) => props.setDirection(event.target.value as Direction)}>
-              <option value="downstream">Downstream</option>
-              <option value="upstream">Upstream</option>
-              <option value="both">Both</option>
-            </select>
-          </label>
-          <NumberField label="Depth" value={props.depth} min={0} max={20} onChange={props.setDepth} />
-          <NumberField label="Node cap" value={props.nodeCap} min={1} max={500} onChange={props.setNodeCap} />
-          <NumberField label="Edge cap" value={props.edgeCap} min={0} max={1000} onChange={props.setEdgeCap} />
+
+        <div className="lineageObjectContext" aria-label="selected object context">
+          <span>Selected object</span>
+          <strong>{props.selectedObject?.id ?? '객체 선택 필요'}</strong>
+          <small>{props.selectedObject ? `${props.selectedObject.type} · ${selectedLayer}` : 'Catalog에서 BW object를 선택하세요.'}</small>
         </div>
+
+        <div className="directionChipGroup" role="group" aria-label="Lineage direction">
+          {directionOptions.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              className={props.direction === option.value ? 'directionChip active' : 'directionChip'}
+              aria-pressed={props.direction === option.value}
+              onClick={() => props.setDirection(option.value)}
+            >
+              <strong>{option.label}</strong>
+              <small>{option.hint}</small>
+            </button>
+          ))}
+        </div>
+
         <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
-          Lineage 실행
+          {props.busy ? '흐름 확인 중…' : '흐름 보기'}
         </button>
-        <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
-          Evidence Walkthrough
-        </button>
-        <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}>
-          Business Summary
-        </button>
+
+        <section className="evidenceHealthSummary" aria-label="Lineage evidence health summary">
+          <div className="panel-title">
+            <span className="eyebrow">Evidence health</span>
+            <small>항상 보이는 근거 상태</small>
+          </div>
+          <div className="evidenceHealthGrid">
+            {evidenceHealth.map((item) => (
+              <span key={item.label} className={`evidenceHealthBadge ${item.tone}`}>
+                <b>{item.label}</b>
+                <em>{item.value}</em>
+              </span>
+            ))}
+          </div>
+        </section>
+
+        <details className="lineageAdvancedControls">
+          <summary>Advanced limits</summary>
+          <div className="compactForm three lineageAdvancedGrid">
+            <NumberField label="Depth" value={props.depth} min={0} max={20} onChange={props.setDepth} />
+            <NumberField label="Node cap" value={props.nodeCap} min={1} max={500} onChange={props.setNodeCap} />
+            <NumberField label="Edge cap" value={props.edgeCap} min={0} max={1000} onChange={props.setEdgeCap} />
+          </div>
+        </details>
+
+        <AssistantPresetLinks
+          title="Assistant presets"
+          presets={[
+            {
+              label: props.tourBusy ? 'Building evidence panel…' : 'Evidence panel',
+              description: 'Evidence Walkthrough preset · citation-bound lane narrative',
+              onClick: props.onTour,
+              disabled: !props.selectedObject || props.busy || props.adviceBusy || props.tourBusy,
+            },
+            {
+              label: props.adviceBusy ? 'Summarizing…' : 'Business summary',
+              description: 'Evidence IDs only',
+              onClick: props.onAdvice,
+              disabled: !props.selectedObject || props.busy || props.adviceBusy || props.tourBusy,
+            },
+            {
+              label: 'Ask BW / Review',
+              description: 'Open assistant surface',
+              onClick: props.onOpenAsk,
+              disabled: !props.selectedObject,
+            },
+          ]}
+        />
         {props.lineage ? (
           <div className="metaGrid">
             <Metric label="Truncated" value={props.lineage.truncated ? 'Yes' : 'No'} />
@@ -2338,7 +2794,7 @@ function LineageTab(props: {
       </section>
       <aside className="detailsDrawer sliceGDrawer">
         <GuidedTourPanel
-          title="Evidence Walkthrough"
+          title="Evidence panel"
           response={props.lineageTour}
           steps={tourSteps}
           currentIndex={currentTourIndex}
@@ -2384,8 +2840,12 @@ function LineageTab(props: {
   );
 }
 
+const impactSeverityOrder = ['HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'] as const;
+
 function ImpactTab(props: {
   selectedObject: CatalogObject | null;
+  scenarioId: ImpactScenarioId;
+  setScenarioId: (value: ImpactScenarioId) => void;
   changeType: ChangeType;
   setChangeType: (value: ChangeType) => void;
   fieldName: string;
@@ -2400,10 +2860,6 @@ function ImpactTab(props: {
   onTour: () => void;
   impact: ImpactScenarioResponse | null;
   impactReview: ImpactReviewResponse | null;
-  agenticReview: AgenticReviewRun | null;
-  agenticQuestion: string;
-  setAgenticQuestion: (value: string) => void;
-  onAgenticReview: () => void;
   impactAdvice: ImpactAdviceResponse | null;
   impactTour: ImpactTourResponse | null;
   objectFreshness: RequestFreshnessResponse | null;
@@ -2421,6 +2877,7 @@ function ImpactTab(props: {
   agenticBusy: boolean;
   adviceBusy: boolean;
   tourBusy: boolean;
+  onOpenAsk: () => void;
   tourStepIndex: number;
   setTourStepIndex: (value: number) => void;
 }) {
@@ -2428,37 +2885,90 @@ function ImpactTab(props: {
   const freshnessDisplay = classifyFreshness(props.objectFreshness ?? freshnessFromMetadata(props.selectedObject?.metadata));
   const tourSteps = normalizeGuidedTourSteps(props.impactTour);
   const currentTourIndex = clampTourIndex(props.tourStepIndex, tourSteps);
+  const activeScenarioById = impactScenarioCards.find((card) => card.id === props.scenarioId) ?? impactScenarioCards[0];
+  const activeScenario = activeScenarioById.changeTypes.includes(props.changeType)
+    ? activeScenarioById
+    : impactScenarioCards.find((card) => card.changeTypes.includes(props.changeType)) ?? activeScenarioById;
+  const affectedGroups = impactSeverityOrder.map((severity) => ({
+    severity,
+    items: props.impact?.affected_objects.filter((item) => item.severity === severity) ?? [],
+  }));
+  const assistantDisabled = !props.selectedObject || props.busy || props.agenticBusy || props.adviceBusy || props.tourBusy;
+
+  function selectScenario(card: ImpactScenarioCard) {
+    props.setScenarioId(card.id);
+    props.setChangeType(card.changeType);
+    if (!props.description.trim() || isImpactScenarioDefaultDescription(props.description)) {
+      props.setDescription(card.defaultDescription);
+    }
+  }
+
+  function selectFieldChangeType(value: ChangeType) {
+    props.setScenarioId('field-change');
+    props.setChangeType(value);
+  }
 
   return (
     <div className="impactLayout sliceGImpactLayout">
-      <section className="controlCard">
+      <section className="controlCard impactScenarioWorkspace">
         <span className="eyebrow">Impact</span>
-        <h1>변경 영향</h1>
-        <p className="tabPurpose">Change grade panel combines deterministic severity, bounded traversal, evidence IDs, and freshness context.</p>
+        <h1>Scenario-first impact workspace</h1>
+        <p className="tabPurpose">Pick the change scenario first; deterministic grade, affected objects, evidence, and manual checks render on the right.</p>
         <div className="scenarioObject">선택 object: <strong>{props.selectedObject?.id ?? '없음'}</strong></div>
-        <label>Change type
-          <select value={props.changeType} onChange={(event) => props.setChangeType(event.target.value as ChangeType)}>
-            {changeTypes.map((item) => <option key={item} value={item}>{item}</option>)}
-          </select>
-        </label>
-        <label>Field / 필드
-          {props.objectFields.length > 0 ? (
-            <select value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)}>
-              {props.objectFields.map((field) => (
-                <option key={field.name} value={field.name}>{field.name}{field.role ? ` · ${field.role}` : ''}</option>
-              ))}
-            </select>
-          ) : (
-            <input value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)} placeholder="Manual field name" />
-          )}
-        </label>
-        <label>설명
+        <div className="impactSafetyCopy" aria-label="Impact safety boundaries">
+          Read-only metadata · no BW query execution · no data preview · parse-only SQL
+        </div>
+
+        <div className="impactScenarioCards" aria-label="Impact scenario cards">
+          {impactScenarioCards.map((card) => (
+            <button
+              key={card.id}
+              type="button"
+              className={card.id === activeScenario.id ? 'impactScenarioCard active' : 'impactScenarioCard'}
+              onClick={() => selectScenario(card)}
+            >
+              <strong>{card.title}</strong>
+              <span>{card.description}</span>
+              <small>{card.changeType}</small>
+            </button>
+          ))}
+        </div>
+
+        {activeScenario.fieldOriented ? (
+          <div className="fieldScenarioControls" aria-label="field-oriented scenario controls">
+            <label>Field / 필드
+              {props.objectFields.length > 0 ? (
+                <select value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)}>
+                  {props.objectFields.map((field) => (
+                    <option key={field.name} value={field.name}>{field.name}{field.role ? ` · ${field.role}` : ''}</option>
+                  ))}
+                </select>
+              ) : (
+                <input value={props.fieldName} onChange={(event) => props.setFieldName(event.target.value)} placeholder="Manual field name" />
+              )}
+            </label>
+            <label>Field change detail
+              <select value={props.changeType} onChange={(event) => selectFieldChangeType(event.target.value as ChangeType)}>
+                {fieldOrientedChangeTypes.map((item) => <option key={item} value={item}>{item}</option>)}
+              </select>
+            </label>
+            <p className="scenarioHint">{activeScenario.hint}</p>
+          </div>
+        ) : (
+          <div className="scenarioReadOnlyHint" aria-label="field selector not required">
+            <strong>Field input not required</strong>
+            <span>{activeScenario.hint}</span>
+          </div>
+        )}
+
+        <label>Scenario notes / 설명
           <textarea value={props.description} onChange={(event) => props.setDescription(event.target.value)} rows={4} />
         </label>
-        <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
-        <details className="advancedSection evidenceDrawer">
-          <summary>Evidence sources · Query / SQL</summary>
-          <p className="mutedSmall">Query Analysis와 SQL Analysis는 Impact Review 내부 evidence로만 사용합니다.</p>
+
+        <details className="advancedSection evidenceScopeAdvanced">
+          <summary>Evidence scope (Advanced)</summary>
+          <p className="mutedSmall">Bounded traversal plus optional Query/SQL evidence. Query evidence is metadata-only; SQL evidence is parse-only and never executed.</p>
+          <NumberField label="Impact depth" value={props.impactDepth} min={1} max={20} onChange={props.setImpactDepth} />
           <label>Query evidence names
             <input
               value={props.queryName}
@@ -2489,22 +2999,18 @@ function ImpactTab(props: {
           <label>SQL file
             <input value={props.sqlFile} onChange={(event) => props.setSqlFile(event.target.value)} disabled={!props.includeSqlEvidence} />
           </label>
-          <p className="policyNote">No BW query execution · No data preview · Parse only · DB execution disabled</p>
+          <p className="policyNote">Read-only metadata · No BW query execution · No data preview · Parse-only SQL</p>
         </details>
+
         <button className="primaryButton wide" onClick={props.onRun} disabled={!props.selectedObject || props.busy || props.agenticBusy || props.adviceBusy || props.tourBusy}>
-          Impact 실행
-        </button>
-        <button className="secondaryButton wide" onClick={props.onTour} disabled={!props.selectedObject || props.busy || props.agenticBusy || props.adviceBusy || props.tourBusy}>
-          Impact Brief
-        </button>
-        <button className="ghostButton wide" onClick={props.onAdvice} disabled={!props.selectedObject || props.busy || props.agenticBusy || props.adviceBusy || props.tourBusy}>
-          Business Summary
+          {props.busy ? 'Assessing Impact…' : '영향 보기 / Assess Impact'}
         </button>
       </section>
+
       <section className="resultCard impactWorkbenchPanel">
         <div className="impactSummaryPanel" aria-label="change grade impact summary">
           <div className={`gradeBadge grade-${impactSummary.grade.toString().toLowerCase()}`}>
-            <span>Change grade</span>
+            <span>Risk grade</span>
             <strong>{impactSummary.gradeLabel}</strong>
           </div>
           <div className="impactHeadline">
@@ -2518,7 +3024,7 @@ function ImpactTab(props: {
             <Metric label="Bounds" value={impactSummary.truncated ? 'Truncated' : 'Complete'} />
           </div>
           <div className="severityBars" aria-label="severity distribution">
-            {(['HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'] as const).map((severity) => (
+            {impactSeverityOrder.map((severity) => (
               <div key={severity} className={`severityBar severity-${severity.toLowerCase()}`}>
                 <span>{severity}</span>
                 <b>{impactSummary.severityCounts[severity]}</b>
@@ -2527,40 +3033,71 @@ function ImpactTab(props: {
           </div>
         </div>
 
-        <span className="eyebrow">Affected</span>
-        {props.impact ? (
-          <div className="severityList">
-            {props.impact.affected_objects.map((item) => (
-              <article key={item.object_id} className={`severityItem ${item.severity.toLowerCase()}`}>
-                <div>
-                  <strong>{item.object_id}</strong>
-                  <span>{item.object_type} · {item.confidence}</span>
-                </div>
-                <b>{item.severity}</b>
-                <p>{item.reason}</p>
-                {GLOSSARY_VISIBLE && item.glossary_terms && item.glossary_terms.length > 0 ? (
-                  <div className="inlineTerms">
-                    {item.glossary_terms.slice(0, 4).map((term) => <span key={term.id} title={term.evidence_ids.join(', ')}>{term.term}</span>)}
+        <section className="affectedSeverityGroups" aria-label="affected objects by severity">
+          <span className="eyebrow">Affected objects by severity</span>
+          {props.impact ? (
+            <div className="severityGroupList">
+              {affectedGroups.map((group) => (
+                <section key={group.severity} className={`severityGroup severity-group-${group.severity.toLowerCase()}`}>
+                  <div className="severityGroupHeader">
+                    <strong>{group.severity}</strong>
+                    <span>{group.items.length} object{group.items.length === 1 ? '' : 's'}</span>
                   </div>
-                ) : null}
-                <small>Evidence IDs: {item.evidence_ids.join(', ') || '—'}</small>
-              </article>
-            ))}
-            {props.impact.affected_objects.length === 0 ? <div className="emptyState">이 범위 내 영향 없음 (깊이 기준 확인 필요)</div> : null}
-          </div>
-        ) : <div className="emptyState">변경 시나리오(예: 필드 삭제)를 고르면 영향 객체를 심각도순으로 보여드립니다. Lineage에서 본 객체가 자동으로 선택됩니다.</div>}
+                  {group.items.length > 0 ? (
+                    <div className="severityList">
+                      {group.items.map((item) => (
+                        <article key={`${group.severity}-${item.object_id}`} className={`severityItem ${item.severity.toLowerCase()}`}>
+                          <div>
+                            <strong>{item.object_id}</strong>
+                            <span><b className="objectTypeLabel">{item.object_type}</b> · {item.confidence}</span>
+                          </div>
+                          <b>{item.severity}</b>
+                          <p>{item.reason}</p>
+                          {GLOSSARY_VISIBLE && item.glossary_terms && item.glossary_terms.length > 0 ? (
+                            <div className="inlineTerms">
+                              {item.glossary_terms.slice(0, 4).map((term) => <span key={term.id} title={term.evidence_ids.join(', ')}>{term.term}</span>)}
+                            </div>
+                          ) : null}
+                          <small>Evidence IDs: {item.evidence_ids.join(', ') || '—'}</small>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="severityGroupEmpty">No {group.severity.toLowerCase()} affected objects in this bounded result.</p>
+                  )}
+                </section>
+              ))}
+              {props.impact.affected_objects.length === 0 ? <div className="emptyState">이 범위 내 영향 없음 (깊이 기준 확인 필요)</div> : null}
+            </div>
+          ) : <div className="emptyState">Scenario cards populate deterministic severity groups after 영향 보기 / Assess Impact.</div>}
+        </section>
 
         <ImpactEvidenceCards review={props.impactReview} />
-        <AuthorityCallout review={props.impactReview} />
-        <AgenticReviewWorkspace
-          review={props.agenticReview}
-          deterministicPack={props.impactReview}
-          question={props.agenticQuestion}
-          setQuestion={props.setAgenticQuestion}
-          onRun={props.onAgenticReview}
-          busy={props.agenticBusy}
-          disabled={!props.selectedObject || props.busy || props.adviceBusy || props.tourBusy}
+        <ManualVerificationChecklist review={props.impactReview} impact={props.impact} />
+        <AssistantPresetLinks
+          title="Assistant presets"
+          presets={[
+            {
+              label: props.tourBusy ? 'Generating brief…' : 'Impact brief',
+              description: 'Evidence cards + citations',
+              onClick: props.onTour,
+              disabled: assistantDisabled,
+            },
+            {
+              label: props.adviceBusy ? 'Summarizing…' : 'Business summary',
+              description: 'Evidence-bound wording',
+              onClick: props.onAdvice,
+              disabled: assistantDisabled,
+            },
+            {
+              label: 'Ask BW / Review',
+              description: 'Open review assistant link',
+              onClick: props.onOpenAsk,
+              disabled: !props.selectedObject,
+            },
+          ]}
         />
+        <AuthorityCallout review={props.impactReview} />
 
         <GuidedTourPanel
           title="Impact Brief"
@@ -2586,6 +3123,7 @@ function ImpactTab(props: {
 }
 
 function AgenticReviewWorkspace(props: {
+  assistantReview: AssistantReviewResponse | null;
   review: AgenticReviewRun | null;
   deterministicPack: ImpactReviewResponse | null;
   question: string;
@@ -2594,6 +3132,7 @@ function AgenticReviewWorkspace(props: {
   busy: boolean;
   disabled: boolean;
 }) {
+  const assistant = props.assistantReview;
   const review = props.review;
   const deterministicPack = review?.deterministic_pack ?? props.deterministicPack;
   const cards = [...(review?.cards ?? [])].sort((left, right) => left.review_priority - right.review_priority);
@@ -2601,27 +3140,52 @@ function AgenticReviewWorkspace(props: {
   const hypotheses = review?.hypotheses ?? [];
   const gaps = review?.evidence_gaps ?? [];
   const manualChecks = review?.manual_checks ?? [];
-  const trace = review?.trace ?? [];
-  const budgetEntries = review ? Object.entries(review.budget) : [];
-  const budgetUsageEntries = review ? Object.entries(review.budget_usage) : [];
+  const assistantManualChecks = assistant?.manual_checks ?? [];
+  const deterministicFindings = deterministicPack?.impact.findings ?? [];
   const coverageEntries = Object.entries(deterministicPack?.coverage_summary ?? {});
-  const policyDecisions = review?.policy_decisions ?? [];
-  const auditTrail = review?.audit_trail ?? [];
+  const hasAnswer = Boolean(assistant?.answer) || cards.length > 0 || Boolean(review?.cab_summary) || deterministicFindings.length > 0;
 
   return (
-    <section className="agenticWorkspace" aria-label="Agentic Review Workspace">
+    <section className="agenticWorkspace" aria-label="Ask BW / Review citation-bound answer area">
       <div className="agenticWorkspaceHeader">
         <div>
-          <span className="eyebrow">Agentic Review Workspace</span>
-          <h2>Autonomous impact review</h2>
-          <p>Deterministic evidence remains authoritative; agentic output is citation-bound review workspace context only.</p>
+          <span className="eyebrow">Ask BW / Review</span>
+          <h2>Citation-bound answer area</h2>
+          <p>Answers stay bound to deterministic lineage/impact evidence, citation IDs, and manual review gaps. Raw chat, chain-of-thought, audit logs, and snapshot payloads are not rendered.</p>
         </div>
-        <div className="agenticBoundaryCopy" aria-label="agentic copy boundaries">
-          <span>No BW query execution · No data preview</span>
-          <span>Parse only · DB execution disabled</span>
+        <div className="agenticBoundaryCopy" aria-label="assistant copy boundaries">
+          <span>Read-only metadata</span>
+          <span>No BW query execution</span>
+          <span>No data preview</span>
+          <span>Local-first · evidence-bound LLM</span>
         </div>
       </div>
 
+      <article className="agenticSectionCard assistantPromptCard">
+        <div className="agenticSectionTitle">
+          <span className="eyebrow">Review objective</span>
+          <h3>Ask from selected evidence</h3>
+        </div>
+        <label>Ask / review objective
+          <textarea
+            value={props.question}
+            rows={4}
+            placeholder="Use a preset or ask for CAB risk, query exposure, freshness gaps, or manual BWMT checks."
+            onChange={(event) => props.setQuestion(event.target.value)}
+          />
+        </label>
+        <button className="primaryButton wide" onClick={props.onRun} disabled={props.disabled || props.busy}>
+          {props.busy ? 'Running citation-bound review…' : 'Run citation-bound review'}
+        </button>
+        <p className="policyNote">Uses the unified assistant review endpoint with selected deterministic context only; no live BW calls, query execution, data preview, or raw snapshot payload.</p>
+      </article>
+
+      {assistant?.status === 'disabled' ? (
+        <div className="agenticBanner disabled">LLM disabled — deterministic assistant fallback</div>
+      ) : null}
+      {assistant?.status === 'fallback' ? (
+        <div className="agenticBanner fallback">LLM validation fallback — deterministic assistant answer</div>
+      ) : null}
       {review?.status === 'disabled' ? (
         <div className="agenticBanner disabled">LLM disabled — deterministic findings only</div>
       ) : null}
@@ -2629,65 +3193,31 @@ function AgenticReviewWorkspace(props: {
         <div className="agenticBanner fallback">Autonomous review failed validation — showing deterministic findings</div>
       ) : null}
 
-      <div className="agenticGrid">
-        <article className="agenticSectionCard review-objective">
-          <div className="agenticSectionTitle">
-            <span className="eyebrow">Review objective</span>
-            <h3>Question and review plan</h3>
-          </div>
-          <label>Review objective
-            <textarea
-              value={props.question}
-              rows={3}
-              placeholder="Optional: ask what the reviewer should focus on, e.g. CAB risk, query exposure, freshness, or BWMT manual checks."
-              onChange={(event) => props.setQuestion(event.target.value)}
-            />
-          </label>
-          <button className="primaryButton wide" onClick={props.onRun} disabled={props.disabled || props.busy}>
-            {props.busy ? 'Running agentic review…' : 'Run agentic review'}
-          </button>
-          {objectives.length > 0 ? (
-            <div className="agenticList">
-              {objectives.map((objective) => (
-                <div key={objective.id} className="agenticMiniItem">
-                  <strong>{objective.title}</strong>
-                  <p>{objective.rationale}</p>
-                  <CitationChipList citationIds={objective.citation_ids} />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="emptyState">Run agentic review to render citation-bound objectives. Disabled LLM mode can still render deterministic cards.</div>
-          )}
-        </article>
-
-        <article className="agenticSectionCard reasoning-trace">
-          <div className="agenticSectionTitle">
-            <span className="eyebrow">Autonomous reasoning trace summary</span>
-            <h3>Stage trace, no raw chat</h3>
-          </div>
-          <p className="mutedSmall">Summaries only; raw chat and chain-of-thought are not rendered.</p>
-          {trace.length > 0 ? (
-            <ol className="traceList">
-              {trace.map((step, index) => (
-                <li key={`${step.stage}-${step.round}-${index}`}>
-                  <strong>{step.stage}</strong>
-                  <span>round {step.round} · citation_validation={step.citation_validation}</span>
-                  <p>{step.summary}</p>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <div className="emptyState">No autonomous trace yet.</div>
-          )}
-        </article>
-      </div>
-
-      <article className="agenticSectionCard prioritized-review-cards">
+      <article className="assistantAnswerArea" aria-label="citation-bound answer area">
         <div className="agenticSectionTitle">
-          <span className="eyebrow">Prioritized review cards</span>
-          <h3>Sorted by review priority</h3>
+          <span className="eyebrow">Answer</span>
+          <h3>Facts, review cards, and citations</h3>
         </div>
+        {assistant ? (
+          <div className="assistantCabBlock unifiedAssistantAnswer" aria-label="unified assistant review answer">
+            <div className="budgetGrid">
+              <Metric label="assistant status" value={assistant.status} />
+              <Metric label="confidence" value={assistant.confidence} />
+              <Metric label="llm used" value={String(assistant.safety.llm_used)} />
+              <Metric label="validator" value={assistant.safety.citation_validation} />
+            </div>
+            <pre className="agenticCabSummary">{assistant.answer}</pre>
+            <CitationChipList citationIds={assistant.citations} />
+          </div>
+        ) : null}
+        {review?.cab_summary ? (
+          <div className="assistantCabBlock">
+            <pre className="agenticCabSummary">{review.cab_summary}</pre>
+            <button className="secondaryButton" onClick={() => void copyCabSummary(review.cab_summary)}>
+              Copy CAB summary
+            </button>
+          </div>
+        ) : null}
         {cards.length > 0 ? (
           <div className="agenticCardList">
             {cards.map((card) => (
@@ -2706,42 +3236,32 @@ function AgenticReviewWorkspace(props: {
               </article>
             ))}
           </div>
-        ) : (
-          <div className="emptyState">No review cards yet.</div>
-        )}
+        ) : null}
+        {cards.length === 0 && deterministicFindings.length > 0 ? (
+          <div className="agenticCardList">
+            {deterministicFindings.slice(0, 6).map((finding) => (
+              <article key={finding.id} className="agenticCard deterministicFallbackCard">
+                <div className="agenticCardHeader">
+                  <span className="provenanceBadge deterministic_finding">Deterministic finding</span>
+                  <span className="reviewPriority">{finding.severity}</span>
+                </div>
+                <h4>{finding.impacted_object_id}</h4>
+                <p>{finding.reason}</p>
+                <div className="agenticCardMeta">
+                  <span>Confidence: {finding.confidence}</span>
+                  <span>Manual verification: {String(finding.manual_verification)}</span>
+                </div>
+                <CitationChipList citationIds={[...finding.evidence_node_ids, ...finding.evidence_edge_ids]} />
+              </article>
+            ))}
+          </div>
+        ) : null}
+        {!hasAnswer ? (
+          <div className="emptyState">Choose a preset or write a review objective. The assistant answer will stay citation-bound and will not execute BW queries.</div>
+        ) : null}
       </article>
 
       <div className="agenticGrid">
-        <article className="agenticSectionCard evidence-map">
-          <div className="agenticSectionTitle">
-            <span className="eyebrow">Evidence map</span>
-            <h3>Card and hypothesis citations</h3>
-          </div>
-          <div className="budgetGrid coverageGrid">
-            {coverageEntries.length > 0 ? coverageEntries.map(([key, value]) => (
-              <Metric key={key} label={key.replace(/_/g, ' ')} value={String(value)} />
-            )) : <Metric label="Coverage" value="0" />}
-          </div>
-          <div className="agenticCitationMap">
-            <strong>Card citations</strong>
-            {cards.length > 0 ? cards.map((card) => (
-              <div key={card.id} className="agenticMiniItem">
-                <span>{card.title}</span>
-                <CitationChipList citationIds={card.citation_ids} />
-              </div>
-            )) : <p className="mutedSmall">No card citations yet.</p>}
-            <strong>Hypothesis citations</strong>
-            {hypotheses.length > 0 ? hypotheses.map((hypothesis) => (
-              <div key={hypothesis.id} className="agenticMiniItem">
-                <span>{hypothesis.statement}</span>
-                <small>{hypothesis.status} · severity opinion {hypothesis.severity_opinion ?? 'n/a'}</small>
-                <p>{hypothesis.confidence_rationale}</p>
-                <CitationChipList citationIds={hypothesis.citation_ids} />
-              </div>
-            )) : <p className="mutedSmall">No hypotheses yet.</p>}
-          </div>
-        </article>
-
         <article className="agenticSectionCard missing-evidence-gaps">
           <div className="agenticSectionTitle">
             <span className="eyebrow">Missing evidence / gaps</span>
@@ -2759,13 +3279,20 @@ function AgenticReviewWorkspace(props: {
                 </div>
               ))}
             </div>
+          ) : assistant?.unknowns.length ? (
+            <div className="agenticList">
+              {assistant.unknowns.map((unknown) => (
+                <div key={unknown} className="agenticMiniItem">
+                  <strong>Unknown / needs manual verification</strong>
+                  <p>{unknown}</p>
+                </div>
+              ))}
+            </div>
           ) : (
-            <div className="emptyState">No agentic evidence gaps returned. Manual deterministic gaps still appear in the evidence cards above.</div>
+            <div className="emptyState">No assistant evidence gaps yet. Deterministic manual gaps remain in Impact evidence cards.</div>
           )}
         </article>
-      </div>
 
-      <div className="agenticGrid">
         <article className="agenticSectionCard manual-bwmt-checklist">
           <div className="agenticSectionTitle">
             <span className="eyebrow">Manual BWMT checklist</span>
@@ -2783,89 +3310,72 @@ function AgenticReviewWorkspace(props: {
                 </div>
               ))}
             </div>
+          ) : assistantManualChecks.length > 0 ? (
+            <div className="agenticList">
+              {assistantManualChecks.map((check) => (
+                <div key={check.id} className="agenticMiniItem">
+                  <strong>{check.title}</strong>
+                  <small>{check.tool}</small>
+                  <p>{check.steps_summary}</p>
+                  {check.related_context_ids.length > 0 ? <small>Contexts: {check.related_context_ids.join(', ')}</small> : null}
+                  <CitationChipList citationIds={check.citation_ids} />
+                </div>
+              ))}
+            </div>
           ) : (
             <div className="emptyState">No manual BWMT checklist items returned.</div>
           )}
         </article>
-
-        <article className="agenticSectionCard cab-change-summary">
-          <div className="agenticSectionTitle">
-            <span className="eyebrow">CAB / change summary</span>
-            <h3>Copy-safe advisory summary</h3>
-          </div>
-          {review?.cab_summary ? (
-            <>
-              <pre className="agenticCabSummary">{review.cab_summary}</pre>
-              <button className="secondaryButton" onClick={() => void copyCabSummary(review.cab_summary)}>
-                Copy CAB summary
-              </button>
-            </>
-          ) : (
-            <div className="emptyState">No CAB summary yet.</div>
-          )}
-        </article>
       </div>
 
-      <article className="agenticSectionCard validator-budget-audit">
-        <div className="agenticSectionTitle">
-          <span className="eyebrow">Validator + budget + audit</span>
-          <h3>Status, policy decisions, and citation validation</h3>
-        </div>
-        <div className="budgetGrid">
-          <Metric label="status" value={review?.status ?? 'not run'} />
-          <Metric label="llm enabled" value={review ? String(review.llm_enabled) : 'n/a'} />
-          <Metric label="llm disabled" value={review ? String(review.llm_disabled) : 'n/a'} />
-          <Metric label="snapshot" value={review?.snapshot_id ?? deterministicPack?.snapshot_id ?? 'n/a'} />
-        </div>
+      <details className="advancedSection agenticAdvancedEvidence">
+        <summary>Advanced · citation map and validator status</summary>
         <div className="agenticGrid compact">
-          <div className="agenticAuditBox">
-            <strong>budget</strong>
-            <div className="budgetGrid">
-              {budgetEntries.length > 0 ? budgetEntries.map(([key, value]) => (
-                <Metric key={key} label={key.replace(/_/g, ' ')} value={String(value)} />
-              )) : <Metric label="budget" value="n/a" />}
+          <article className="agenticSectionCard evidence-map">
+            <div className="agenticSectionTitle">
+              <span className="eyebrow">Evidence map</span>
+              <h3>Card and hypothesis citations</h3>
             </div>
-          </div>
-          <div className="agenticAuditBox">
-            <strong>budget_usage</strong>
-            <div className="budgetGrid">
-              {budgetUsageEntries.length > 0 ? budgetUsageEntries.map(([key, value]) => (
+            <div className="budgetGrid coverageGrid">
+              {coverageEntries.length > 0 ? coverageEntries.map(([key, value]) => (
                 <Metric key={key} label={key.replace(/_/g, ' ')} value={String(value)} />
-              )) : <Metric label="usage" value="n/a" />}
+              )) : <Metric label="Coverage" value="0" />}
             </div>
-          </div>
+            <div className="agenticCitationMap">
+              <strong>Card citations</strong>
+              {cards.length > 0 ? cards.map((card) => (
+                <div key={card.id} className="agenticMiniItem">
+                  <span>{card.title}</span>
+                  <CitationChipList citationIds={card.citation_ids} />
+                </div>
+              )) : <p className="mutedSmall">No card citations yet.</p>}
+              <strong>Hypothesis citations</strong>
+              {hypotheses.length > 0 ? hypotheses.map((hypothesis) => (
+                <div key={hypothesis.id} className="agenticMiniItem">
+                  <span>{hypothesis.statement}</span>
+                  <small>{hypothesis.status} · severity opinion {hypothesis.severity_opinion ?? 'n/a'}</small>
+                  <p>{hypothesis.confidence_rationale}</p>
+                  <CitationChipList citationIds={hypothesis.citation_ids} />
+                </div>
+              )) : <p className="mutedSmall">No hypotheses yet.</p>}
+            </div>
+          </article>
+          <article className="agenticSectionCard validator-status">
+            <div className="agenticSectionTitle">
+              <span className="eyebrow">Safety + validation</span>
+              <h3>Status without audit log details</h3>
+            </div>
+            <div className="budgetGrid">
+              <Metric label="status" value={review?.status ?? 'not run'} />
+              <Metric label="assistant" value={assistant?.status ?? 'not run'} />
+              <Metric label="llm enabled" value={review ? String(review.llm_enabled) : 'n/a'} />
+              <Metric label="llm disabled" value={review ? String(review.llm_disabled) : 'n/a'} />
+              <Metric label="final authority" value={deterministicPack?.final_authority ?? 'impact.py'} />
+            </div>
+            <p className="mutedSmall">Validator details are summarized here without rendering raw audit logs, snapshot payloads, credentials, cookies, or secrets.</p>
+          </article>
         </div>
-        <div className="agenticGrid compact">
-          <div className="agenticAuditBox">
-            <strong>Policy decisions</strong>
-            {policyDecisions.length > 0 ? (
-              <ul className="plainList">
-                {policyDecisions.map((decision) => (
-                  <li key={decision.request_id}>
-                    <b>{decision.allowed ? 'allowed' : 'blocked'} · {decision.request_id}</b>
-                    <span>{decision.reason}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : <p className="mutedSmall">No policy decisions recorded.</p>}
-          </div>
-          <div className="agenticAuditBox">
-            <strong>Audit citation validation</strong>
-            {auditTrail.length > 0 ? (
-              <ul className="plainList">
-                {auditTrail.map((audit, index) => (
-                  <li key={`${audit.prompt_sha256 ?? 'audit'}-${index}`}>
-                    <b>{audit.model ?? 'model n/a'} · citation_validation={String(audit.citation_validation ?? 'not_validated')}</b>
-                    <span>prompt_sha256={audit.prompt_sha256 ?? 'n/a'}</span>
-                    <span>sanitized_input_sha256={audit.sanitized_input_sha256 ?? 'n/a'}</span>
-                    {audit.response_id ? <span>response_id={audit.response_id}</span> : null}
-                  </li>
-                ))}
-              </ul>
-            ) : <p className="mutedSmall">No LLM audit entries recorded.</p>}
-          </div>
-        </div>
-      </article>
+      </details>
     </section>
   );
 }
@@ -2874,7 +3384,7 @@ function ImpactEvidenceCards(props: { review: ImpactReviewResponse | null }) {
   const review = props.review;
   const queryEvidence = review?.query_evidence ?? [];
   const sqlEvidence = review?.sql_evidence ?? [];
-  const gaps = review?.manual_verification_gaps ?? [];
+  const freshnessEvidence = review?.freshness_evidence ?? [];
   const variableCount = queryEvidence.reduce((total, item) => total + item.variable_names.length, 0);
   const keyFigureCount = queryEvidence.reduce(
     (total, item) => total + item.calculated_key_figure_names.length + item.restricted_key_figure_names.length,
@@ -2882,6 +3392,7 @@ function ImpactEvidenceCards(props: { review: ImpactReviewResponse | null }) {
   );
   const referencedObjectCount = new Set(sqlEvidence.flatMap((item) => item.referenced_object_ids)).size;
   const referencedColumnCount = new Set(sqlEvidence.flatMap((item) => item.referenced_column_names)).size;
+  const freshnessManualCount = freshnessEvidence.reduce((total, item) => total + item.manual_check_notes.length, 0);
 
   return (
     <div className="evidenceStack impactEvidenceStack" aria-label="Impact evidence source cards">
@@ -2956,29 +3467,92 @@ function ImpactEvidenceCards(props: { review: ImpactReviewResponse | null }) {
         )}
       </article>
 
-      <article className="evidenceCard gaps-evidence">
+      <article className="evidenceCard freshness-evidence">
         <div className="evidenceCardHeader">
           <div>
-            <span className="eyebrow">Manual verification gaps</span>
-            <h3>Human review points</h3>
+            <span className="eyebrow">Freshness evidence</span>
+            <h3>Recent load / request metadata evidence</h3>
           </div>
-          <span className="evidenceStatus">{coverageValue(review, 'manual_gap_count')} gaps</span>
+          <span className="evidenceStatus">Read-only metadata · No data preview</span>
         </div>
-        {gaps.length > 0 ? (
-          <ul className="manualGapList">
-            {gaps.map((gap) => (
-              <li key={gap.id}>
-                <strong>{gap.source.toUpperCase()}{gap.object_id ? ` · ${gap.object_id}` : ''}</strong>
-                <span>{gap.reason}</span>
-                {gap.evidence_ids.length > 0 ? <small>Evidence IDs: {gap.evidence_ids.join(', ')}</small> : null}
-              </li>
+        <div className="metaGrid evidenceMetricGrid">
+          <Metric label="Objects" value={String(freshnessEvidence.length)} />
+          <Metric label="Manual notes" value={String(freshnessManualCount)} />
+          <Metric label="Included" value={review ? String(Boolean(review.coverage_summary.freshness_evidence_count)) : 'false'} />
+          <Metric label="Execution" value="blocked" />
+        </div>
+        {freshnessEvidence.length > 0 ? (
+          <div className="evidenceRows">
+            {freshnessEvidence.map((item) => (
+              <div key={item.object_id} className="evidenceRow">
+                <strong>{item.object_id}</strong>
+                <small>{item.object_type ?? 'UNKNOWN'} · requests {item.request_count} · status {item.latest_status ?? 'n/a'}</small>
+                <EvidenceChipList label="Latest TSN" items={item.latest_request_tsn ? [item.latest_request_tsn] : []} empty="no request TSN" />
+                {item.latest_timestamp ? <p>Latest timestamp: {item.latest_timestamp}</p> : null}
+                {item.manual_check_notes.length > 0 ? <p>{item.manual_check_notes.join(' ')}</p> : null}
+              </div>
             ))}
-          </ul>
+          </div>
         ) : (
-          <div className="emptyState">Impact evidence pack이 생성되면 수동 확인 포인트를 모읍니다.</div>
+          <div className="emptyState">Impact Review includes freshness as read-only request metadata when available; no load or data preview is executed.</div>
         )}
       </article>
     </div>
+  );
+}
+
+function ManualVerificationChecklist(props: { review: ImpactReviewResponse | null; impact: ImpactScenarioResponse | null }) {
+  const gaps = props.review?.manual_verification_gaps ?? [];
+  const manualFindings = props.review?.impact.findings.filter((finding) => finding.manual_verification)
+    ?? props.impact?.affected_objects
+      .filter((item) => item.manual_verification)
+      .map((item) => ({
+        id: item.object_id,
+        impacted_object_id: item.object_id,
+        impacted_object_type: item.object_type,
+        severity: item.severity,
+        reason: item.reason,
+        evidence_node_ids: item.evidence_node_ids,
+        evidence_edge_ids: item.evidence_edge_ids,
+      }))
+    ?? [];
+
+  return (
+    <article className="evidenceCard manual-checklist-card" aria-label="Manual verification checklist">
+      <div className="evidenceCardHeader">
+        <div>
+          <span className="eyebrow">Manual-check checklist</span>
+          <h3>Verification gaps and human-only follow-up</h3>
+        </div>
+        <span className="evidenceStatus">{gaps.length} deterministic gaps</span>
+      </div>
+      {gaps.length > 0 ? (
+        <ul className="manualGapList">
+          {gaps.map((gap) => (
+            <li key={gap.id}>
+              <strong>{gap.source.toUpperCase()}{gap.object_id ? ` · ${gap.object_id}` : ''}</strong>
+              <span>{gap.reason}</span>
+              {gap.evidence_ids.length > 0 ? <small>Evidence IDs: {gap.evidence_ids.join(', ')}</small> : null}
+            </li>
+          ))}
+        </ul>
+      ) : manualFindings.length > 0 ? (
+        <ul className="manualGapList">
+          {manualFindings.map((finding) => (
+            <li key={finding.id}>
+              <strong>{finding.severity} · {finding.impacted_object_type} · {finding.impacted_object_id}</strong>
+              <span>{finding.reason}</span>
+              <small>Manual BWMT check required. Evidence IDs: {[...finding.evidence_node_ids, ...finding.evidence_edge_ids].join(', ') || '—'}</small>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="emptyState">
+          No deterministic manual gaps yet. Before transport approval, manually verify BWMT activation, DTP/process-chain load freshness, and query exposure outside this read-only metadata workspace.
+        </div>
+      )}
+      <p className="policyNote">Human-only checks remain outside the app: read-only metadata, no BW query execution, no data preview, parse-only SQL.</p>
+    </article>
   );
 }
 
@@ -3440,8 +4014,8 @@ function GuidedTourPanel(props: {
       {props.response?.summary ? <p className="tourSummary">{props.response.summary}</p> : null}
       {current ? (
         <>
-          <p>{current.description || props.response?.message || 'Evidence Walkthrough step has no description.'}</p>
-          <div className="tourEvidenceList" aria-label="evidence walkthrough evidence ids">
+          <p>{current.description || props.response?.message || 'Evidence panel step has no description.'}</p>
+          <div className="tourEvidenceList" aria-label="evidence panel evidence ids">
             {current.evidenceIds.length > 0 ? current.evidenceIds.slice(0, 6).map((id) => <code key={id}>{id}</code>) : <span>No evidence IDs returned</span>}
           </div>
           <div className="tourControls">
@@ -3451,9 +4025,9 @@ function GuidedTourPanel(props: {
         </>
       ) : (
         <>
-          <p>{isDisabled ? props.response?.message : 'Generate a citation-bound evidence walkthrough for the selected bounded analysis.'}</p>
+          <p>{isDisabled ? props.response?.message : 'Generate citation-bound evidence panel content for the selected bounded analysis.'}</p>
           {props.response?.citations.length ? <small>Citations: {props.response.citations.join(', ')}</small> : null}
-          <button className="secondaryButton wide" onClick={props.onRun} disabled={props.busy}>{props.busy ? 'Generating…' : 'Generate Evidence Walkthrough'}</button>
+          <button className="secondaryButton wide" onClick={props.onRun} disabled={props.busy}>{props.busy ? 'Generating…' : 'Generate evidence panel'}</button>
         </>
       )}
     </section>
@@ -3465,8 +4039,11 @@ function SafetyCopy() {
     <section className="safetyCopy" aria-label="read-only safety boundaries">
       <strong>Safety copy · read-only local-first</strong>
       <ul>
+        <li>Read-only metadata analysis only; local-first snapshots remain the evidence basis.</li>
         <li>No SAP write, run, activate, or transport actions.</li>
+        <li>No BW query execution and no data preview.</li>
         <li>No data rows or data-preview UI; metadata, request timestamps, and citations only.</li>
+        <li>LLM answers are evidence-bound and never become final authority.</li>
         <li>No secrets, credentials, hostnames, API keys, cookies, or raw connection details are displayed here.</li>
       </ul>
     </section>
@@ -3483,6 +4060,56 @@ function FreshnessBadge(props: { display: FreshnessDisplay; compact?: boolean })
 
 function FreshnessCount(props: { label: string; count: number; state: FreshnessDisplay['state'] }) {
   return <span className={`freshnessCount ${props.state}`}><b>{props.label}</b><em>{props.count}</em></span>;
+}
+
+function lineageHealthItem(
+  label: 'Dataflow',
+  selectedObject: CatalogObject | null,
+  lineage: LineageResponse | null,
+): { label: string; value: string; tone: 'ok' | 'warn' | 'info' | 'neutral' } {
+  if (!selectedObject) return { label, value: 'Select object', tone: 'neutral' };
+  if (!lineage) return { label, value: 'Not run', tone: 'info' };
+  if (lineage.edges.length > 0) return { label, value: `${lineage.edges.length} edges`, tone: lineage.truncated ? 'warn' : 'ok' };
+  return { label, value: lineage.nodes.length > 0 ? 'Node only' : 'No evidence', tone: 'warn' };
+}
+
+function whereUsedHealthItem(
+  label: 'Where-used',
+  selectedObject: CatalogObject | null,
+  lineage: LineageResponse | null,
+  direction: Direction,
+): { label: string; value: string; tone: 'ok' | 'warn' | 'info' | 'neutral' } {
+  if (!selectedObject) return { label, value: 'Select object', tone: 'neutral' };
+  if (!lineage) return { label, value: 'Not run', tone: 'info' };
+  const evidenceDirection = lineage.direction ?? direction;
+  if (evidenceDirection === 'downstream') return { label, value: 'Run Upstream/Both', tone: 'info' };
+  if (lineage.edges.length > 0) return { label, value: `${lineage.edges.length} refs`, tone: lineage.truncated ? 'warn' : 'ok' };
+  return { label, value: 'No refs', tone: 'warn' };
+}
+
+function objectDetailHealthItem(
+  label: 'Object detail',
+  selectedObject: CatalogObject | null,
+  objectDetail: CatalogObjectDetail | null,
+): { label: string; value: string; tone: 'ok' | 'warn' | 'info' | 'neutral' } {
+  if (!selectedObject) return { label, value: 'Select object', tone: 'neutral' };
+  if (!objectDetail) return { label, value: 'Loading', tone: 'info' };
+  if (objectDetail.evidence_ids.length > 0) return { label, value: `${objectDetail.evidence_ids.length} ids`, tone: 'ok' };
+  return { label, value: 'Metadata only', tone: 'warn' };
+}
+
+function freshnessHealthItem(
+  label: 'Freshness',
+  display: FreshnessDisplay,
+  objectFreshness: RequestFreshnessResponse | null,
+): { label: string; value: string; tone: 'ok' | 'warn' | 'info' | 'neutral' } {
+  const toneByState: Record<FreshnessDisplay['state'], 'ok' | 'warn' | 'info' | 'neutral'> = {
+    fresh: 'ok',
+    stale: 'warn',
+    none: 'info',
+    unknown: objectFreshness ? 'info' : 'neutral',
+  };
+  return { label, value: display.label, tone: toneByState[display.state] };
 }
 
 function summarizeFreshness(

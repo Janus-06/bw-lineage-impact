@@ -5,9 +5,42 @@ from typing import Any
 
 import pytest
 
-from bwli.live import LiveCollectionError, collect_live_snapshot, run_live_smoke
+from bwli.live import BwReadClient, LiveCollectionError, collect_live_snapshot, run_live_smoke
 from bwli.snapshot import SnapshotReader
 from bwli.store import ingest_manifest
+
+
+def test_live_read_protocol_excludes_blocked_mcp_tools() -> None:
+    names = {
+        name
+        for name, member in BwReadClient.__dict__.items()
+        if callable(member) and not name.startswith("_")
+    }
+
+    forbidden_fragments = {
+        "activate",
+        "activate_request",
+        "create",
+        "delete",
+        "filter_values",
+        "patch",
+        "post",
+        "preview",
+        "push",
+        "put",
+        "query_data",
+        "raw_get",
+        "raw_post",
+        "run",
+        "run_dtp",
+        "transport",
+        "update",
+        "write",
+    }
+
+    assert not {
+        name for name in names if any(fragment in name.lower() for fragment in forbidden_fragments)
+    }
 
 
 class RecordingLiveClient:

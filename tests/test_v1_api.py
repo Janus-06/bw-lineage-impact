@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import stat
 from pathlib import Path, PureWindowsPath
 
@@ -38,6 +39,34 @@ def _capture_sample_graph(client: TestClient) -> str:
     assert payload["object_count"] == 5
     assert payload["edge_count"] == 5
     return str(payload["id"])
+
+
+def test_v1_openapi_excludes_blocked_mcp_tool_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path, monkeypatch)
+
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    spec_text = json.dumps(response.json(), sort_keys=True).lower()
+    forbidden_tokens = [
+        "bw_query_data",
+        "bw_get_filter_values",
+        "bw_preview_datasource",
+        "bw_activate_request",
+        "bw_run_dtp",
+        "bw_create",
+        "bw_update",
+        "bw_delete",
+        "bw_push",
+        "query-data",
+        "filter-values",
+        "preview-datasource",
+        "activate-request",
+    ]
+    assert not [token for token in forbidden_tokens if token in spec_text]
 
 
 def test_v1_runtime_config_auto_seeds_env_and_clear_falls_back(
